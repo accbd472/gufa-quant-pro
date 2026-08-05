@@ -30,6 +30,7 @@
     "log_max_bytes": 10485760,
     "log_backup_count": 10,
     "health_file": "health.json",
+    "webhook_url": "",
     "once_on_start": true,
     "max_consecutive_cycle_errors": 5
   },

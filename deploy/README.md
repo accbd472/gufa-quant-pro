@@ -136,7 +136,12 @@ sudo systemctl status gufa-quant-pro
   - AI 结构错误且 `fail_closed=true` 时只允许保持/降仓，绝不加仓；
   - 挂单对账失败时**不会盲目重下**，保留记录并提示人工确认（见日志中"人工确认"字样）。
 - **关键命令**：`version` / `validate` / `once` / `run` / `status` /
-  `export-weights` / `adopt-positions` / `ai-check`。
+  `export-weights` / `adopt-positions` / `ai-check` /
+  `paipan-report` / `backtest-paipan` / `export-ohlcv` / `pause` / `resume`。
+- **应急暂停**：`pause` 立即停开新仓（创建 `runtime/pause` 标记），存量仓位与硬止损继续；
+  `resume` 恢复。适合人工观察行情/修复问题时不停进程。
+- **事件通知**：配置 `runtime.webhook_url` 后，成交/订单不确定/熔断事件推送 JSON
+  （含 sandbox 标志）；未配置或发送失败不影响交易。
 
 ---
 

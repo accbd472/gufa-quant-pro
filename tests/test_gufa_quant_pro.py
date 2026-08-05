@@ -645,3 +645,54 @@ def test_account_snapshot_always_uses_exchange_balance(tmp_path: Path) -> None:
 
 def test_fill_result_has_no_local_simulation_flag() -> None:
     assert "dry_run" not in g.FillResult.__dataclass_fields__
+
+
+def test_webhook_url_config_round_trip(tmp_path: Path) -> None:
+    cfg = load_default(tmp_path, lambda p: p["runtime"].__setitem__("webhook_url", "https://example.com/hook"))
+    assert cfg.runtime.webhook_url == "https://example.com/hook"
+    assert g.default_config_dict()["runtime"]["webhook_url"] == ""
+
+
+def test_webhook_send_receives_json() -> None:
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    received: dict = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", 0))
+            received["body"] = self.rfile.read(length).decode("utf-8")
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):  # noqa: N802
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        ok = g._send_webhook(f"http://127.0.0.1:{port}/hook", {"event": "test", "msg": "你好"})
+        assert ok is True
+        body = json.loads(received["body"])
+        assert body["event"] == "test" and body["msg"] == "你好"
+        # 失败路径不抛异常
+        assert g._send_webhook("http://127.0.0.1:1/none", {"event": "x"}) is False
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_pause_resume_marker(tmp_path: Path) -> None:
+    assert g.cmd_pause_resume(tmp_path, resume=False) == 0
+    assert (tmp_path / "pause").exists()
+    # 再次 pause 幂等
+    assert g.cmd_pause_resume(tmp_path, resume=False) == 0
+    assert (tmp_path / "pause").exists()
+    assert g.cmd_pause_resume(tmp_path, resume=True) == 0
+    assert not (tmp_path / "pause").exists()
+    # resume 无标记时幂等
+    assert g.cmd_pause_resume(tmp_path, resume=True) == 0

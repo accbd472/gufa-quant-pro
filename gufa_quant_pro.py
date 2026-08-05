@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import getpass
 import hashlib
 import json
@@ -437,13 +438,14 @@ class RuntimeConfig:
     log_max_bytes: int = 10 * 1024 * 1024
     log_backup_count: int = 10
     health_file: str = "health.json"
+    webhook_url: str = ""  # 可选：成交/熔断等事件通知端点（留空禁用）
     once_on_start: bool = True
     max_consecutive_cycle_errors: int = 5
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "RuntimeConfig":
         reject_unknown(data, cls.__dataclass_fields__.keys(), "runtime")
-        string_fields = {"quote_currency", "timeframe", "state_dir", "log_level", "health_file"}
+        string_fields = {"quote_currency", "timeframe", "state_dir", "log_level", "health_file", "webhook_url"}
         int_fields = {
             "ohlcv_limit", "poll_interval_seconds", "max_candle_lag_seconds",
             "log_max_bytes", "log_backup_count", "max_consecutive_cycle_errors",
@@ -474,6 +476,7 @@ class RuntimeConfig:
         cfg.state_dir = cfg.state_dir.strip()
         cfg.log_level = cfg.log_level.strip().upper()
         cfg.health_file = cfg.health_file.strip()
+        cfg.webhook_url = cfg.webhook_url.strip()
         return cfg
 
     def validate(self) -> None:
@@ -2313,6 +2316,23 @@ class SymbolDecision:
     ai_decision: AIDecision
 
 
+def _send_webhook(url: str, payload: Dict[str, Any], timeout: int = 5) -> bool:
+    """发送 JSON POST 到 webhook；失败返回 False（best-effort，不影响主流程）。"""
+    try:
+        import urllib.request
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read(128)
+        return True
+    except Exception:  # noqa: BLE001 通知失败不向上抛
+        return False
+
+
 class GuFaQuantPro:
     def __init__(
         self,
@@ -2633,6 +2653,27 @@ class GuFaQuantPro:
             )
         return decisions
 
+    def _notify(self, event: str, payload: Dict[str, Any]) -> None:
+        """可选的 webhook 事件通知（runtime.webhook_url 为空时静默跳过）。
+
+        仅用于事件通知（成交/熔断等），best-effort：失败只记日志，不影响交易主流程。
+        """
+        url = self.config.runtime.webhook_url
+        if not url:
+            return
+        body = {
+            "event": event,
+            "ts": iso_now(),
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "sandbox": self.config.exchange.sandbox,
+            **payload,
+        }
+        if _send_webhook(url, body):
+            self.log.info("webhook %s 已发送", event)
+        else:
+            self.log.warning("webhook %s 发送失败", event)
+
     def run_cycle(self) -> Dict[str, Any]:
         cycle_started = time.monotonic()
         self.gateway.reconcile_pending_orders()
@@ -2645,8 +2686,17 @@ class GuFaQuantPro:
         account_prices = self._account_prices()
         snapshot = self.gateway.account_snapshot(account_prices)
         self.gateway.update_high_water(snapshot)
+        prev_halted = self.store.state.halted_reason
         risk_status = self.risk.evaluate(snapshot)
+        if self.store.state.halted_reason and self.store.state.halted_reason != prev_halted:
+            self._notify("halted", {"reason": self.store.state.halted_reason})
         protective = self.risk.protective_exits(snapshot)
+
+        # 暂停开关：state_dir/pause 存在时本周期不开新仓，仅继续管理存量与保护性退出。
+        pause_file = self.state_dir / "pause"
+        paused = pause_file.exists()
+        if paused:
+            self.log.warning("检测到暂停标记 %s：本周期不开新仓，仅管理存量仓位", pause_file)
 
         managed_positions = {
             symbol
@@ -2657,7 +2707,7 @@ class GuFaQuantPro:
                 or symbol in self.store.state.positions
             )
         }
-        selected = set(daily_selection.selected_symbols)
+        selected = set() if paused else set(daily_selection.selected_symbols)
         fine_screen_symbols = selected | managed_positions
 
         # 第二阶段：只对“当日入选 + 已有受管仓位”使用原交易周期精筛。
@@ -2704,6 +2754,14 @@ class GuFaQuantPro:
                     "fill": asdict(fill),
                 }
                 append_jsonl(self.audit_path, audit)
+                self._notify("order_fill", {
+                    "symbol": plan.symbol,
+                    "side": plan.side,
+                    "filled_amount": fill.filled_amount,
+                    "average_price": fill.average_price,
+                    "status": fill.status,
+                    "reason": plan.reason,
+                })
                 self.log.warning(
                     "%s %s filled=%s avg=%s status=%s sandbox=%s reason=%s",
                     plan.symbol, plan.side.upper(), fill.filled_amount,
@@ -2718,6 +2776,7 @@ class GuFaQuantPro:
                     "action": "automatic trading stopped; manual reconciliation required",
                 })
                 self.stop_event.set()
+                self._notify("order_uncertain", {"symbol": plan.symbol, "error": repr(exc)})
                 self.log.critical("订单状态不确定，立即停止自动交易: %s", exc, exc_info=True)
                 raise
             except Exception as exc:
@@ -2746,6 +2805,7 @@ class GuFaQuantPro:
             "mode": "exchange-sandbox" if self.config.exchange.sandbox else "exchange-production",
             "exchange": self.config.exchange.id,
             "sandbox": self.config.exchange.sandbox,
+            "paused": paused,
             "equity": snapshot.equity,
             "quote_free": snapshot.quote_free,
             "risk_allowed": risk_status.allowed,
@@ -3104,6 +3164,62 @@ def _split_symbols(text: str, fallback: Sequence[str]) -> List[str]:
     return symbols or list(fallback)
 
 
+def cmd_export_ohlcv(
+    config: AppConfig,
+    symbols: Sequence[str],
+    timeframe: str,
+    bars: int,
+    output: Optional[str],
+) -> int:
+    """导出公开 K 线到 CSV（列与 backtest-paipan --ohlcv-file 兼容）。只读公开行情，无需凭据。"""
+    if not hasattr(ccxt, config.exchange.id):
+        raise ConfigError(f"CCXT 不支持交易所: {config.exchange.id}")
+    exchange = getattr(ccxt, config.exchange.id)({
+        "enableRateLimit": True,
+        "timeout": config.exchange.timeout_ms,
+        "options": {"defaultType": "spot"},
+    })
+    rows: List[List[Any]] = []
+    for symbol in symbols:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=bars)
+        except Exception as exc:  # noqa: BLE001 网络/交易所错误统一转为友好提示
+            raise ConfigError(f"拉取 {symbol} {timeframe} 行情失败: {exc}") from exc
+        if len(ohlcv) < 2:
+            raise ConfigError(f"{symbol} {timeframe} 有效 K 线不足: {len(ohlcv)}")
+        for candle in ohlcv:
+            ts = datetime.fromtimestamp(candle[0] / 1000.0, timezone.utc).isoformat()
+            rows.append([symbol, ts] + [float(x) for x in candle[1:6]])
+    if output:
+        path = Path(output).expanduser().resolve()
+    else:
+        state_dir = Path(config.runtime.state_dir).expanduser().resolve()
+        path = state_dir / f"ohlcv_{timeframe}_{utc_now().strftime('%Y%m%d_%H%M%S')}.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["symbol", "date", "open", "high", "low", "close", "volume"])
+        writer.writerows(rows)
+    print(f"已导出 {len(rows)} 根 {timeframe} K 线（{', '.join(symbols)}）→ {path}")
+    return 0
+
+
+def cmd_pause_resume(state_dir: Path, resume: bool) -> int:
+    """暂停/恢复：创建或移除 state_dir/pause 标记文件。"""
+    pause_file = state_dir / "pause"
+    if resume:
+        if pause_file.exists():
+            pause_file.unlink()
+            print(f"已恢复自动交易（移除 {pause_file}）")
+        else:
+            print("当前未暂停")
+    else:
+        pause_file.parent.mkdir(parents=True, exist_ok=True)
+        pause_file.touch()
+        print(f"已暂停新开仓（标记 {pause_file}）；存量仓位与保护性退出继续管理。用 resume 恢复。")
+    return 0
+
+
 def cmd_paipan_report(
     config: AppConfig,
     symbols: Sequence[str],
@@ -3405,6 +3521,13 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--ohlcv-file", default="", help="本地回测 CSV（列: symbol,date,open,high,low,close[,volume]；离线可用）")
     backtest.add_argument("--format", choices=["json", "markdown"], default="json")
     backtest.add_argument("--output", default="", help="输出文件路径（默认打印 stdout）")
+    export = sub.add_parser("export-ohlcv", help="导出公开 K 线为 CSV（列与 backtest --ohlcv-file 兼容；只读公开行情，无需凭据）")
+    export.add_argument("--symbols", default="", help="逗号分隔标的；默认用 runtime.symbols")
+    export.add_argument("--timeframe", default="", help="K 线周期（默认 runtime.timeframe）")
+    export.add_argument("--bars", type=int, default=250, help="每标的 K 线根数")
+    export.add_argument("--output", default="", help="输出 CSV 路径（默认 state_dir/ohlcv_*.csv）")
+    sub.add_parser("pause", help="暂停新开仓（创建 state_dir/pause 标记；存量仓位仍受管理）")
+    sub.add_parser("resume", help="恢复自动交易（移除暂停标记）")
     sub.add_parser("validate", help="校验配置、交易所市场和公开行情")
     sub.add_parser("once", help="执行一个完整周期")
     sub.add_parser("run", help="持续运行")
@@ -3528,6 +3651,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.output or None,
             args.ohlcv_file or None,
         )
+
+    if args.command == "export-ohlcv":
+        return cmd_export_ohlcv(
+            config,
+            _split_symbols(args.symbols, config.runtime.symbols),
+            args.timeframe or config.runtime.timeframe,
+            args.bars,
+            args.output or None,
+        )
+
+    if args.command in {"pause", "resume"}:
+        return cmd_pause_resume(state_dir, resume=(args.command == "resume"))
 
     lock_path = state_dir / "gufa_quant.lock"
     with InstanceLock(lock_path):

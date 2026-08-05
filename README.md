@@ -28,6 +28,9 @@
 - **`paipan-report`**：离线生成完整盘面 + 信号 + 断卦要点报告（JSON/Markdown），不连接交易所、不下单；适合排盘校验与人工审计。`--now` 可指定任意历史时刻复盘。
 - **`backtest-paipan`**：逐日排盘回测——对历史日线每天生成时空盘信号，统计十项古法与未来 N 日收益的 Pearson 相关、多头/空头命中率与平均收益；支持 `--ohlcv-file` 用本地 CSV 离线回测（列：`symbol,date,open,high,low,close[,volume]`）。统计结果仅供观察关联，不构成预测保证。
 - 新命令均为**只读**：不需要交易所凭据、不经过 InstanceLock、不下单。
+- **`export-ohlcv`**：导出公开 K 线为 CSV（列 `symbol,date,open,high,low,close,volume`，与 `backtest-paipan --ohlcv-file` 兼容），无需凭据，形成"导出→回测"数据闭环。
+- **暂停开关**：`pause` / `resume` 命令创建/移除 `state_dir/pause` 标记。暂停时**不开新仓**，但存量仓位管理与保护性退出（硬止损/回撤/日内亏损熔断）照常运行——运维应急不停进程。
+- **Webhook 事件通知**（可选）：`runtime.webhook_url` 配置端点后，成交（`order_fill`）、订单不确定（`order_uncertain`）、组合熔断（`halted`）事件会推送 JSON（含 sandbox 标志）；留空禁用、失败不影响交易主流程。
 
 ## 7.5.0 功能：每日初选 + 逐个精筛
 
@@ -275,6 +278,9 @@ python gufa_quant_pro.py --config config.json version
 python gufa_quant_pro.py --config config.json paipan-report --format markdown --output paipan-report.md
 python gufa_quant_pro.py --config config.json backtest-paipan --bars 240 --days 1 --format markdown
 python gufa_quant_pro.py --config config.json backtest-paipan --ohlcv-file history.csv --format json
+python gufa_quant_pro.py --config config.json export-ohlcv --timeframe 1d --bars 250 --output history.csv
+python gufa_quant_pro.py --config config.json pause
+python gufa_quant_pro.py --config config.json resume
 ```
 
 ## 状态与升级
