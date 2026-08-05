@@ -1,0 +1,104 @@
+{
+  "version": 2,
+  "exchange": {
+    "id": "okx",
+    "sandbox": true,
+    "market_type": "spot",
+    "api_key_env": "GUFA_API_KEY",
+    "secret_env": "GUFA_API_SECRET",
+    "password_env": "GUFA_API_PASSWORD",
+    "timeout_ms": 15000,
+    "max_retries": 4,
+    "retry_base_seconds": 1.0,
+    "recv_window_ms": 10000,
+    "client_order_id_param": "clientOrderId"
+  },
+  "runtime": {
+    "symbols": [
+      "BTC/USDT",
+      "ETH/USDT",
+      "SOL/USDT"
+    ],
+    "quote_currency": "USDT",
+    "timeframe": "1h",
+    "ohlcv_limit": 250,
+    "poll_interval_seconds": 60,
+    "closed_candle_only": true,
+    "max_candle_lag_seconds": 900,
+    "state_dir": "./runtime",
+    "log_level": "INFO",
+    "log_max_bytes": 10485760,
+    "log_backup_count": 10,
+    "health_file": "health.json",
+    "once_on_start": true,
+    "max_consecutive_cycle_errors": 5
+  },
+  "selection": {
+    "enabled": true,
+    "timeframe": "1d",
+    "ohlcv_limit": 250,
+    "top_n": 2,
+    "min_score": 0.55
+  },
+  "strategy": {
+    "weights": {
+      "奇门": 0.14,
+      "六壬": 0.12,
+      "太乙": 0.09,
+      "易经": 0.1,
+      "风水": 0.08,
+      "八字": 0.12,
+      "梅花": 0.08,
+      "紫微": 0.09,
+      "八卦": 0.1,
+      "四柱": 0.08
+    },
+    "entry_half": 0.64,
+    "entry_full": 0.76,
+    "exit_score": 0.42,
+    "hold_hysteresis": 0.03,
+    "min_signal_change": 0.015
+  },
+  "risk": {
+    "max_symbol_allocation": 0.2,
+    "max_total_allocation": 0.7,
+    "cash_reserve_pct": 0.2,
+    "max_order_quote": 10000.0,
+    "min_order_quote": 10.0,
+    "min_rebalance_quote": 20.0,
+    "min_rebalance_pct": 0.01,
+    "max_daily_loss_pct": 0.03,
+    "max_drawdown_pct": 0.1,
+    "stop_loss_pct": 0.035,
+    "take_profit_pct": 0.1,
+    "trailing_stop_pct": 0.04,
+    "trailing_activation_pct": 0.035,
+    "max_slippage_bps": 30.0,
+    "max_trades_per_day": 12,
+    "cooldown_seconds": 300,
+    "order_fill_timeout_seconds": 20,
+    "reject_unmanaged_positions": true,
+    "dust_quote": 5.0,
+    "live_trading_ack": ""
+  },
+  "ai": {
+    "enabled": false,
+    "model": "gpt-4.1-mini",
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url": "",
+    "timeout_seconds": 20,
+    "fail_closed": true,
+    "minimum_allow_confidence": 0.6,
+    "decision_mode": "bounded",
+    "max_output_tokens": 1200
+  },
+  "paipan": {
+    "enabled": true,
+    "true_solar_time": true,
+    "longitude": 116.4074,
+    "latitude": 39.9042,
+    "listing_time_source": "ohlcv",
+    "listing_times": {},
+    "exchange_timezone": "UTC"
+  }
+}

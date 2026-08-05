@@ -1,0 +1,21 @@
+# GuFaQuant-Pro 构建上下文排除（减小镜像构建上下文，防止凭据/状态泄漏进镜像）
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+.venv/
+runtime/
+memory/
+tests/
+scripts/
+deploy/
+*.bak-*
+*.bak
+.git/
+.gitignore
+config.json
+config.json.*
+credentials*.json
+.env
+*.log
+*.lock

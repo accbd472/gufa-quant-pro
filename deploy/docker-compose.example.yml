@@ -1,0 +1,45 @@
+# GuFaQuant-Pro 生产部署示例（Docker Compose）
+# 用法：
+#   1. 生成配置：python gufa_quant_pro.py --config ./config.json init-config
+#      并按要求修改（交易所/标的选择/风控/排盘/AI 开关）。
+#   2. 填写凭据：复制 gufa-quant-pro.env.example 为 gufa-quant-pro.env 并填入真实值。
+#   3. 本地冒烟：python gufa_quant_pro.py --config ./config.json validate
+#   4. 启动：docker compose -f deploy/docker-compose.example.yml up -d --build
+#   5. 观察：docker compose logs -f gufa-quant-pro；docker compose ps
+#
+# 安全基线：
+#   - read_only 根文件系统 + tmpfs /tmp + no-new-privileges + 非 root 用户（镜像内 uid 10001）
+#   - 配置与状态目录通过卷挂载，凭据走 env_file 不落盘
+#   - 健康检查复用 status 命令（读 health.json），start_period 90s 等待首周期
+#   - stop_grace_period 45s 与镜像 STOPSIGNAL SIGTERM 配合优雅退出
+
+services:
+  gufa-quant-pro:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: gufa-quant-pro:8.1.0
+    container_name: gufa-quant-pro
+    restart: unless-stopped
+    env_file:
+      - ./gufa-quant-pro.env
+    volumes:
+      - ../config.json:/config/config.json:ro
+      - ../runtime:/app/runtime
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "python", "gufa_quant_pro.py", "--config", "/config/config.json", "status"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

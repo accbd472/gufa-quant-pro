@@ -1,0 +1,24 @@
+[Unit]
+Description=GuFaQuant-Pro exchange sandbox/production service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gufa
+Group=gufa
+WorkingDirectory=/opt/gufa-quant-pro
+EnvironmentFile=/etc/gufa-quant-pro.env
+ExecStart=/opt/gufa-quant-pro/.venv/bin/python /opt/gufa-quant-pro/gufa_quant_pro.py --config /etc/gufa-quant-pro.json run
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/gufa-quant-pro
+
+[Install]
+WantedBy=multi-user.target

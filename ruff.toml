@@ -1,0 +1,9 @@
+# GuFaQuant-Pro ruff 基线（2026-08-06 固化）
+# 仅启用安全/正确性规则（pyflakes + 核心 pycodestyle）。
+# 现代化风格规则（UP006/UP045 等）未启用：历史代码沿用 typing.Dict/Optional，
+# 新代码已用 dict[str,...]/X|None，风格迁移不阻塞本基线。
+target-version = "py310"
+line-length = 100
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
