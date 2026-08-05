@@ -17,3 +17,12 @@
   任何需要构建 wheel 的 pip 安装必须先在 PowerShell 设置：`$env:SETUPTOOLS_USE_DISTUTILS="stdlib"`，
   否则报 `AssertionError: ...\distutils\core.py`（lunar_python 安装即为此法解决）。
 - 若问题复发，用 `py -3.10 -c "import setuptools"` 自检。
+
+## 生产化状态（8.1.0，2026-08-06）
+
+- 已 git init 并首次提交（commit a958bed）；git_commit 工具内部错误不可用，用 `git -c user.name=... commit` 命令行提交。
+- 部署资产：deploy/（compose 示例、env 模板、生产部署指南）、Dockerfile（HEALTHCHECK/STOPSIGNAL）、.dockerignore。
+- Docker Desktop 已装但引擎常不运行；构建前需先启动 Docker Desktop 等引擎就绪。
+- `gufa_divination/` 是旧版平行包（仅被自身测试引用），主程序用顶层模块；保留勿删。
+- 正式盘安全门：`exchange.sandbox=false` 必须同时设置 `risk.live_trading_ack="I_UNDERSTAND_LIVE_TRADING_RISK"`。
+
