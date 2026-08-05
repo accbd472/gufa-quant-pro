@@ -142,6 +142,8 @@ sudo systemctl status gufa-quant-pro
   `resume` 恢复。适合人工观察行情/修复问题时不停进程。
 - **事件通知**：配置 `runtime.webhook_url` 后，成交/订单不确定/熔断事件推送 JSON
   （含 sandbox 标志）；未配置或发送失败不影响交易。
+- **权益与审计汇总**：`stats` 输出周期数、区间收益、最大回撤、按标的成交数与错误数；
+  原始序列在 `runtime/equity.jsonl`（追加式）与 `runtime/orders.audit.jsonl`。
 
 ---
 

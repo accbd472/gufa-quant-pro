@@ -31,6 +31,8 @@
 - **`export-ohlcv`**：导出公开 K 线为 CSV（列 `symbol,date,open,high,low,close,volume`，与 `backtest-paipan --ohlcv-file` 兼容），无需凭据，形成"导出→回测"数据闭环。
 - **暂停开关**：`pause` / `resume` 命令创建/移除 `state_dir/pause` 标记。暂停时**不开新仓**，但存量仓位管理与保护性退出（硬止损/回撤/日内亏损熔断）照常运行——运维应急不停进程。
 - **Webhook 事件通知**（可选）：`runtime.webhook_url` 配置端点后，成交（`order_fill`）、订单不确定（`order_uncertain`）、组合熔断（`halted`）事件会推送 JSON（含 sandbox 标志）；留空禁用、失败不影响交易主流程。
+- **权益曲线历史**：每个周期追加一条 `state_dir/equity.jsonl`（时间/权益/可用计价币/暂停/成交数），不覆盖、可回放。
+- **`stats` 汇总**（只读）：汇总权益曲线与成交审计——周期数、区间收益、**最大回撤**、按标的分组成交数、订单错误/不确定次数，适合运维巡检与观察期评估。
 
 ## 7.5.0 功能：每日初选 + 逐个精筛
 
@@ -281,6 +283,7 @@ python gufa_quant_pro.py --config config.json backtest-paipan --ohlcv-file histo
 python gufa_quant_pro.py --config config.json export-ohlcv --timeframe 1d --bars 250 --output history.csv
 python gufa_quant_pro.py --config config.json pause
 python gufa_quant_pro.py --config config.json resume
+python gufa_quant_pro.py --config config.json stats
 ```
 
 ## 状态与升级

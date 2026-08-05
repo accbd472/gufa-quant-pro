@@ -63,6 +63,15 @@ def test_unknown_config_field_is_rejected(tmp_path: Path) -> None:
         load_default(tmp_path, lambda p: p["runtime"].__setitem__("typo", 1))
 
 
+def test_config_json_tolerates_utf8_bom(tmp_path: Path) -> None:
+    payload = g.default_config_dict()
+    payload["runtime"]["state_dir"] = str(tmp_path / "runtime")
+    path = tmp_path / "config-bom.json"
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    cfg = g.AppConfig.load(path)
+    assert cfg.runtime.state_dir.endswith("runtime")
+
+
 def test_old_config_without_selection_uses_safe_defaults(tmp_path: Path) -> None:
     payload = g.default_config_dict()
     payload.pop("selection")
@@ -696,3 +705,37 @@ def test_pause_resume_marker(tmp_path: Path) -> None:
     assert not (tmp_path / "pause").exists()
     # resume 无标记时幂等
     assert g.cmd_pause_resume(tmp_path, resume=True) == 0
+
+
+def test_cmd_stats_summary(tmp_path: Path, capsys) -> None:
+    equity = [
+        {"ts": "2026-08-01T00:00:00+00:00", "equity": 1000.0, "quote_free": 200.0, "paused": False, "status": "ok", "fills": 0},
+        {"ts": "2026-08-02T00:00:00+00:00", "equity": 1100.0, "quote_free": 300.0, "paused": False, "status": "ok", "fills": 1},
+        {"ts": "2026-08-03T00:00:00+00:00", "equity": 990.0, "quote_free": 400.0, "paused": True, "status": "ok", "fills": 0},
+        {"ts": "2026-08-04T00:00:00+00:00", "equity": 1039.5, "quote_free": 500.0, "paused": False, "status": "ok", "fills": 1},
+    ]
+    audit = [
+        {"ts": "2026-08-02T00:00:00+00:00", "event": "order_fill", "plan": {"symbol": "BTC/USDT", "side": "buy"}, "fill": {"filled_amount": 0.1}},
+        {"ts": "2026-08-02T00:00:01+00:00", "event": "order_fill", "plan": {"symbol": "ETH/USDT", "side": "buy"}, "fill": {}},
+        {"ts": "2026-08-03T00:00:00+00:00", "event": "order_error", "plan": {"symbol": "ETH/USDT"}, "error": "boom"},
+    ]
+    for row in equity:
+        g.append_jsonl(tmp_path / "equity.jsonl", row)
+    for row in audit:
+        g.append_jsonl(tmp_path / "orders.audit.jsonl", row)
+    # 容忍损坏行
+    with (tmp_path / "equity.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{broken\n")
+
+    assert g.cmd_stats(tmp_path, "health.json") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["cycles"] == 4
+    assert out["fills"] == 2
+    assert out["fills_by_symbol"] == {"BTC/USDT": 1, "ETH/USDT": 1}
+    assert out["order_errors"] == 1
+    assert out["order_uncertain"] == 0
+    assert out["equity"]["first"] == 1000.0 and out["equity"]["last"] == 1039.5
+    assert out["return_pct"] == 3.95
+    # 峰值 1100 → 最低 990 回撤 10%
+    assert out["max_drawdown_pct"] == 10.0
+    assert out["health_exists"] is False

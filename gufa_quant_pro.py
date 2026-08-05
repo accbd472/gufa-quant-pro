@@ -152,7 +152,8 @@ def append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
 
 def load_json(path: Path) -> Dict[str, Any]:
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        # utf-8-sig 同时兼容 Windows 工具写入的 UTF-8 BOM 与无 BOM 文件
+        with path.open("r", encoding="utf-8-sig") as handle:
             data = json.load(handle)
     except FileNotFoundError as exc:
         raise ConfigError(f"配置文件不存在: {path}") from exc
@@ -2834,6 +2835,16 @@ class GuFaQuantPro:
             "cycle_seconds": round(duration, 3),
         }
         atomic_write_json(self.state_dir / self.config.runtime.health_file, report, mode=0o644)
+        # 权益曲线历史（追加式，供 stats 命令与外部监控使用）
+        append_jsonl(self.state_dir / "equity.jsonl", {
+            "ts": iso_now(),
+            "equity": snapshot.equity,
+            "quote_free": snapshot.quote_free,
+            "risk_allowed": risk_status.allowed,
+            "paused": paused,
+            "status": report["status"],
+            "fills": len(fills),
+        })
         self.log.info(
             "周期完成 | equity=%.4f %s | fills=%d | risk=%s | selected=%s | scores=%s | %.2fs",
             snapshot.equity, self.config.runtime.quote_currency, len(fills),
@@ -3220,6 +3231,59 @@ def cmd_pause_resume(state_dir: Path, resume: bool) -> int:
     return 0
 
 
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    """读取 JSONL 文件；容忍空行与损坏行（进程中断时末行可能不完整）。"""
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def cmd_stats(state_dir: Path, health_file: str) -> int:
+    """汇总权益曲线与成交审计（只读，供运维与回测观察）。"""
+    equity_rows = _read_jsonl(state_dir / "equity.jsonl")
+    audit_rows = _read_jsonl(state_dir / "orders.audit.jsonl")
+    summary: Dict[str, Any] = {"cycles": len(equity_rows)}
+    if equity_rows:
+        first, last = equity_rows[0], equity_rows[-1]
+        summary["period"] = {"first": first.get("ts"), "last": last.get("ts")}
+        eq_first = first.get("equity")
+        eq_last = last.get("equity")
+        summary["equity"] = {"first": eq_first, "last": eq_last}
+        if isinstance(eq_first, (int, float)) and isinstance(eq_last, (int, float)) and eq_first > 0:
+            summary["return_pct"] = round((eq_last / eq_first - 1) * 100, 4)
+        peak = float("-inf")
+        max_dd = 0.0
+        for row in equity_rows:
+            eq = row.get("equity")
+            if not isinstance(eq, (int, float)) or eq <= 0:
+                continue
+            peak = max(peak, eq)
+            max_dd = max(max_dd, (peak - eq) / peak)
+        summary["max_drawdown_pct"] = round(max_dd * 100, 4)
+    fills = [row for row in audit_rows if row.get("event") == "order_fill"]
+    summary["fills"] = len(fills)
+    per_symbol: Dict[str, int] = {}
+    for fill in fills:
+        symbol = (fill.get("plan") or {}).get("symbol") or (fill.get("fill") or {}).get("symbol") or "?"
+        per_symbol[symbol] = per_symbol.get(symbol, 0) + 1
+    summary["fills_by_symbol"] = per_symbol
+    summary["order_errors"] = sum(1 for row in audit_rows if row.get("event") == "order_error")
+    summary["order_uncertain"] = sum(1 for row in audit_rows if row.get("event") == "order_uncertain")
+    summary["health_exists"] = (state_dir / health_file).exists()
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_paipan_report(
     config: AppConfig,
     symbols: Sequence[str],
@@ -3532,6 +3596,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("once", help="执行一个完整周期")
     sub.add_parser("run", help="持续运行")
     sub.add_parser("status", help="读取本地健康状态")
+    sub.add_parser("stats", help="汇总权益曲线与成交审计（只读）")
     adopt = sub.add_parser("adopt-positions", help="显式接管交易所账户已有现货仓位")
     adopt.add_argument(
         "--entry", action="append", default=[], metavar="SYMBOL=PRICE",
@@ -3624,6 +3689,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 1
         print(json.dumps(load_json(health), ensure_ascii=False, indent=2))
         return 0
+
+    if args.command == "stats":
+        return cmd_stats(state_dir, config.runtime.health_file)
 
     if args.command == "export-weights":
         path = state_dir / f"GuFa_Weights_{utc_now().strftime('%Y%m%d_%H%M%S')}.json"
