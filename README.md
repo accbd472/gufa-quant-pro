@@ -22,6 +22,13 @@
 - `paipan.enabled=false` 时回退到 7.x 的技术因子模式，便于回滚；`listing_time_source` 支持 `ohlcv`（默认）与 `manual`（人工指定上市时间）。
 - 新增依赖：`lunar_python`（历法数据与八字基础，MIT）。
 
+## 8.1 功能：断卦要点 + 排盘报告 + 古法信号回测
+
+- **确定性断卦要点**（`paipan_verdicts`）：每项古法给出人话结论与依据（如"初传巳火生日干辛金，气助日干"、"值符天柱临惊门（凶门）"），与置信度同源、完全可复现，供审计与报告。
+- **`paipan-report`**：离线生成完整盘面 + 信号 + 断卦要点报告（JSON/Markdown），不连接交易所、不下单；适合排盘校验与人工审计。`--now` 可指定任意历史时刻复盘。
+- **`backtest-paipan`**：逐日排盘回测——对历史日线每天生成时空盘信号，统计十项古法与未来 N 日收益的 Pearson 相关、多头/空头命中率与平均收益；支持 `--ohlcv-file` 用本地 CSV 离线回测（列：`symbol,date,open,high,low,close[,volume]`）。统计结果仅供观察关联，不构成预测保证。
+- 新命令均为**只读**：不需要交易所凭据、不经过 InstanceLock、不下单。
+
 ## 7.5.0 功能：每日初选 + 逐个精筛
 
 - `runtime.symbols` 是人工允许的币种候选白名单；程序和 AI 都不能扩展到白名单之外。
@@ -264,6 +271,10 @@ python gufa_quant_pro.py --config config.json once
 python gufa_quant_pro.py --config config.json run
 python gufa_quant_pro.py --config config.json status
 python gufa_quant_pro.py --config config.json export-weights
+python gufa_quant_pro.py --config config.json version
+python gufa_quant_pro.py --config config.json paipan-report --format markdown --output paipan-report.md
+python gufa_quant_pro.py --config config.json backtest-paipan --bars 240 --days 1 --format markdown
+python gufa_quant_pro.py --config config.json backtest-paipan --ohlcv-file history.csv --format json
 ```
 
 ## 状态与升级

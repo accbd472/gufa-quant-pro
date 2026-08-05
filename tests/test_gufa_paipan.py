@@ -240,6 +240,25 @@ def test_paipan_signals_shape(svc):
     assert len(result.natal) == 10
 
 
+def test_paipan_verdicts_shape(svc):
+    service = gp.PaipanService(g.PaipanConfig(listing_time_source="ohlcv"))
+    for panzer in (QimenPaipan(), LiurenPaipan(), TaiyiPaipan(), YijingPaipan(),
+                   FengshuiPaipan(), BaziPaipan(), MeihuaPaipan(), ZiweiPaipan(),
+                   BaguaPaipan(), SizhuPaipan()):
+        service.register(panzer)
+    result = service.paipan("BTC/USDT", now_dt=SAMPLE_DT, listing_ts=1502956800000)
+    verdicts = gps.paipan_verdicts(result.to_dict())
+    assert set(verdicts.keys()) == set(g.STRATEGY_NAMES)
+    for method, text in verdicts.items():
+        assert isinstance(text, str) and text.strip(), f"{method} 断卦要点为空"
+        assert "排盘不可用" not in text, f"{method} 出现异常: {text}"
+    # 每项要点都应包含与其规则相关的关键字段
+    assert "值符" in verdicts["奇门"] or "未定位" in verdicts["奇门"]
+    assert "初传" in verdicts["六壬"] or "无初传" in verdicts["六壬"]
+    assert "体用" in verdicts["梅花"]
+    assert "日主" in verdicts["八字"]
+
+
 # ---------------------------------------------------------------------------
 # StrategyEngine 排盘模式
 # ---------------------------------------------------------------------------

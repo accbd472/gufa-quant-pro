@@ -54,7 +54,7 @@ try:  # 8.0 真实排盘模块（可选）：缺少时回退旧技术因子并�
     from gufa_paipan_bazi import BaziPaipan, SizhuPaipan
     from gufa_paipan_ziwei import ZiweiPaipan
     from gufa_paipan_yijing import YijingPaipan, MeihuaPaipan, BaguaPaipan, FengshuiPaipan
-    from gufa_paipan_signal import paipan_signals
+    from gufa_paipan_signal import paipan_signals, paipan_verdicts
     PAIPAN_AVAILABLE = True
     _PAIPAN_IMPORT_ERROR: Optional[BaseException] = None
 except ImportError as exc:  # pragma: no cover
@@ -1061,6 +1061,18 @@ class MarketDataValidator:
         return df.reset_index(drop=True)
 
 
+def build_paipan_service(paipan_config: Any) -> PaipanService:
+    """组装十项排盘器并返回 PaipanService（report/backtest/策略共用）。"""
+    if not PAIPAN_AVAILABLE:
+        raise ConfigError("排盘模块不可用: " + str(_PAIPAN_IMPORT_ERROR))
+    service = PaipanService(paipan_config)
+    for panzer in (QimenPaipan(), LiurenPaipan(), TaiyiPaipan(),
+                   YijingPaipan(), FengshuiPaipan(), BaziPaipan(),
+                   MeihuaPaipan(), ZiweiPaipan(), BaguaPaipan(), SizhuPaipan()):
+        service.register(panzer)
+    return service
+
+
 class StrategyEngine:
     """十类互补信号，输出 [0,1] 看多置信度。
 
@@ -1072,16 +1084,7 @@ class StrategyEngine:
         self.config = config
         self.paipan_service: Optional[PaipanService] = None
         if paipan_config is not None and getattr(paipan_config, "enabled", False):
-            if not PAIPAN_AVAILABLE:
-                raise ConfigError(
-                    "paipan.enabled=true 但排盘模块不可用: " + str(_PAIPAN_IMPORT_ERROR)
-                )
-            service = PaipanService(paipan_config)
-            for panzer in (QimenPaipan(), LiurenPaipan(), TaiyiPaipan(),
-                           YijingPaipan(), FengshuiPaipan(), BaziPaipan(),
-                           MeihuaPaipan(), ZiweiPaipan(), BaguaPaipan(), SizhuPaipan()):
-                service.register(panzer)
-            self.paipan_service = service
+            self.paipan_service = build_paipan_service(paipan_config)
 
     @staticmethod
     def _series_last(series: pd.Series, default: float = 0.0) -> float:
@@ -3091,6 +3094,290 @@ def parse_entry_pairs(values: Sequence[str]) -> Dict[str, float]:
     return entries
 
 
+# =============================================================================
+# 8.1 排盘报告与古法信号回测（只读：不连接私密 API、不下单）
+# =============================================================================
+
+
+def _split_symbols(text: str, fallback: Sequence[str]) -> List[str]:
+    symbols = [s.strip() for s in text.split(",") if s.strip()]
+    return symbols or list(fallback)
+
+
+def cmd_paipan_report(
+    config: AppConfig,
+    symbols: Sequence[str],
+    now_iso: Optional[str],
+    fmt: str,
+    output: Optional[str],
+) -> int:
+    """离线生成完整盘面 + 信号 + 断卦要点报告，供人工审计与排盘校验。"""
+    if not config.paipan.enabled and not PAIPAN_AVAILABLE:
+        raise ConfigError("paipan 模块不可用")
+    svc = build_paipan_service(config.paipan)
+    now_dt = parse_iso(now_iso) if now_iso else datetime.now(timezone.utc)
+    payload: Dict[str, Any] = {
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "generated_at": utc_now().isoformat(),
+        "report_time": now_dt.isoformat(),
+        "paipan": {
+            "true_solar_time": config.paipan.true_solar_time,
+            "longitude": config.paipan.longitude,
+            "latitude": config.paipan.latitude,
+            "listing_time_source": config.paipan.listing_time_source,
+        },
+        "symbols": [],
+    }
+    for symbol in symbols:
+        result = svc.paipan(symbol, now_dt=now_dt)
+        entry = result.to_dict()
+        entry["signals"] = paipan_signals(entry)
+        entry["verdicts"] = paipan_verdicts(entry)
+        if not entry.get("natal"):
+            entry["diagnostics"]["natal_missing"] = "需 ohlcv 行情或 paipan.listing_times 手工指定"
+        payload["symbols"].append(entry)
+    text = _report_markdown(payload) if fmt == "markdown" else json.dumps(payload, ensure_ascii=False, indent=2)
+    return _emit(text, output)
+
+
+def _report_markdown(payload: Dict[str, Any]) -> str:
+    lines = [
+        f"# {APP_NAME} 排盘报告",
+        f"- 版本: {payload['version']}  生成: {payload['generated_at']}",
+        f"- 报告基准时间: {payload['report_time']}",
+        f"- 真太阳时修正: {'开' if payload['paipan']['true_solar_time'] else '关'} "
+        f"（经度 {payload['paipan']['longitude']}，纬度 {payload['paipan']['latitude']}）",
+        f"- 本命盘来源: {payload['paipan']['listing_time_source']}",
+        "",
+    ]
+    for entry in payload["symbols"]:
+        symbol = entry["symbol"]
+        lines.append(f"## {symbol} —— 时空盘 {entry['time_label']}")
+        lines.append("")
+        lines.append("| 古法 | 置信度 | 断卦要点 |")
+        lines.append("|---|---|---|")
+        for method in STRATEGY_NAMES:
+            score = entry["signals"].get(method, 0.5)
+            verdict = entry["verdicts"].get(method, "")
+            lines.append(f"| {method} | {score:.2f} | {verdict} |")
+        lines.append("")
+        lines.append(f"### 本命盘（{symbol}）")
+        natal = entry.get("natal") or {}
+        if not natal:
+            lines.append(f"未生成：{entry.get('diagnostics', {}).get('natal_missing', '无上市时间')}")
+        else:
+            for method in STRATEGY_NAMES:
+                chart = natal.get(method) or {}
+                key = {
+                    "奇门": ("dun", "ju"), "六壬": ("yuejiang",), "太乙": ("taiyi_gong",),
+                    "易经": ("ben_gua",), "风水": ("year_star",), "八字": ("day_master", "strength"),
+                    "梅花": ("ti_yong_relation",), "紫微": ("palaces",), "八卦": ("gua_gong",),
+                    "四柱": ("ganzhi",),
+                }.get(method, ())
+                summary = "、".join(str(chart.get(k)) for k in key if chart.get(k))
+                lines.append(f"- {method}: {summary or '（见完整 JSON）'}")
+        lines.append("")
+    lines.append("> 排盘过程真实可复现；预测准确性不保证，不构成投资建议。")
+    return "\n".join(lines)
+
+
+def cmd_backtest_paipan(
+    config: AppConfig,
+    symbols: Sequence[str],
+    bars: int,
+    days: int,
+    min_score: float,
+    fmt: str,
+    output: Optional[str],
+    ohlcv_file: Optional[str] = None,
+) -> int:
+    """逐日排盘回测：十项古法信号 vs 未来 N 日收益（公开历史行情，不下单）。
+
+    统计指标仅供观察古法信号与历史走势的统计关联，不构成预测保证。
+    """
+    if bars < 30:
+        raise ConfigError("--bars 至少 30")
+    if days < 1:
+        raise ConfigError("--days 至少 1")
+    if not 0.0 < min_score < 1.0:
+        raise ConfigError("--min-score 必须在 (0,1)")
+    if not PAIPAN_AVAILABLE:
+        raise ConfigError("排盘模块不可用: " + str(_PAIPAN_IMPORT_ERROR))
+    svc = build_paipan_service(config.paipan)
+    rows: List[Dict[str, Any]] = []
+    if ohlcv_file:
+        ohlcv_map = _load_ohlcv_file(ohlcv_file)
+        for symbol in symbols:
+            if symbol not in ohlcv_map:
+                raise ConfigError(f"CSV 中无 {symbol} 数据（可用列: {sorted(ohlcv_map)}）")
+            ohlcv = ohlcv_map[symbol]
+            print(f"[backtest] {symbol}: {len(ohlcv)} 根日线（CSV）", file=sys.stderr)
+            rows.extend(_ohlcv_to_rows(svc, symbol, ohlcv, days))
+    else:
+        exchange_id = config.exchange.id
+        if not hasattr(ccxt, exchange_id):
+            raise ConfigError(f"CCXT 不支持交易所: {exchange_id}")
+        # 公开行情回测：不设 sandbox（用真实历史数据），无需 API 凭据。
+        exchange = getattr(ccxt, exchange_id)({
+            "enableRateLimit": True,
+            "timeout": config.exchange.timeout_ms,
+            "options": {"defaultType": "spot"},
+        })
+        limit = min(bars, 300)  # OKX 单次日线上限 300
+        for symbol in symbols:
+            try:
+                ohlcv = exchange.fetch_ohlcv(symbol, "1d", limit=limit)
+            except Exception as exc:  # noqa: BLE001 - 网络/交易所异常统一转为清晰报错
+                raise ConfigError(
+                    f"拉取 {symbol} 历史行情失败（请检查网络/交易所可达性）："
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+            if not ohlcv or len(ohlcv) < 30:
+                raise ConfigError(f"{symbol} 历史日线不足: {len(ohlcv) if ohlcv else 0} 根")
+            print(f"[backtest] {symbol}: {len(ohlcv)} 根日线（公开行情）", file=sys.stderr)
+            rows.extend(_ohlcv_to_rows(svc, symbol, ohlcv, days))
+    payload: Dict[str, Any] = {
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "generated_at": utc_now().isoformat(),
+        "exchange": "csv" if ohlcv_file else config.exchange.id,
+        "timeframe": "1d",
+        "fwd_days": days,
+        "min_score": min_score,
+        "samples": len(rows),
+        "per_method": _backtest_stats(rows, config.strategy.weights, days, min_score),
+        "disclaimer": "统计相关性仅供参考，不构成预测保证（README 免责声明）",
+    }
+    text = _backtest_markdown(payload) if fmt == "markdown" else json.dumps(payload, ensure_ascii=False, indent=2)
+    return _emit(text, output)
+
+
+def _ohlcv_to_rows(svc: PaipanService, symbol: str, ohlcv: Sequence[Sequence[float]], days: int) -> List[Dict[str, Any]]:
+    """把 [[ts_ms, o, h, l, c, v], ...] 逐根排盘并计算未来收益。"""
+    rows: List[Dict[str, Any]] = []
+    closes = [float(c[4]) for c in ohlcv]
+    for i in range(len(ohlcv) - days):
+        ts = int(ohlcv[i][0])
+        now_dt = datetime.fromtimestamp(ts / 1000, timezone.utc)
+        result = svc.paipan(symbol, now_dt=now_dt)
+        sig = paipan_signals(result.to_dict())
+        rows.append({
+            "symbol": symbol,
+            "date": datetime.fromtimestamp(ts / 1000, timezone.utc).strftime("%Y-%m-%d"),
+            "signals": sig,
+            "fwd_return": round(closes[i + days] / closes[i] - 1.0, 6),
+        })
+    return rows
+
+
+def _load_ohlcv_file(path: str) -> Dict[str, List[List[float]]]:
+    """读取回测 CSV（列: symbol,date,open,high,low,close,volume 或 时间戳/OHLCV）。
+
+    时间列支持 ISO 字符串或毫秒时间戳；按 symbol 分组为 [[ts,o,h,l,c,v], ...]。
+    """
+    csv_path = Path(path).expanduser().resolve()
+    if not csv_path.exists():
+        raise ConfigError(f"回测 CSV 不存在: {csv_path}")
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as exc:  # noqa: BLE001
+        raise ConfigError(f"读取 CSV 失败: {exc}") from exc
+    if len(df.columns) < 6:
+        raise ConfigError("CSV 至少需要 6 列: symbol,date,open,high,low,close[,volume]")
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    mapping: Dict[str, List[List[float]]] = {}
+    for name, group in df.groupby(df.columns[0], sort=False):
+        g = group.sort_values(df.columns[1])
+        ts_values = g.iloc[:, 1]
+        first = str(ts_values.iloc[0])
+        if first.replace("-", "").replace(".", "").isdigit() and len(first) >= 10:
+            times = ts_values.astype("int64").tolist()  # 毫秒时间戳
+        else:
+            times = [int(pd.Timestamp(v).timestamp() * 1000) for v in ts_values]
+        rows = []
+        for idx, ts in enumerate(times):
+            o, high, low, close = (float(g.iloc[idx, j]) for j in (2, 3, 4, 5))
+            v = float(g.iloc[idx, 6]) if len(g.columns) > 6 else 0.0
+            rows.append([ts, o, high, low, close, v])
+        mapping[name] = rows
+    return mapping
+
+
+def _backtest_stats(
+    rows: Sequence[Dict[str, Any]],
+    weights: Mapping[str, float],
+    days: int,
+    min_score: float,
+) -> Dict[str, Any]:
+    n = len(rows)
+    total_w = sum(weights.values()) or 1.0
+
+    def agg(sig: Mapping[str, float]) -> float:
+        return sum(sig.get(m, 0.5) * weights.get(m, 0.0) for m in STRATEGY_NAMES) / total_w
+
+    def stats_for(xs: Sequence[float]) -> Dict[str, Any]:
+        ys = [r["fwd_return"] for r in rows]
+        pearson: Optional[float] = None
+        if n >= 3:
+            corr = float(pd.Series(xs).corr(pd.Series(ys)))
+            if corr == corr:  # NaN 判定
+                pearson = round(corr, 4)
+        bull = [y for x, y in zip(xs, ys) if x >= min_score]
+        bear = [y for x, y in zip(xs, ys) if x <= 1.0 - min_score]
+        return {
+            "n": n,
+            "pearson": pearson,
+            "bull_n": len(bull),
+            "bull_hit_rate": round(sum(1 for y in bull if y > 0) / len(bull), 4) if bull else None,
+            "bull_mean_return": round(sum(bull) / len(bull), 6) if bull else None,
+            "bear_n": len(bear),
+            "bear_hit_rate": round(sum(1 for y in bear if y < 0) / len(bear), 4) if bear else None,
+            "bear_mean_return": round(sum(bear) / len(bear), 6) if bear else None,
+        }
+
+    stats: Dict[str, Any] = {m: stats_for([r["signals"][m] for r in rows]) for m in STRATEGY_NAMES}
+    stats["综合"] = stats_for([agg(r["signals"]) for r in rows])
+    return stats
+
+
+def _backtest_markdown(payload: Dict[str, Any]) -> str:
+    lines = [
+        f"# {APP_NAME} 古法信号回测",
+        f"- 版本: {payload['version']}  生成: {payload['generated_at']}",
+        f"- 交易所: {payload['exchange']}  周期: {payload['timeframe']}  样本: {payload['samples']}",
+        f"- 未来 {payload['fwd_days']} 日收益；多头阈值 ≥ {payload['min_score']}，空头阈值 ≤ {1.0 - payload['min_score']}",
+        "",
+        "| 古法 | 样本 | Pearson | 多头n | 多头命中 | 多头均值 | 空头n | 空头命中 | 空头均值 |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for method, st in payload["per_method"].items():
+        def pct(v):
+            return f"{v * 100:.1f}%" if v is not None else "-"
+
+        def pct2(v):
+            return f"{v * 100:.2f}%" if v is not None else "-"
+
+        lines.append(
+            f"| {method} | {st['n']} | {st['pearson'] if st['pearson'] is not None else '-'} "
+            f"| {st['bull_n']} | {pct(st['bull_hit_rate'])} | {pct2(st['bull_mean_return'])} "
+            f"| {st['bear_n']} | {pct(st['bear_hit_rate'])} | {pct2(st['bear_mean_return'])} |"
+        )
+    lines.append("")
+    lines.append(f"> {payload['disclaimer']}")
+    return "\n".join(lines)
+
+
+def _emit(text: str, output: Optional[str]) -> int:
+    if output:
+        path = Path(output).expanduser().resolve()
+        path.write_text(text, encoding="utf-8")
+        print(f"已写入: {path}")
+    else:
+        print(text)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=f"{APP_NAME} {APP_VERSION}")
     parser.add_argument("--config", default="config.json", help="JSON 配置文件路径")
@@ -3105,6 +3392,19 @@ def build_parser() -> argparse.ArgumentParser:
     model_set = model_sub.add_parser("set", help="切换模型；省略 ID 时交互选择")
     model_set.add_argument("model_id", nargs="?", help="中转站支持的模型 ID")
     sub.add_parser("ai-check", help="仅测试 AI 中转站与严格 JSON Schema；不连接交易所、不下单")
+    report = sub.add_parser("paipan-report", help="离线生成完整排盘报告：盘面+信号+断卦要点（不下单）")
+    report.add_argument("--symbols", default="", help="逗号分隔标的；默认用 runtime.symbols")
+    report.add_argument("--now", default="", help="ISO 时间（默认当前 UTC 时间）")
+    report.add_argument("--format", choices=["json", "markdown"], default="json")
+    report.add_argument("--output", default="", help="输出文件路径（默认打印 stdout）")
+    backtest = sub.add_parser("backtest-paipan", help="历史回测：逐日排盘信号 vs 未来收益（公开行情，不下单）")
+    backtest.add_argument("--symbols", default="", help="逗号分隔标的；默认用 runtime.symbols")
+    backtest.add_argument("--bars", type=int, default=240, help="历史日线根数（最多 300）")
+    backtest.add_argument("--days", type=int, default=1, help="未来 N 日收益")
+    backtest.add_argument("--min-score", type=float, default=0.6, help="多头阈值（空头=1-该值）")
+    backtest.add_argument("--ohlcv-file", default="", help="本地回测 CSV（列: symbol,date,open,high,low,close[,volume]；离线可用）")
+    backtest.add_argument("--format", choices=["json", "markdown"], default="json")
+    backtest.add_argument("--output", default="", help="输出文件路径（默认打印 stdout）")
     sub.add_parser("validate", help="校验配置、交易所市场和公开行情")
     sub.add_parser("once", help="执行一个完整周期")
     sub.add_parser("run", help="持续运行")
@@ -3207,6 +3507,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         atomic_write_json(path, asdict(config.strategy))
         print(path)
         return 0
+
+    if args.command == "paipan-report":
+        return cmd_paipan_report(
+            config,
+            _split_symbols(args.symbols, config.runtime.symbols),
+            args.now or None,
+            args.format,
+            args.output or None,
+        )
+
+    if args.command == "backtest-paipan":
+        return cmd_backtest_paipan(
+            config,
+            _split_symbols(args.symbols, config.runtime.symbols),
+            args.bars,
+            args.days,
+            args.min_score,
+            args.format,
+            args.output or None,
+            args.ohlcv_file or None,
+        )
 
     lock_path = state_dir / "gufa_quant.lock"
     with InstanceLock(lock_path):

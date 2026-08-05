@@ -112,7 +112,9 @@ sudo systemctl status gufa-quant-pro
        `paipan_charts`（本命盘 + 时空盘十项）与 AI 解读。
 3. [ ] **风控限额收紧**：`max_order_quote` / `max_total_allocation` 用你能承受的最小值，
        `max_daily_loss_pct` 保留默认熔断。
-4. [ ] **观察期**：模拟盘连续运行 ≥ 数个交易日，确认信号分布、调仓频率、日志无异常。
+4. [ ] **观察期**：模拟盘连续运行 ≥ 数个交易日，确认信号分布、调仓频率、日志无异常；
+       用 `backtest-paipan` 回测古法信号与未来收益的关联（或 `--ohlcv-file` 本地数据），
+       用 `paipan-report` 抽查排盘与断卦要点是否符合预期。
 5. [ ] **小仓位真盘试运行**（可选但强烈建议）：sandbox 保持 true 期间用交易所
        Demo/测试网账户验证订单流。
 6. [ ] **正式盘确认**：仅在充分验证后，设置 `exchange.sandbox=false` 且
