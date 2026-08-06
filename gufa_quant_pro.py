@@ -3606,6 +3606,10 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--output", default="", help="输出 CSV 路径（默认 state_dir/ohlcv_*.csv）")
     sub.add_parser("pause", help="暂停新开仓（创建 state_dir/pause 标记；存量仓位仍受管理）")
     sub.add_parser("resume", help="恢复自动交易（移除暂停标记）")
+    console = sub.add_parser("console", help="启动 Web 控制台（小白/手机端；一键配置、启动/停止）")
+    console.add_argument("--host", default="127.0.0.1", help="监听地址；手机访问用 0.0.0.0")
+    console.add_argument("--port", type=int, default=8600, help="监听端口（默认 8600）")
+    console.add_argument("--token", default="", help="访问令牌（默认随机生成并打印）")
     sub.add_parser("validate", help="校验配置、交易所市场和公开行情")
     sub.add_parser("once", help="执行一个完整周期")
     sub.add_parser("run", help="持续运行")
@@ -3639,6 +3643,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "setup":
         run_setup_wizard(config_path)
         return 0
+
+    if args.command == "console":
+        from gufa_console import run_console
+        return run_console(config_path, host=args.host, port=args.port, token=args.token)
 
     config = AppConfig.load(config_path)
     credentials = CredentialStore(default_credentials_path(config_path))

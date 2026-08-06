@@ -174,6 +174,27 @@ python gufa_quant_pro.py --config config.json run
 
 警告：`once` 与 `run` 都可能向交易所模拟盘提交远程订单，不是无副作用测试命令。测试 AI 应使用 `ai-check`。
 
+### 6. Web 控制台（小白 / 手机端）
+
+本机启动（默认仅本机可访问）：
+
+```bash
+python gufa_quant_pro.py --config config.json console
+```
+
+手机同一局域网访问（暴露到局域网，需令牌保护）：
+
+```bash
+python gufa_quant_pro.py --config config.json console --host 0.0.0.0
+```
+
+- 控制台启动时会打印**访问令牌**（也可用 `--token` 或环境变量 `GUFA_CONSOLE_TOKEN` 固定）；
+  所有 `/api/*` 接口都需要该令牌。
+- 功能：一键设置向导（交易所凭据 / AI 断卦师 / 代理与交易对）、一键 启动/停止/暂停/恢复、
+  只读看板（状态、权益曲线、持仓、成交、日志）、一键校验。
+- 凭据只写入本地凭据文件（不经过网络、不回显）；控制台默认只监听 `127.0.0.1`。
+- 停止控制台（Ctrl+C）**不会**停止已启动的交易进程；交易进程由控制台托管，可在页面停止。
+
 ## 第三方 OpenAI 兼容中转站
 
 通过 `setup` 修改最安全；也可以手工修改 `config.json` 中的非敏感字段：
