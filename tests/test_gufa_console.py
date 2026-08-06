@@ -2,6 +2,7 @@
 """gufa_console Web 控制台测试（纯本地，不联网）。"""
 
 import json
+import os
 import threading
 import urllib.error
 import urllib.request
@@ -125,6 +126,75 @@ def test_config_save_and_validation(server_env) -> None:
                        {"exchange": {"proxy_url": "socks5://x"}})
     assert status == 400
     assert "http" in body.get("error", "")
+
+
+def test_symbols_candidates_builtin(server_env, monkeypatch) -> None:
+    monkeypatch.setattr(gc, "_fetch_okx_candidates", lambda *a, **k: None)
+    status, body = api(server_env["port"], "GET", "/api/symbols/candidates")
+    assert status == 200
+    assert body["source"] == "builtin"
+    assert "BTC/USDT" in body["symbols"]
+    assert body["quote"] == "USDT"
+
+
+def test_symbols_candidates_from_okx(server_env, monkeypatch) -> None:
+    monkeypatch.setattr(gc, "_fetch_okx_candidates",
+                        lambda *a, **k: ["BTC/USDT", "ETH/USDT", "SOL/USDT"])
+    status, body = api(server_env["port"], "GET", "/api/symbols/candidates")
+    assert status == 200
+    assert body["source"] == "okx"
+    assert body["symbols"] == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+
+
+def test_symbols_save_basic(server_env) -> None:
+    status, body = api(server_env["port"], "POST", "/api/symbols",
+                       {"symbols": ["ETH/USDT", "SOL/USDT"]})
+    assert status == 200 and body["ok"] is True
+    assert body["reset"] is False
+    cfg = g.AppConfig.load(server_env["config_path"])
+    assert cfg.runtime.symbols == ["ETH/USDT", "SOL/USDT"]
+
+
+def test_symbols_save_running_conflict(server_env) -> None:
+    server_env["server"].managed.pid = os.getpid()  # 当前进程存活 → running=True
+    status, body = api(server_env["port"], "POST", "/api/symbols",
+                       {"symbols": ["ETH/USDT"]})
+    assert status == 409
+    assert "停止" in body.get("error", "")
+
+
+def test_symbols_save_invalid(server_env) -> None:
+    status, body = api(server_env["port"], "POST", "/api/symbols", {"symbols": []})
+    assert status == 400
+    status, body = api(server_env["port"], "POST", "/api/symbols",
+                       {"symbols": ["BTC", "BTC/USDT"]})
+    assert status == 400
+
+
+def test_symbols_save_needs_reset_and_backup(server_env) -> None:
+    # 旧状态绑定当前配置的标的
+    cfg0 = g.AppConfig.load(server_env["config_path"])
+    old_symbols = list(cfg0.runtime.symbols)
+    old_profile = g.build_profile_id(cfg0, "")
+    state_file = server_env["state_dir"] / "state.json"
+    write_json(state_file, {"version": 4, "profile_id": old_profile, "positions": {}})
+    # 第一次：只提示需要重置，配置回滚
+    status, body = api(server_env["port"], "POST", "/api/symbols",
+                       {"symbols": ["ETH/USDT"]})
+    assert status == 200 and body["ok"] is False and body.get("needs_reset") is True
+    cfg = g.AppConfig.load(server_env["config_path"])
+    assert cfg.runtime.symbols == old_symbols
+    assert state_file.exists()
+    # 第二次：确认重置 → 保存并备份旧状态
+    status, body = api(server_env["port"], "POST", "/api/symbols",
+                       {"symbols": ["ETH/USDT"], "reset_state": True})
+    assert status == 200 and body["ok"] is True and body["reset"] is True
+    assert body["backup"] and Path(body["backup"]).is_dir()
+    cfg = g.AppConfig.load(server_env["config_path"])
+    assert cfg.runtime.symbols == ["ETH/USDT"]
+    assert not state_file.exists()
+    backup_dir = Path(body["backup"])
+    assert (backup_dir / "state.json").exists()
 
 
 def test_credentials_save(server_env) -> None:

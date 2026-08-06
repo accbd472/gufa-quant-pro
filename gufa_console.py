@@ -19,10 +19,13 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
 import threading
+import urllib.request
+from copy import deepcopy
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -49,9 +52,54 @@ _ALLOWED_CONFIG: Dict[str, List[str]] = {
            "decision_mode", "fail_closed", "max_output_tokens"],
 }
 
+# OKX 公开现货合约列表（用于自助选择交易标的；经代理拉取，失败则回退内置列表）
+_OKX_INSTRUMENTS_URL = "https://www.okx.com/api/v5/public/instruments?instType=SPOT"
+
+# 内置主流币候选池（OKX 现货，计价币 USDT；网络不可用时仍可自助选择）
+_BUILTIN_SPOT_SYMBOLS: List[str] = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "BNB/USDT",
+    "ADA/USDT", "AVAX/USDT", "LINK/USDT", "TON/USDT", "TRX/USDT", "DOT/USDT",
+    "LTC/USDT", "BCH/USDT", "NEAR/USDT", "APT/USDT", "ARB/USDT", "OP/USDT",
+    "SUI/USDT", "PEPE/USDT", "SHIB/USDT", "UNI/USDT", "ATOM/USDT", "FIL/USDT",
+    "XLM/USDT", "ICP/USDT", "HBAR/USDT", "INJ/USDT", "SEI/USDT", "TIA/USDT",
+    "WIF/USDT", "ORDI/USDT", "RNDR/USDT", "ETC/USDT", "POL/USDT",
+]
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _fetch_okx_candidates(proxy_url: str, quote: str) -> Optional[List[str]]:
+    """经代理拉取 OKX 现货合约列表（只读公开接口）。失败返回 None，调用方回退内置池。"""
+    try:
+        if proxy_url:
+            handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            opener = urllib.request.build_opener(handler)
+        else:
+            opener = urllib.request.build_opener()
+        request = urllib.request.Request(
+            _OKX_INSTRUMENTS_URL,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GuFaQuant/8.1"},
+        )
+        with opener.open(request, timeout=8) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        rows = payload.get("data") or []
+        symbols: List[str] = []
+        for row in rows:
+            if row.get("instType") != "SPOT" or row.get("state") != "live":
+                continue
+            inst = str(row.get("instId") or "")
+            if "-" not in inst:
+                continue
+            base, contract_quote = inst.rsplit("-", 1)
+            if contract_quote.upper() == quote.upper():
+                symbols.append(f"{base.upper()}/{quote.upper()}")
+        seen: set = set()
+        deduped = [s for s in symbols if not (s in seen or seen.add(s))]
+        return deduped[:80] or None
+    except Exception:
+        return None
 
 
 def _read_json(path: Path, default: Any = None) -> Any:
@@ -157,6 +205,105 @@ class ConsoleServer(ThreadingHTTPServer):
 
     def credentials_store(self) -> g.CredentialStore:
         return g.CredentialStore(g.default_credentials_path(self.config_path))
+
+    # ---- 自助选择交易标的 ----
+    def symbols_candidates(self) -> Dict[str, Any]:
+        """返回可自助选择的交易对：优先从 OKX 实时拉取，失败回退内置池。"""
+        cfg = self.resolve_config()
+        quote = (cfg.runtime.quote_currency if cfg else "USDT").strip().upper() or "USDT"
+        proxy_url = (cfg.exchange.proxy_url.strip() if cfg else "") or ""
+        fetched = _fetch_okx_candidates(proxy_url, quote)
+        if fetched:
+            return {"source": "okx", "quote": quote, "symbols": fetched,
+                    "builtin": _BUILTIN_SPOT_SYMBOLS}
+        return {"source": "builtin", "quote": quote, "symbols": list(_BUILTIN_SPOT_SYMBOLS),
+                "builtin": list(_BUILTIN_SPOT_SYMBOLS)}
+
+    def save_symbols(self, body: Dict[str, Any]) -> tuple:
+        """保存交易标的；检测旧状态绑定并在确认后备份重置。返回 (status, payload)。"""
+        raw = body.get("symbols")
+        if not isinstance(raw, list) or not raw:
+            return 400, {"ok": False, "error": "请至少选择一个交易对"}
+        symbols = [str(s).strip().upper() for s in raw if str(s).strip()]
+        if not symbols:
+            return 400, {"ok": False, "error": "请至少选择一个交易对"}
+        if len(symbols) != len(set(symbols)):
+            return 400, {"ok": False, "error": "交易对存在重复项"}
+        for symbol in symbols:
+            if "/" not in symbol:
+                return 400, {"ok": False, "error": f"交易对格式应为 币种/计价币，如 BTC/USDT：{symbol}"}
+            base, quote = symbol.split("/", 1)
+            if not base or not quote or base == quote:
+                return 400, {"ok": False, "error": f"交易对无效：{symbol}"}
+        if self.managed.running:
+            return 409, {"ok": False, "error": "交易进程正在运行，请先点击「■ 停止交易」再更换标的"}
+
+        if not self.config_path.exists():
+            g.atomic_write_json(self.config_path, g.default_config_dict(), mode=0o644)
+        try:
+            payload = g.load_json(self.config_path)
+        except Exception as exc:  # noqa: BLE001
+            return 400, {"ok": False, "error": f"现有配置无法读取: {exc}"}
+        old_payload = deepcopy(payload)
+        payload.setdefault("runtime", {})["symbols"] = symbols
+        try:
+            g.atomic_write_json(self.config_path, payload, mode=0o644)
+            new_cfg = g.AppConfig.load(self.config_path)
+        except g.ConfigError as exc:
+            g.atomic_write_json(self.config_path, old_payload, mode=0o644)
+            return 400, {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            g.atomic_write_json(self.config_path, old_payload, mode=0o644)
+            return 400, {"ok": False, "error": f"保存失败: {exc}"}
+
+        # 状态绑定检查：symbols 计入 profile 指纹，更换标的后旧 state.json 会拒绝启动
+        state_dir = self.resolve_state_dir()
+        needs_reset = False
+        if state_dir is not None:
+            state = _read_json(state_dir / "state.json", None)
+            if isinstance(state, dict):
+                old_profile = str(state.get("profile_id") or "")
+                if old_profile:
+                    store = self.credentials_store()
+                    account_key = (
+                        os.getenv(new_cfg.exchange.api_key_env, "").strip()
+                        or store.stored(new_cfg.exchange.api_key_env)
+                    )
+                    new_profile = g.build_profile_id(new_cfg, account_key)
+                    needs_reset = old_profile != new_profile
+        if needs_reset and not body.get("reset_state"):
+            g.atomic_write_json(self.config_path, old_payload, mode=0o644)
+            return 200, {
+                "ok": False,
+                "needs_reset": True,
+                "error": "更换标的后，旧交易状态与新的交易对不匹配，需要重置状态（旧状态会先备份）。请确认后重试。",
+            }
+        backup = ""
+        if needs_reset and state_dir is not None:
+            backup = self._backup_state_files(state_dir)
+        note = "已保存；请点击「▶ 启动交易」开始自动交易"
+        if needs_reset:
+            note = f"已保存并重置交易状态；旧状态已备份到 {backup}，请点击「▶ 启动交易」"
+        return 200, {"ok": True, "reset": needs_reset, "backup": backup, "note": note}
+
+    def _backup_state_files(self, state_dir: Path) -> str:
+        """把旧状态文件复制到 state_backup_<时间戳>/ 并移除原件（换标的后重新开始）。"""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_dir = state_dir / f"state_backup_{stamp}"
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return ""
+        for name in ("state.json", "health.json", "equity.jsonl", "orders.audit.jsonl", "pause"):
+            source = state_dir / name
+            if not source.exists():
+                continue
+            try:
+                shutil.copy2(source, backup_dir / name)
+                source.unlink()
+            except OSError:
+                pass
+        return str(backup_dir)
 
     # ---- 托管进程 ----
     def _restore_managed(self) -> None:
@@ -444,6 +591,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_json(raw)
         elif path == "/api/config":
             self._send_json(self._config_payload())
+        elif path == "/api/symbols/candidates":
+            self._send_json(self.server.symbols_candidates())
         else:
             self._send_json({"error": "未知接口"}, 404)
 
@@ -459,6 +608,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._handle_credentials_save(body)
         elif path == "/api/control":
             self._handle_control(body)
+        elif path == "/api/symbols":
+            status, payload = self.server.save_symbols(body)
+            self._send_json(payload, status)
         elif path == "/api/validate":
             result = self.server.validate_now()
             self._send_json(result)
@@ -676,6 +828,13 @@ input[type=checkbox]{width:auto}
 .modal.active{display:flex}
 .modal-box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;width:min(90vw,380px)}
 .svg-wrap{overflow:auto}
+.chip{display:inline-block;padding:7px 12px;border:1px solid var(--line);border-radius:999px;background:var(--card);color:var(--txt);font-size:13px;cursor:pointer;user-select:none}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
+#candGrid{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 10px;max-height:220px;overflow:auto;padding:2px}
+#symSearch{font-size:14px}
+.sel-list{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 8px}
+.sel-chip{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:rgba(59,130,246,.12);border:1px solid rgba(59,130,246,.4);font-size:13px}
+.sel-chip b{cursor:pointer;color:var(--dim);font-weight:700}
 </style>
 </head>
 <body>
@@ -723,6 +882,7 @@ input[type=checkbox]{width:auto}
 <div class="panel" id="panel-trades"><table id="tradeTable"><thead><tr><th>时间</th><th>事件</th><th>交易对</th><th>说明</th></tr></thead><tbody></tbody></table></div>
 <div class="panel" id="panel-log"><pre id="logPre">加载中…</pre></div>
 <div class="panel" id="panel-setup">
+  <p class="hint" style="margin-bottom:10px">当前支持 <strong>OKX 模拟盘/正式盘现货（虚拟货币）</strong>。股票行情源暂未接入，后续可扩展。第 3 步可<strong>自助选择要交易的币种</strong>，保存后点「▶ 启动交易」即可自己运行。</p>
   <div class="tabs" style="border-bottom:none">
     <div class="tab active" data-step="1" onclick="switchStep(1)">1 交易所</div>
     <div class="tab" data-step="2" onclick="switchStep(2)">2 AI 断卦师</div>
@@ -749,8 +909,15 @@ input[type=checkbox]{width:auto}
   </div>
 
   <div class="step" id="step-3" style="display:none">
-    <div class="form-row"><label>交易对（逗号分隔）</label><input id="f_symbols" value="BTC/USDT,ETH/USDT,SOL/USDT"></div>
-    <div class="form-row"><label>K 线周期</label><select id="f_tf"><option>1h</option><option>4h</option><option>1d</option></select></div>
+    <p class="hint" style="margin-bottom:10px">🎯 选择要交易的<strong>虚拟货币</strong>（OKX 现货）。点击下方币种即可加入/移除；也可在输入框手动输入任意交易对（如 SOL/USDT）。<em>股票行情源暂未接入，后续可扩展。</em></p>
+    <div class="form-row"><label>已选交易对（可手动编辑）</label><input id="f_symbols" value="BTC/USDT,ETH/USDT,SOL/USDT" placeholder="BTC/USDT,ETH/USDT"></div>
+    <div class="form-row"><label>搜索币种（从交易所实时列表或内置主流币中选）</label><input id="symSearch" placeholder="输入名称过滤，如 BTC / ETH / SOL…" oninput="renderCands()"></div>
+    <div id="candGrid"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button onclick="clearSymbols()" style="flex:1">🗑 清空已选</button>
+      <button onclick="fillPopular()" style="flex:1">⭐ 填入主流三币</button>
+    </div>
+    <div class="form-row" style="margin-top:14px"><label>K 线周期</label><select id="f_tf"><option>1h</option><option>4h</option><option>1d</option></select></div>
     <div class="form-row"><label>轮询间隔（秒）</label><input id="f_poll" type="number" value="60"></div>
     <div class="form-row"><label>Webhook 通知 URL（可选）</label><input id="f_webhook" placeholder="留空禁用"></div>
     <button class="primary" onclick="saveStep3()">保存运行设置</button>
@@ -773,7 +940,7 @@ function api(path, opts={}){
 function toast(msg, ms=2600){ const t=document.getElementById('toast'); t.textContent=msg; t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(()=>t.style.display='none', ms); }
 function showLogin(){ document.getElementById('loginModal').classList.add('active'); }
 function saveToken(){ token=document.getElementById('tokenInput').value.trim(); if(!token) return; localStorage.setItem('token', token); document.getElementById('loginModal').classList.remove('active'); refresh(); }
-function switchTab(name){ document.querySelectorAll('.tab[data-panel]').forEach(t=>t.classList.toggle('active', t.dataset.panel===name)); document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active', p.id==='panel-'+name)); if(name==='equity') loadEquity(); if(name==='log') loadLog(); if(name==='trades') loadTrades(); if(name==='positions') loadState(); if(name==='setup') loadConfig(); }
+function switchTab(name){ document.querySelectorAll('.tab[data-panel]').forEach(t=>t.classList.toggle('active', t.dataset.panel===name)); document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active', p.id==='panel-'+name)); if(name==='equity') loadEquity(); if(name==='log') loadLog(); if(name==='trades') loadTrades(); if(name==='positions') loadState(); if(name==='setup'){ loadConfig(); loadCandidates(); } }
 function switchStep(n){ document.querySelectorAll('.tab[data-step]').forEach(t=>t.classList.toggle('active', +t.dataset.step===n)); for(let i=1;i<=3;i++) document.getElementById('step-'+i).style.display = i===n?'':'none'; }
 function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function fmtNum(v, d=2){ if(v==null||isNaN(v)) return '-'; return Number(v).toLocaleString('zh-CN',{maximumFractionDigits:d}); }
@@ -881,8 +1048,38 @@ function loadConfig(){
     document.getElementById('f_tf').value = c.runtime.timeframe;
     document.getElementById('f_poll').value = c.runtime.poll_interval_seconds;
     document.getElementById('f_webhook').value = c.runtime.webhook_url||'';
+    renderCands();
   }).catch(()=>{});
 }
+
+// ---- 自助选择交易标的 ----
+let cands=[], candSource='builtin';
+function loadCandidates(){
+  api('/api/symbols/candidates').then(c=>{
+    cands=c.symbols||[]; candSource=c.source||'builtin';
+    document.getElementById('symSearch').placeholder = candSource==='okx'
+      ? '已连接 OKX，实时列表（输入名称过滤，如 BTC / ETH / SOL…）'
+      : '内置主流币列表（未连接 OKX，输入名称过滤）';
+    renderCands();
+  }).catch(()=>{});
+}
+function curSymbols(){ return document.getElementById('f_symbols').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean); }
+function renderCands(){
+  const q=document.getElementById('symSearch').value.trim().toUpperCase();
+  const sel=new Set(curSymbols());
+  const list=cands.filter(s=>!q||s.includes(q));
+  document.getElementById('candGrid').innerHTML = list.length
+    ? list.map(s=>`<span class="chip ${sel.has(s)?'on':''}" onclick="toggleSymbol('${s}')">${esc(s)}</span>`).join('')
+    : '<span class="hint">暂无候选（可直接在上方输入框手动填写交易对）</span>';
+}
+function toggleSymbol(sym){
+  const sel=curSymbols(); const i=sel.indexOf(sym);
+  if(i>=0) sel.splice(i,1); else sel.push(sym);
+  document.getElementById('f_symbols').value=sel.join(',');
+  renderCands();
+}
+function clearSymbols(){ document.getElementById('f_symbols').value=''; renderCands(); }
+function fillPopular(){ document.getElementById('f_symbols').value='BTC/USDT,ETH/USDT,SOL/USDT'; renderCands(); }
 function saveStep1(){
   const cred={}; if(document.getElementById('f_ex_key').value.trim()) cred.exchange_api_key=document.getElementById('f_ex_key').value.trim();
   if(document.getElementById('f_ex_secret').value.trim()) cred.exchange_secret=document.getElementById('f_ex_secret').value.trim();
@@ -902,9 +1099,21 @@ function saveStep2(){
   ]).then(()=>{ toast('AI 设置已保存'); refresh(); }).catch(e=>toast(e.message));
 }
 function saveStep3(){
-  const symbols=document.getElementById('f_symbols').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const symbols=curSymbols();
+  if(!symbols.length){ toast('请至少选择一个交易对'); return; }
   const cfg={runtime:{symbols, timeframe:document.getElementById('f_tf').value, poll_interval_seconds:Number(document.getElementById('f_poll').value)||60, webhook_url:document.getElementById('f_webhook').value.trim()}};
-  api('/api/config',{method:'POST',body:JSON.stringify(cfg)}).then(()=>{ toast('运行设置已保存'); refresh(); }).catch(e=>toast(e.message));
+  const send=(reset_state)=>api('/api/symbols',{method:'POST',body:JSON.stringify({symbols, reset_state})});
+  send(false).then(r=>{
+    if(r.needs_reset){
+      if(!confirm('更换交易标的后，旧交易状态（权益曲线、持仓记录等）与新标的绑定不匹配，需要重置。\n\n旧状态会自动备份到 state_backup_ 文件夹，不会丢失。\n\n确定继续更换吗？')) return null;
+      return send(true);
+    }
+    return r;
+  }).then(r=>{
+    if(!r) return;
+    toast(r.ok?(r.note||'运行设置已保存'):(r.error||'保存失败'));
+    if(r.ok) refresh();
+  }).catch(e=>toast(e.message));
 }
 
 if(localStorage.getItem('token')){ document.getElementById('loginModal').classList.remove('active'); }
