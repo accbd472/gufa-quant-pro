@@ -64,7 +64,7 @@ except ImportError as exc:  # pragma: no cover
     _PAIPAN_IMPORT_ERROR = exc
 
 APP_NAME = "GuFaQuant-Pro"
-APP_VERSION = "8.4.0"
+APP_VERSION = "8.4.1"
 CONFIG_VERSION = 3
 STATE_VERSION = 4
 CREDENTIALS_VERSION = 1
@@ -78,6 +78,10 @@ DEAD_SYMBOL_MARKERS: Tuple[str, ...] = (
     "无有效价格",
     "无有效 K 线",
     "无有效K线",
+    "返回空 K 线",
+    "返回空K线",
+    "空 K 线",
+    "空K线",
     "有效 K 线不足",
     "有效K线不足",
     "行情为空",
@@ -920,11 +924,42 @@ def setup_logging(runtime: RuntimeConfig) -> logging.Logger:
 
 
 class InstanceLock:
-    """跨平台单实例锁；锁由操作系统在进程退出时释放。"""
+    """跨平台单实例锁；进程异常退出时自动清理残留锁。"""
 
     def __init__(self, path: Path):
         self.path = path
         self.handle: Optional[Any] = None
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """检查进程是否存活（跨平台，不依赖 subprocess）。"""
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x0400, False, pid)  # PROCESS_QUERY_INFORMATION
+            if not handle:
+                return False
+            code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                kernel32.CloseHandle(handle)
+                return code.value == 259  # STILL_ACTIVE
+            kernel32.CloseHandle(handle)
+            return False
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _read_lock_pid(path: Path) -> int:
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            return int(text) if text.isdigit() else 0
+        except Exception:
+            return 0
 
     def __enter__(self) -> "InstanceLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -940,7 +975,33 @@ class InstanceLock:
         except (OSError, BlockingIOError) as exc:
             self.handle.close()
             self.handle = None
-            raise SafetyError(f"已有实例正在运行，无法取得锁: {self.path}") from exc
+            # 自动清理残留锁：PID 无效或进程已死，清锁重试
+            stale_pid = self._read_lock_pid(self.path)
+            if stale_pid <= 0 or not self._pid_alive(stale_pid):
+                # 死进程：尝试清理锁文件，失败则小延迟后重试锁
+                try:
+                    self.path.unlink(missing_ok=True)
+                except PermissionError:
+                    time.sleep(0.5)
+                self.handle = self.path.open("a+", encoding="utf-8")
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        self.handle.seek(0)
+                        msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except (OSError, BlockingIOError):
+                    self.handle.close()
+                    self.handle = None
+                    raise SafetyError(
+                        f"已有实例正在运行（PID {stale_pid}），无法取得锁: {self.path}"
+                    ) from exc
+            else:
+                raise SafetyError(
+                    f"已有实例正在运行（PID {stale_pid}），无法取得锁: {self.path}"
+                ) from exc
         self.handle.seek(0)
         self.handle.truncate()
         self.handle.write(str(os.getpid()))
