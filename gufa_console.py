@@ -404,7 +404,11 @@ class ConsoleServer(ThreadingHTTPServer):
                 kwargs["creationflags"] = _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=log_handle, stderr=subprocess.STDOUT,
+                    cmd,
+                    # 始终以项目目录为工作目录，避免控制台从别处启动时
+                    # 交易进程把相对路径的 runtime 状态写到错误位置
+                    cwd=str(Path(__file__).resolve().parent),
+                    stdout=log_handle, stderr=subprocess.STDOUT,
                     env=os.environ.copy(), **kwargs,
                 )
             except Exception as exc:  # noqa: BLE001
