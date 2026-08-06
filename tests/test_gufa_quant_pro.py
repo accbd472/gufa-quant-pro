@@ -630,6 +630,92 @@ def test_ai_check_uses_synthetic_data_and_never_connects_exchange() -> None:
     assert report["decision"]["action"] == "HOLD"
 
 
+def test_ai_parse_accepts_next_review_minutes() -> None:
+    advisor = g.AIAdvisor(g.AIConfig(), logging.getLogger("test.ai"))
+    payload = make_ai_payload()
+    payload["next_review_minutes"] = 30
+    decision = advisor._parse_decision(json.dumps(payload, ensure_ascii=False))
+    assert decision.next_review_minutes == 30
+
+
+def test_ai_parse_accepts_missing_next_review_minutes() -> None:
+    # 旧响应没有该字段时兼容，视为未提供节奏建议
+    advisor = g.AIAdvisor(g.AIConfig(), logging.getLogger("test.ai"))
+    decision = advisor._parse_decision(json.dumps(make_ai_payload(), ensure_ascii=False))
+    assert decision.next_review_minutes is None
+
+
+def test_ai_parse_rejects_invalid_next_review_minutes() -> None:
+    advisor = g.AIAdvisor(g.AIConfig(), logging.getLogger("test.ai"))
+    for bad in (0, 361, -5, 60.5, "60"):
+        payload = make_ai_payload()
+        payload["next_review_minutes"] = bad
+        with pytest.raises(g.ConfigError, match="next_review_minutes"):
+            advisor._parse_decision(json.dumps(payload, ensure_ascii=False))
+
+
+def make_symbol_decision(symbol: str, ai_decision: g.AIDecision) -> g.SymbolDecision:
+    return g.SymbolDecision(
+        symbol=symbol,
+        score=0.7,
+        target_fraction=0.5,
+        target_allocation=0.1,
+        reason="test",
+        signal_result=g.SignalResult(0.7, {}, {}, "2026-08-06T00:00:00+00:00"),
+        ai_decision=ai_decision,
+    )
+
+
+def make_review_controller(poll_interval_seconds: int = 60) -> g.GuFaQuantPro:
+    controller = object.__new__(g.GuFaQuantPro)
+    controller.config = SimpleNamespace(
+        runtime=SimpleNamespace(poll_interval_seconds=poll_interval_seconds)
+    )
+    return controller
+
+
+def review_decision(next_review_minutes=None) -> g.AIDecision:
+    return g.AIDecision(
+        "HOLD", "UNCHANGED", 0.5, "s", {},
+        next_review_minutes=next_review_minutes,
+    )
+
+
+def test_next_review_takes_tightest_ai_suggestion() -> None:
+    controller = make_review_controller()
+    decisions = {
+        "BTC/USDT": make_symbol_decision("BTC/USDT", review_decision(30)),
+        "ETH/USDT": make_symbol_decision("ETH/USDT", review_decision(120)),
+    }
+    assert controller._next_review_seconds(decisions, True, {}, False) == 1800
+
+
+def test_next_review_clamps_to_six_hours() -> None:
+    controller = make_review_controller()
+    decisions = {"BTC/USDT": make_symbol_decision("BTC/USDT", review_decision(720))}
+    assert controller._next_review_seconds(decisions, True, {}, False) == 6 * 3600
+
+
+def test_next_review_floor_is_poll_interval() -> None:
+    controller = make_review_controller(poll_interval_seconds=300)
+    decisions = {"BTC/USDT": make_symbol_decision("BTC/USDT", review_decision(1))}
+    assert controller._next_review_seconds(decisions, True, {}, False) == 300
+
+
+def test_next_review_conservative_when_halted_paused_or_protective() -> None:
+    controller = make_review_controller(poll_interval_seconds=90)
+    decisions = {"BTC/USDT": make_symbol_decision("BTC/USDT", review_decision(300))}
+    assert controller._next_review_seconds(decisions, False, {}, False) == 90
+    assert controller._next_review_seconds(decisions, True, {"BTC/USDT": "stop_loss"}, False) == 90
+    assert controller._next_review_seconds(decisions, True, {}, True) == 90
+
+
+def test_next_review_defaults_when_no_ai_suggestion() -> None:
+    controller = make_review_controller(poll_interval_seconds=90)
+    decisions = {"BTC/USDT": make_symbol_decision("BTC/USDT", review_decision(None))}
+    assert controller._next_review_seconds(decisions, True, {}, False) == 90
+
+
 def test_ai_check_cli_never_constructs_trading_controller(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

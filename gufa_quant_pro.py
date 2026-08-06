@@ -64,7 +64,7 @@ except ImportError as exc:  # pragma: no cover
     _PAIPAN_IMPORT_ERROR = exc
 
 APP_NAME = "GuFaQuant-Pro"
-APP_VERSION = "8.1.1"
+APP_VERSION = "8.2.0"
 CONFIG_VERSION = 3
 STATE_VERSION = 4
 CREDENTIALS_VERSION = 1
@@ -1982,6 +1982,8 @@ class AIDecision:
     risk_notes: List[str] = field(default_factory=list)
     enabled: bool = True
     fallback: bool = False
+    # AI 建议的下一次行情复查间隔（分钟）；None 表示未提供，由系统用默认轮询间隔。
+    next_review_minutes: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -2028,6 +2030,7 @@ class AIAdvisor:
             "target_level": "UNCHANGED",
             "confidence": 0.0,
             "summary": "中文总结",
+            "next_review_minutes": 60,
             "readings": {
                 name: {
                     "bias": "neutral",
@@ -2045,10 +2048,13 @@ class AIAdvisor:
         template = json.dumps(cls._response_template(), ensure_ascii=False, separators=(",", ":"))
         return (
             "输出协议是强制接口契约：只能输出一个 JSON object，不得输出 Markdown、代码块、解释、前后缀或思维过程。"
-            "顶层必须且只能包含 action、target_level、confidence、summary、readings、conflicts、risk_notes。"
+            "顶层必须且只能包含 action、target_level、confidence、summary、next_review_minutes、readings、conflicts、risk_notes。"
             "action 必须是 JSON string，并且只能精确等于 BUY、SELL、HOLD 之一；不得为 null、数字或对象。"
             "target_level 必须是 JSON string，并且只能精确等于 FLAT、HALF、FULL、UNCHANGED 之一。"
             "confidence 必须是 0 到 1 的 JSON number；summary 必须是 JSON string。"
+            "next_review_minutes 必须是 1 到 360 的 JSON integer，表示你建议的下一次行情复查间隔（分钟）："
+            "波动剧烈、持仓重或方向不确定时用短间隔（如 5-30），市场平淡、空仓且无信号时可用长间隔（如 120-360）；"
+            "无法判断时必须用 60，不得缺失。"
             "readings 必须是 JSON object，必须完整且只包含奇门、六壬、太乙、易经、风水、八字、梅花、紫微、八卦、四柱。"
             "每个 readings 项必须且只能包含 bias、confidence、reading；bias 只能是 bullish、bearish、neutral；"
             "reading 必须是该古法盘面的断卦解读（如体用生克、三传与日干关系、值符吉门、命宫主星、日主旺衰等），"
@@ -2147,11 +2153,12 @@ class AIAdvisor:
 
     def _parse_decision(self, content: str) -> AIDecision:
         parsed = require_json_object(json.loads(content), "AI response")
-        expected_fields = {
+        required_fields = {
             "action", "target_level", "confidence", "summary", "readings", "conflicts", "risk_notes",
         }
-        reject_unknown(parsed, expected_fields, "AI response")
-        missing_fields = sorted(expected_fields - set(parsed))
+        allowed_fields = required_fields | {"next_review_minutes"}
+        reject_unknown(parsed, allowed_fields, "AI response")
+        missing_fields = sorted(required_fields - set(parsed))
         if missing_fields:
             raise ConfigError(f"AI response 缺少顶层字段: {missing_fields}")
         action = require_json_string(parsed.get("action"), "AI response.action").strip().upper()
@@ -2191,7 +2198,16 @@ class AIAdvisor:
             readings[name] = AncientMethodReading(bias, item_confidence, reading)
         conflicts = self._parse_string_list(parsed["conflicts"], "AI response.conflicts")
         risk_notes = self._parse_string_list(parsed["risk_notes"], "AI response.risk_notes")
-        return AIDecision(action, target_level, confidence, summary, readings, conflicts, risk_notes)
+        next_review_minutes: Optional[int] = None
+        raw_next = parsed.get("next_review_minutes")
+        if raw_next is not None:
+            if type(raw_next) is not int or not (1 <= raw_next <= 360):
+                raise ConfigError("AI response.next_review_minutes 必须是 1..360 的 JSON integer")
+            next_review_minutes = raw_next
+        return AIDecision(
+            action, target_level, confidence, summary, readings, conflicts, risk_notes,
+            next_review_minutes=next_review_minutes,
+        )
 
     def _parse_with_one_format_repair(self, content: str) -> Tuple[AIDecision, bool]:
         """严格解析；仅结构无效时请求一次格式修复，网络错误不会在这里重试。"""
@@ -2779,6 +2795,33 @@ class GuFaQuantPro:
             )
         return decisions
 
+    def _next_review_seconds(
+        self,
+        decisions: Mapping[str, SymbolDecision],
+        risk_allowed: bool,
+        protective: Mapping[str, str],
+        paused: bool,
+    ) -> int:
+        """AI 决定下一次查看 K 线的时机。
+
+        取所有 AI 建议中最紧的（最短间隔）以保证任何被选中标的都不被错过，
+        并钳制在 [poll_interval_seconds, 6 小时] 内。熔断/保护性退出/暂停期间
+        不使用 AI 建议，强制保守轮询间隔——异常状态必须频繁检查，不能拉长。
+        无 AI 建议（AI 未启用、落选持仓、解析失败回退）时用默认轮询间隔。
+        """
+        base = self.config.runtime.poll_interval_seconds
+        if not risk_allowed or protective or paused:
+            return base
+        minutes = [
+            decision.ai_decision.next_review_minutes
+            for decision in decisions.values()
+            if decision.ai_decision.next_review_minutes is not None
+        ]
+        if not minutes:
+            return base
+        tightest = min(minutes) * 60
+        return int(min(max(tightest, base), 6 * 3600))
+
     def _notify(self, event: str, payload: Dict[str, Any]) -> None:
         """可选的 webhook 事件通知（runtime.webhook_url 为空时静默跳过）。
 
@@ -2919,6 +2962,9 @@ class GuFaQuantPro:
         state.last_scores = {symbol: result.score for symbol, result in results.items()}
         self.store.save()
         duration = time.monotonic() - cycle_started
+        next_review_seconds = self._next_review_seconds(
+            decisions, risk_status.allowed, protective, paused
+        )
         report = {
             "app": APP_NAME,
             "version": APP_VERSION,
@@ -2957,6 +3003,7 @@ class GuFaQuantPro:
             },
             "protective_exits": protective,
             "fills": len(fills),
+            "next_review_seconds": next_review_seconds,
             "cycle_seconds": round(duration, 3),
         }
         atomic_write_json(self.state_dir / self.config.runtime.health_file, report, mode=0o644)
@@ -2971,11 +3018,11 @@ class GuFaQuantPro:
             "fills": len(fills),
         })
         self.log.info(
-            "周期完成 | equity=%.4f %s | fills=%d | risk=%s | selected=%s | scores=%s | %.2fs",
+            "周期完成 | equity=%.4f %s | fills=%d | risk=%s | selected=%s | scores=%s | next_review=%ds | %.2fs",
             snapshot.equity, self.config.runtime.quote_currency, len(fills),
             risk_status.reason or "OK",
             daily_selection.selected_symbols,
-            {s: round(r.score, 3) for s, r in results.items()}, duration,
+            {s: round(r.score, 3) for s, r in results.items()}, next_review_seconds, duration,
         )
         return report
 
@@ -2995,11 +3042,12 @@ class GuFaQuantPro:
         consecutive_errors = 0
         first = True
         while not self.stop_event.is_set():
+            report: Optional[Dict[str, Any]] = None
             if first and not self.config.runtime.once_on_start:
                 first = False
             else:
                 try:
-                    self.run_cycle()
+                    report = self.run_cycle()
                     consecutive_errors = 0
                 except OrderUncertainError as exc:
                     atomic_write_json(self.state_dir / self.config.runtime.health_file, {
@@ -3032,7 +3080,12 @@ class GuFaQuantPro:
                     if consecutive_errors >= self.config.runtime.max_consecutive_cycle_errors:
                         raise SafetyError("连续运行错误达到熔断阈值，进程退出并等待人工/守护进程处理") from exc
             first = False
-            self.stop_event.wait(self.config.runtime.poll_interval_seconds)
+            wait_seconds = self.config.runtime.poll_interval_seconds
+            if isinstance(report, dict):
+                wait_seconds = int(
+                    report.get("next_review_seconds") or self.config.runtime.poll_interval_seconds
+                )
+            self.stop_event.wait(wait_seconds)
         self.log.warning("服务已安全停止")
 
 
