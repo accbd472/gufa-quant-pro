@@ -390,6 +390,7 @@ class ExchangeConfig:
     retry_base_seconds: float = 1.0
     recv_window_ms: int = 10000
     client_order_id_param: str = "clientOrderId"
+    proxy_url: str = ""  # 可选：仅本应用请求使用的代理（ccxt proxies），如 http://127.0.0.1:7890；留空不走代理
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ExchangeConfig":
@@ -406,6 +407,7 @@ class ExchangeConfig:
             "retry_base_seconds": require_json_number,
             "recv_window_ms": require_json_int,
             "client_order_id_param": require_json_string,
+            "proxy_url": require_json_string,
         }
         values = {key: parsers[key](value, f"exchange.{key}") for key, value in data.items()}
         return cls(**values)
@@ -423,6 +425,11 @@ class ExchangeConfig:
             raise ConfigError("exchange.max_retries 必须在 0..10")
         if self.retry_base_seconds <= 0:
             raise ConfigError("exchange.retry_base_seconds 必须大于 0")
+        self.proxy_url = self.proxy_url.strip()
+        if self.proxy_url and not (
+            self.proxy_url.startswith("http://") or self.proxy_url.startswith("https://")
+        ):
+            raise ConfigError("exchange.proxy_url 必须以 http:// 或 https:// 开头（如 http://127.0.0.1:7890）")
 
 
 @dataclass
@@ -1351,6 +1358,9 @@ class ExchangeGateway:
                 "recvWindow": self.exchange_cfg.recv_window_ms,
             },
         }
+        if self.exchange_cfg.proxy_url:
+            # 仅本应用请求走代理，不影响系统/其他进程网络（ccxt 原生 proxies 支持）
+            params["proxies"] = {"http": self.exchange_cfg.proxy_url, "https": self.exchange_cfg.proxy_url}
         api_key = secret_from_env(
             self.exchange_cfg.api_key_env, required=True,
             credentials=self.credentials, purpose="交易所 API",
@@ -3189,6 +3199,8 @@ def cmd_export_ohlcv(
         "enableRateLimit": True,
         "timeout": config.exchange.timeout_ms,
         "options": {"defaultType": "spot"},
+        **({"proxies": {"http": config.exchange.proxy_url, "https": config.exchange.proxy_url}}
+           if config.exchange.proxy_url else {}),
     })
     rows: List[List[Any]] = []
     for symbol in symbols:
@@ -3403,6 +3415,8 @@ def cmd_backtest_paipan(
             "enableRateLimit": True,
             "timeout": config.exchange.timeout_ms,
             "options": {"defaultType": "spot"},
+            **({"proxies": {"http": config.exchange.proxy_url, "https": config.exchange.proxy_url}}
+               if config.exchange.proxy_url else {}),
         })
         limit = min(bars, 300)  # OKX 单次日线上限 300
         for symbol in symbols:

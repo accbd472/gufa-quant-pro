@@ -112,6 +112,10 @@ cp config.example.json config.json
 python gufa_quant_pro.py --config config.json init-config
 ```
 
+> **国内网络访问 OKX 需要代理时**（可选）：在 `config.json` 的 `exchange` 段设置
+> `"proxy_url": "http://127.0.0.1:7890"`（以你的 Clash/V2Ray 本地混合端口为准）。
+> 代理只作用于本应用发出的请求，不影响系统或其他程序的网络；留空或删掉该字段即不走代理。
+
 ### 2. 首次配置向导
 
 ```bash

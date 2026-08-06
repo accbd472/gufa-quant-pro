@@ -63,6 +63,61 @@ def test_unknown_config_field_is_rejected(tmp_path: Path) -> None:
         load_default(tmp_path, lambda p: p["runtime"].__setitem__("typo", 1))
 
 
+def test_exchange_proxy_url_validation(tmp_path: Path) -> None:
+    cfg = load_default(tmp_path)
+    assert cfg.exchange.proxy_url == ""
+    with pytest.raises(g.ConfigError, match="http:// 或 https://"):
+        load_default(tmp_path, lambda p: p["exchange"].__setitem__("proxy_url", "socks5://127.0.0.1:1080"))
+    cfg2 = load_default(
+        tmp_path, lambda p: p["exchange"].__setitem__("proxy_url", "http://127.0.0.1:7890")
+    )
+    assert cfg2.exchange.proxy_url == "http://127.0.0.1:7890"
+
+
+def test_exchange_proxy_url_wired_to_ccxt(tmp_path: Path, monkeypatch) -> None:
+    payload = g.default_config_dict()
+    payload["exchange"]["proxy_url"] = "http://127.0.0.1:7890"
+    cfg = g.AppConfig.load(write_json(tmp_path / "config.json", payload))
+    state = g.StateStore(tmp_path / "state.json", "profile")
+    captured: dict = {}
+
+    class FakeClient:
+        timeframes = {"1h": "1H", "1d": "1D"}
+
+        def __init__(self, params: dict) -> None:
+            captured["params"] = params
+
+        def set_sandbox_mode(self, enabled: bool) -> None:
+            captured["sandbox"] = enabled
+
+        def load_markets(self) -> dict:
+            return {
+                "BTC/USDT": {
+                    "id": "BTC-USDT",
+                    "type": "spot",
+                    "spot": True,
+                    "active": True,
+                    "quote": "USDT",
+                }
+            }
+
+    monkeypatch.setattr(g, "ccxt", SimpleNamespace(okx=FakeClient))
+    credentials_path = tmp_path / "credentials.json"
+    monkeypatch.setenv("GUFA_CREDENTIALS_FILE", str(credentials_path))
+    store = g.CredentialStore(credentials_path)
+    store.set(cfg.exchange.api_key_env, "k")
+    store.set(cfg.exchange.secret_env, "s")
+    store.set(cfg.exchange.password_env, "p")
+    store.save()
+
+    g.ExchangeGateway(cfg, state, logging.getLogger("test.proxy"), store)
+    assert captured["params"]["proxies"] == {
+        "http": "http://127.0.0.1:7890",
+        "https": "http://127.0.0.1:7890",
+    }
+    assert captured["sandbox"] is True
+
+
 def test_config_json_tolerates_utf8_bom(tmp_path: Path) -> None:
     payload = g.default_config_dict()
     payload["runtime"]["state_dir"] = str(tmp_path / "runtime")

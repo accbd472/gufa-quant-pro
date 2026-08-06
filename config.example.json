@@ -11,7 +11,8 @@
     "max_retries": 4,
     "retry_base_seconds": 1.0,
     "recv_window_ms": 10000,
-    "client_order_id_param": "clientOrderId"
+    "client_order_id_param": "clientOrderId",
+    "proxy_url": ""
   },
   "runtime": {
     "symbols": [
