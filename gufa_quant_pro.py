@@ -64,7 +64,7 @@ except ImportError as exc:  # pragma: no cover
     _PAIPAN_IMPORT_ERROR = exc
 
 APP_NAME = "GuFaQuant-Pro"
-APP_VERSION = "8.1.0"
+APP_VERSION = "8.1.1"
 CONFIG_VERSION = 3
 STATE_VERSION = 4
 CREDENTIALS_VERSION = 1
@@ -530,11 +530,11 @@ DEFAULT_PREFERRED_BASES: Tuple[str, ...] = (
 class DailySelectionConfig:
     """每日候选池初选；只使用确定性十项技术因子，不让 AI 扩展人工白名单。
 
-    初筛两层（prefilter=True 时）：
-    1. 名字规则：主流币（preferred）优先保留，排除以数字开头的新币/蹭热币
-       与 exclude_patterns 匹配的标的，零成本、不请求行情。
-    2. 流动性截断：对剩余标的按 24h 成交额排序，只保留流动性最好的
-       max_candidates 个，避免对全池拉 K 线浪费请求与 token。
+    初筛仅用名字规则（prefilter=True 时），不使用流动性：
+    preferred（主流币）优先保留，排除以数字开头的新币/蹭热币与
+    exclude_patterns 匹配的标的；零行情请求、绝不 fail-closed。
+    候选池全部进入古法扫描，每天重点看哪几个完全由古法得分决定
+    （min_score 门槛 + top_n 上限），保持严谨。
     """
 
     enabled: bool = True
@@ -545,8 +545,6 @@ class DailySelectionConfig:
     prefilter: bool = True
     preferred: Tuple[str, ...] = ()
     exclude_patterns: Tuple[str, ...] = ()
-    max_candidates: int = 15
-    min_quote_volume: float = 0.0
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DailySelectionConfig":
@@ -556,9 +554,9 @@ class DailySelectionConfig:
             path = f"selection.{key}"
             if key in {"enabled", "prefilter"}:
                 values[key] = require_json_bool(value, path)
-            elif key in {"ohlcv_limit", "top_n", "max_candidates"}:
+            elif key in {"ohlcv_limit", "top_n"}:
                 values[key] = require_json_int(value, path)
-            elif key in {"min_score", "min_quote_volume"}:
+            elif key in {"min_score"}:
                 values[key] = require_json_number(value, path)
             elif key in {"preferred", "exclude_patterns"}:
                 items = require_json_array(value, path)
@@ -578,10 +576,7 @@ class DailySelectionConfig:
             raise ConfigError("selection.top_n 至少为 1")
         if not 0 <= self.min_score <= 1:
             raise ConfigError("selection.min_score 必须在 0..1")
-        if self.max_candidates < 0:
-            raise ConfigError("selection.max_candidates 不能为负")
-        if self.min_quote_volume < 0:
-            raise ConfigError("selection.min_quote_volume 不能为负")
+
 
 
 @dataclass
@@ -2436,22 +2431,16 @@ class GuFaQuantPro:
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(ValueError, OSError):
                 signal.signal(sig, handler)
-    def _fetch_quote_volumes(self, symbols: Sequence[str]) -> Dict[str, float]:
-        """流动性初筛：批量 24h 成交额。失败时降级为空（初筛只是优化，不 fail-closed）。"""
-        fetcher = getattr(self.gateway, "fetch_quote_volumes", None)
-        if fetcher is None:
-            return {}
-        try:
-            return fetcher(symbols)
-        except Exception as exc:  # noqa: BLE001 初筛失败不中断主流程
-            self.log.warning("流动性初筛 ticker 获取失败，降级为纯名字过滤: %s", exc)
-            return {}
-
     def _prefilter_symbols(self, symbols: Sequence[str]) -> List[str]:
-        """名字初筛：主流优先 + 黑名单正则 + 流动性截断，返回候选池。
+        """名字初筛：只用名字规则，不用流动性，返回古法扫描候选池。
 
-        顺序：preferred（主流币）全部保留 → 其余按 24h 成交额排序只留
-        max_candidates 个。ticker 不可用时降级为纯名字过滤，绝不 fail-closed。
+        规则（零行情请求，绝不 fail-closed）：
+        1. preferred（主流币）全部保留；
+        2. 排除以数字开头的新币/蹭热币（知名币可加入 preferred）；
+        3. 排除 exclude_patterns 匹配的标的。
+
+        不做成交额/市值截断：候选池全部进入古法扫描，每天重点看哪几个
+        完全由古法得分决定（min_score 门槛 + top_n 上限），保持严谨。
         """
         selection = self.config.selection
         if not selection.prefilter:
@@ -2465,24 +2454,14 @@ class GuFaQuantPro:
                 preferred_hits.append(symbol)
                 continue
             if re.match(r"^\d", base):
-                # 以数字开头多为新上线/蹭热币（如 2Z、1INCH 知名币在 preferred 内）
+                # 以数字开头多为新上线/蹭热币（如 2Z；1INCH 等知名币可加入 preferred）
                 continue
             if any(re.search(pattern, base, re.IGNORECASE) for pattern in selection.exclude_patterns):
                 continue
             rest.append(symbol)
-        if selection.max_candidates > 0 and len(rest) > 0:
-            volumes = self._fetch_quote_volumes(rest)
-            if volumes:
-                if selection.min_quote_volume > 0:
-                    rest = [s for s in rest if volumes.get(s, 0.0) >= selection.min_quote_volume]
-                # 24h 成交额为 0 的僵尸币（已停交易/无流动性）直接剔除
-                rest = [s for s in rest if volumes.get(s, 0.0) > 0]
-                rest.sort(key=lambda s: -volumes.get(s, 0.0))
-                budget = max(0, selection.max_candidates - len(preferred_hits))
-                rest = rest[:budget]
         candidates = preferred_hits + rest
         self.log.info(
-            "名字初筛 | %d -> %d 候选 (preferred=%d, rest=%d)",
+            "名字初筛（无流动性，纯名字规则）| %d -> %d 候选 (preferred=%d, rest=%d)",
             len(symbols),
             len(candidates),
             len(preferred_hits),
@@ -2504,8 +2483,6 @@ class GuFaQuantPro:
                 "enabled": selection.prefilter,
                 "preferred": list(selection.preferred),
                 "exclude_patterns": list(selection.exclude_patterns),
-                "max_candidates": selection.max_candidates,
-                "min_quote_volume": selection.min_quote_volume,
             },
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
