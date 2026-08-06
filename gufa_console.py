@@ -1439,4 +1439,20 @@ refresh(); setInterval(refresh, 5000);
 
 
 if __name__ == "__main__":
-    sys.exit(run_console(Path("config.json")))
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="gufa_console", description=f"{APP_TITLE}（浏览器访问即用）"
+    )
+    parser.add_argument("--config", default="config.json",
+                        help="配置文件路径（默认 config.json）")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="监听地址；手机/局域网访问请用 0.0.0.0")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
+                        help=f"监听端口（默认 {DEFAULT_PORT}）")
+    parser.add_argument("--token", default="",
+                        help="访问令牌；不指定则随机生成并打印在终端")
+    args = parser.parse_args()
+    sys.exit(run_console(
+        Path(args.config), host=args.host, port=args.port, token=args.token,
+    ))
