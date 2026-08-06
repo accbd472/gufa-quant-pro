@@ -64,7 +64,7 @@ except ImportError as exc:  # pragma: no cover
     _PAIPAN_IMPORT_ERROR = exc
 
 APP_NAME = "GuFaQuant-Pro"
-APP_VERSION = "8.2.0"
+APP_VERSION = "8.3.0"
 CONFIG_VERSION = 3
 STATE_VERSION = 4
 CREDENTIALS_VERSION = 1
@@ -3040,6 +3040,7 @@ class GuFaQuantPro:
             self.config.runtime.timeframe,
         )
         consecutive_errors = 0
+        retry_delay = self.config.runtime.poll_interval_seconds
         first = True
         while not self.stop_event.is_set():
             report: Optional[Dict[str, Any]] = None
@@ -3049,6 +3050,7 @@ class GuFaQuantPro:
                 try:
                     report = self.run_cycle()
                     consecutive_errors = 0
+                    retry_delay = self.config.runtime.poll_interval_seconds
                 except OrderUncertainError as exc:
                     atomic_write_json(self.state_dir / self.config.runtime.health_file, {
                         "app": APP_NAME,
@@ -3062,25 +3064,26 @@ class GuFaQuantPro:
                     raise
                 except Exception as exc:
                     consecutive_errors += 1
+                    # 8.3.0 起自动恢复：一般错误（网络抖动、限流、行情缺失等）
+                    # 不再退出进程，改为指数退避后继续探测，恢复后自动继续交易。
+                    # OrderUncertainError 仍强制退出（订单状态必须人工核对）。
+                    retry_delay = min(30 * (2 ** (consecutive_errors - 1)), 600)
                     self.log.error(
-                        "运行周期失败 (%d/%d): %s",
-                        consecutive_errors,
-                        self.config.runtime.max_consecutive_cycle_errors,
-                        exc,
+                        "运行周期失败 (%d 次，%ds 后自动重试): %s",
+                        consecutive_errors, retry_delay, exc,
                         exc_info=True,
                     )
                     atomic_write_json(self.state_dir / self.config.runtime.health_file, {
                         "app": APP_NAME,
                         "version": APP_VERSION,
-                        "status": "error",
+                        "status": "degraded",
                         "timestamp": iso_now(),
                         "consecutive_errors": consecutive_errors,
+                        "retry_after_seconds": retry_delay,
                         "error": str(exc),
                     }, mode=0o644)
-                    if consecutive_errors >= self.config.runtime.max_consecutive_cycle_errors:
-                        raise SafetyError("连续运行错误达到熔断阈值，进程退出并等待人工/守护进程处理") from exc
             first = False
-            wait_seconds = self.config.runtime.poll_interval_seconds
+            wait_seconds = retry_delay
             if isinstance(report, dict):
                 wait_seconds = int(
                     report.get("next_review_seconds") or self.config.runtime.poll_interval_seconds

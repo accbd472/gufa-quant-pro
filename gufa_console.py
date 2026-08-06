@@ -23,7 +23,9 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import threading
+import urllib.request
 import urllib.request
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -187,7 +189,64 @@ class ConsoleServer(ThreadingHTTPServer):
         self.token = token
         self.managed = ManagedProcess()
         self.lock = threading.RLock()
+        # 自动守护：交易进程意外退出时自动拉起（订单状态不确定除外），
+        # 1 小时窗口内连续自动重启超过 3 次则熔断，等待人工处理。
+        self.auto_restart = {
+            "enabled": True,
+            "window_started": 0.0,
+            "count": 0,
+            "last_restart_at": "",
+            "disabled_reason": "",
+        }
         self._restore_managed()
+        self._supervisor = threading.Thread(
+            target=self._supervise_loop, daemon=True, name="console-supervisor"
+        )
+        self._supervisor.start()
+
+    # ---- 自动守护 ----
+    def _supervise_loop(self) -> None:
+        while True:
+            try:
+                self._supervise_once()
+            except Exception:  # noqa: BLE001 守护失败不能拖垮控制台
+                pass
+            time.sleep(10)
+
+    def _supervise_once(self) -> None:
+        if not self.auto_restart["enabled"]:
+            return
+        state_dir = self.resolve_state_dir()
+        if state_dir is None:
+            return
+        pid_file = state_dir / "console.pid.json"
+        data = _read_json(pid_file, {})
+        pid = int(data.get("pid", 0) or 0)
+        if pid <= 0:
+            return  # 用户从未启动交易，或已主动停止（stop 会清 pid 文件）
+        if _is_alive(pid):
+            self.auto_restart["count"] = 0  # 进程稳定运行，重置窗口计数
+            return
+        # 进程已死：检查是否订单状态不确定（必须人工，禁止自动拉起）
+        health = _read_json(state_dir / "health.json", {})
+        if str(health.get("status")) == "order_uncertain":
+            self.auto_restart["disabled_reason"] = "订单状态不确定，需人工核对后再启动"
+            self.auto_restart["enabled"] = False
+            return
+        now = time.time()
+        if self.auto_restart["count"] == 0:
+            self.auto_restart["window_started"] = now
+        elif now - self.auto_restart["window_started"] > 3600:
+            self.auto_restart["window_started"] = now
+            self.auto_restart["count"] = 0
+        if self.auto_restart["count"] >= 3:
+            self.auto_restart["disabled_reason"] = "1 小时内连续自动重启超限，已熔断，请人工检查"
+            self.auto_restart["enabled"] = False
+            return
+        result = self.start_trading()
+        if result.get("ok"):
+            self.auto_restart["count"] += 1
+            self.auto_restart["last_restart_at"] = utc_now()
 
     # ---- 状态目录 ----
     def resolve_state_dir(self) -> Optional[Path]:
@@ -346,6 +405,10 @@ class ConsoleServer(ThreadingHTTPServer):
             self.managed.pid = proc.pid
             self.managed.started_at = utc_now()
             self.managed.cmd = cmd
+            # 用户手动启动成功 → 重新武装自动守护
+            self.auto_restart["enabled"] = True
+            self.auto_restart["count"] = 0
+            self.auto_restart["disabled_reason"] = ""
             g.atomic_write_json(
                 state_dir / "console.pid.json",
                 {"pid": proc.pid, "started_at": self.managed.started_at, "cmd": cmd},
@@ -397,6 +460,12 @@ class ConsoleServer(ThreadingHTTPServer):
                 "pid": self.managed.pid,
                 "started_at": self.managed.started_at,
                 "cmd": self.managed.cmd,
+            },
+            "auto_restart": {
+                "enabled": bool(self.auto_restart["enabled"]),
+                "count": int(self.auto_restart["count"]),
+                "last_restart_at": str(self.auto_restart["last_restart_at"]),
+                "disabled_reason": str(self.auto_restart["disabled_reason"]),
             },
         }
         if cfg is not None:
@@ -955,6 +1024,8 @@ function refresh(){
     b.push(`<span class="badge">${s.exchange?s.exchange.id.toUpperCase():'未配置'}</span>`);
     if(s.paused) b.push('<span class="badge warn">已暂停新开仓</span>');
     if(s.halted_reason) b.push(`<span class="badge bad">已熔断: ${esc(s.halted_reason)}</span>`);
+    if(s.auto_restart&&!s.auto_restart.enabled) b.push(`<span class="badge warn">自动守护已熔断: ${esc(s.auto_restart.disabled_reason)}</span>`);
+    if(s.auto_restart&&s.auto_restart.count>0) b.push(`<span class="badge">自动守护: ${s.auto_restart.count}次重启</span>`);
     document.getElementById('badges').innerHTML = b.join('');
     const c=[];
     c.push(card('账户权益', fmtNum(s.last_equity)));
