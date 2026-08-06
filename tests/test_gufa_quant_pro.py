@@ -679,6 +679,66 @@ def test_ai_valid_structure_does_not_trigger_repair() -> None:
     assert decision.action == "HOLD"
 
 
+def test_ai_empty_content_does_not_trigger_repair() -> None:
+    # 余额不足/中转站异常常表现为空正文：必须直接报错，不得再发一次修复请求烧钱
+    advisor = object.__new__(g.AIAdvisor)
+    advisor.config = g.AIConfig(enabled=True)
+    advisor.log = logging.getLogger("test.ai.empty")
+    advisor._completion_content = lambda messages: pytest.fail("空正文不应触发格式修复请求")
+    for bad in ("", "   ", None):
+        with pytest.raises(g.ConfigError, match="非空 JSON string"):
+            advisor._parse_with_one_format_repair(bad)
+
+
+def test_ai_relay_error_skips_format_repair() -> None:
+    # 修复请求遇到中转站错误（如余额不足）时直接上抛，不再尝试解析
+    advisor = object.__new__(g.AIAdvisor)
+    advisor.config = g.AIConfig(enabled=True)
+    advisor.log = logging.getLogger("test.ai.relay")
+    calls = []
+
+    def completion(messages):
+        calls.append(messages)
+        raise g.AIRelayError("AI 中转站错误（HTTP 402）: INSUFFICIENT_BALANCE: 余额不足",
+                             status=402, detail="INSUFFICIENT_BALANCE: 余额不足")
+
+    advisor._completion_content = completion
+    with pytest.raises(g.AIRelayError, match="余额不足"):
+        advisor._parse_with_one_format_repair(
+            json.dumps({"action": {"value": "BUY"}}, ensure_ascii=False)
+        )
+    assert len(calls) == 1
+
+
+def test_ai_interpret_relay_error_fallback_and_last_error() -> None:
+    # 真实交易周期中：中转站 402 余额不足 → 单行日志 + fail_closed 回退 + last_error 可读
+    cfg = g.AIConfig(enabled=True, fail_closed=True)
+    advisor = object.__new__(g.AIAdvisor)
+    advisor.config = cfg
+    advisor.log = logging.getLogger("test.ai.relay.interpret")
+    advisor.bind_strategy_weights(g.StrategyConfig().weights)
+
+    class RelayDown(Exception):
+        status_code = 402
+        body = {"error": {"message": "INSUFFICIENT_BALANCE: 余额不足"}}
+
+    advisor.client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: (_ for _ in ()).throw(RelayDown()))
+        )
+    )
+    position = g.AccountPosition("BTC/USDT", 1.0, 100.0, 100.0, 90.0, 110.0)
+    decision = advisor.interpret(
+        "BTC/USDT", make_signal_result(), 1.0, 0.5, "rule full", position, 1000.0
+    )
+    assert decision.fallback is True
+    assert decision.action == "HOLD"
+    assert decision.target_level == "UNCHANGED"
+    assert "中转站错误" in advisor.last_error
+    assert "HTTP 402" in advisor.last_error
+    assert "余额不足" in advisor.last_error
+
+
 def test_ai_check_uses_synthetic_data_and_never_connects_exchange() -> None:
     advisor = object.__new__(g.AIAdvisor)
     advisor.config = g.AIConfig(enabled=True, model="schema-model", base_url="https://relay.example/v1")

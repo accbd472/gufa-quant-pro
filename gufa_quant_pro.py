@@ -122,6 +122,19 @@ class ConfigError(ValueError):
     pass
 
 
+class AIRelayError(ConfigError):
+    """AI 中转站/传输层错误（余额不足、鉴权失败、网络错误等）。
+
+    携带 HTTP 状态与错误摘要，区别于『响应结构无效』——后者可尝试格式修复，
+    前者（如余额不足）重试只会继续烧钱/继续失败，必须直接回退。
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None, detail: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.detail = detail
+
+
 class SafetyError(RuntimeError):
     pass
 
@@ -2169,6 +2182,7 @@ class AIAdvisor:
         self.log = logger
         self.credentials = credentials
         self.client: Any = None
+        self.last_error: str = ""  # 最近一次 AI 失败的可读原因（供日志/控制台排查）
         if not config.enabled:
             return
         try:
@@ -2235,14 +2249,40 @@ class AIAdvisor:
             f"严格结构示例（内容应根据输入重写，但结构和字段名不得改变）：{template}"
         )
 
+    @staticmethod
+    def _relay_error(exc: Exception) -> AIRelayError:
+        """把 openai SDK / 传输层异常转成带状态与错误摘要的 AIRelayError。"""
+        status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+        detail = ""
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                detail = str(err.get("message", ""))
+            elif isinstance(err, str):
+                detail = err
+            if not detail:
+                try:
+                    detail = json.dumps(body, ensure_ascii=False)[:300]
+                except Exception:
+                    detail = str(body)[:300]
+        elif isinstance(body, str):
+            detail = body[:300]
+        status_text = f"HTTP {status}" if status else "传输层"
+        message = f"AI 中转站错误（{status_text}）: {detail or exc}"
+        return AIRelayError(message, status=status, detail=detail)
+
     def _completion_content(self, messages: Sequence[Mapping[str, str]]) -> str:
-        response = self.client.chat.completions.create(
-            model=self.config.model,
-            messages=list(messages),
-            temperature=0,
-            max_tokens=self.config.max_output_tokens,
-            response_format={"type": "json_object"},
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.config.model,
+                messages=list(messages),
+                temperature=0,
+                max_tokens=self.config.max_output_tokens,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # noqa: BLE001 - SDK/网络/中转站错误统一转成可读信息
+            raise self._relay_error(exc) from exc
         try:
             content = response.choices[0].message.content
         except (AttributeError, IndexError, TypeError) as exc:
@@ -2381,9 +2421,17 @@ class AIAdvisor:
         )
 
     def _parse_with_one_format_repair(self, content: str) -> Tuple[AIDecision, bool]:
-        """严格解析；仅结构无效时请求一次格式修复，网络错误不会在这里重试。"""
+        """严格解析；仅『非空正文且结构无效』时请求一次格式修复。
+
+        空正文（余额不足/中转站异常常表现为空响应）与 AIRelayError
+        （传输层/HTTP 错误）直接抛出不修复——重试只会继续失败或继续扣费。
+        """
+        if not isinstance(content, str) or not content.strip():
+            raise ConfigError("AI 响应正文必须是非空 JSON string")
         try:
             return self._parse_decision(content), False
+        except AIRelayError:
+            raise
         except (ConfigError, json.JSONDecodeError) as parse_exc:
             self.log.warning("AI 首次响应结构无效，尝试一次格式修复: %s", parse_exc)
             repair_system = (
@@ -2393,13 +2441,16 @@ class AIAdvisor:
                 "缺失的十项 readings 必须基于原响应已有文字补齐；无法恢复时使用 neutral、0、‘原响应缺失该项’。"
                 + self._response_contract()
             )
-            repaired = self._completion_content([
-                {"role": "system", "content": repair_system},
-                {"role": "user", "content": json.dumps({
-                    "validation_error": str(parse_exc),
-                    "invalid_response": content,
-                }, ensure_ascii=False)},
-            ])
+            try:
+                repaired = self._completion_content([
+                    {"role": "system", "content": repair_system},
+                    {"role": "user", "content": json.dumps({
+                        "validation_error": str(parse_exc),
+                        "invalid_response": content,
+                    }, ensure_ascii=False)},
+                ])
+            except AIRelayError:
+                raise  # 修复请求同样遇到中转站错误（如余额不足），直接上抛，不再尝试解析
             return self._parse_decision(repaired), True
 
     def schema_check(self) -> Dict[str, Any]:
@@ -2512,14 +2563,21 @@ class AIAdvisor:
                 {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
             ])
             decision, _ = self._parse_with_one_format_repair(content)
+            self.last_error = ""
             return decision
+        except AIRelayError as exc:
+            # 中转站/传输层错误（余额不足、鉴权失败、网络错误）：单行日志即可，
+            # 不打印堆栈；重试只会继续失败或继续扣费。
+            self.last_error = str(exc)
+            self.log.error("AI 十项古法解读失败（中转站错误）: %s", exc)
         except Exception as exc:
+            self.last_error = repr(exc)
             self.log.error("AI 十项古法解读失败: %s", exc, exc_info=True)
-            if self.config.fail_closed:
-                return self.rule_fallback(
-                    result, min(rule_target, current_fraction), current_fraction, rule_reason, repr(exc)
-                )
-            return self.rule_fallback(result, rule_target, current_fraction, rule_reason, repr(exc))
+        if self.config.fail_closed:
+            return self.rule_fallback(
+                result, min(rule_target, current_fraction), current_fraction, rule_reason, self.last_error
+            )
+        return self.rule_fallback(result, rule_target, current_fraction, rule_reason, self.last_error)
 
     def configured_weight(self, name: str) -> float:
         # 由控制器在构造后绑定 StrategyConfig；保留默认值以便独立测试。
