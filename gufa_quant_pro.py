@@ -1030,11 +1030,12 @@ class InstanceLock:
 
     @staticmethod
     def _read_lock_pid(path: Path) -> int:
+        """读取锁文件中的 PID；文件被独占/损坏时返回 -1（未知）。"""
         try:
             text = path.read_text(encoding="utf-8").strip()
-            return int(text) if text.isdigit() else 0
+            return int(text) if text.isdigit() else -1
         except Exception:
-            return 0
+            return -1
 
     def __enter__(self) -> "InstanceLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1070,12 +1071,15 @@ class InstanceLock:
                 except (OSError, BlockingIOError):
                     self.handle.close()
                     self.handle = None
+                    pid_text = "未知（锁被占用，无法读取）" if stale_pid < 0 else f"{stale_pid}"
                     raise SafetyError(
-                        f"已有实例正在运行（PID {stale_pid}），无法取得锁: {self.path}"
+                        f"已有实例正在运行（PID {pid_text}），无法取得锁: {self.path}\n"
+                        f"请先停止正在运行的交易进程，或确认无进程后删除该锁文件重试。"
                     ) from exc
             else:
                 raise SafetyError(
-                    f"已有实例正在运行（PID {stale_pid}），无法取得锁: {self.path}"
+                    f"已有实例正在运行（PID {stale_pid}），无法取得锁: {self.path}\n"
+                    f"请先停止 PID {stale_pid} 对应的交易进程。"
                 ) from exc
         self.handle.seek(0)
         self.handle.truncate()

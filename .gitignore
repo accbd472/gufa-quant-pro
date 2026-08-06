@@ -10,3 +10,4 @@ credentials*.json
 *.env
 *.bak-*
 *.log
+unused-state.json
