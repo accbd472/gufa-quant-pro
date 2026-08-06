@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import random
+import re
 import signal
 import sys
 import threading
@@ -518,15 +519,34 @@ class RuntimeConfig:
             raise ConfigError("runtime.max_consecutive_cycle_errors 至少为 1")
 
 
+DEFAULT_PREFERRED_BASES: Tuple[str, ...] = (
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT",
+    "ATOM", "UNI", "LTC", "BCH", "TRX", "XLM", "NEAR", "APT", "ARB", "OP",
+    "SUI", "INJ", "TON", "SHIB", "PEPE", "WIF", "AAVE", "FIL", "ICP", "ALGO",
+)
+
+
 @dataclass
 class DailySelectionConfig:
-    """每日候选池初选；只使用确定性十项技术因子，不让 AI 扩展人工白名单。"""
+    """每日候选池初选；只使用确定性十项技术因子，不让 AI 扩展人工白名单。
+
+    初筛两层（prefilter=True 时）：
+    1. 名字规则：主流币（preferred）优先保留，排除以数字开头的新币/蹭热币
+       与 exclude_patterns 匹配的标的，零成本、不请求行情。
+    2. 流动性截断：对剩余标的按 24h 成交额排序，只保留流动性最好的
+       max_candidates 个，避免对全池拉 K 线浪费请求与 token。
+    """
 
     enabled: bool = True
     timeframe: str = "1d"
     ohlcv_limit: int = 250
     top_n: int = 3
     min_score: float = 0.55
+    prefilter: bool = True
+    preferred: Tuple[str, ...] = ()
+    exclude_patterns: Tuple[str, ...] = ()
+    max_candidates: int = 15
+    min_quote_volume: float = 0.0
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DailySelectionConfig":
@@ -534,12 +554,15 @@ class DailySelectionConfig:
         values: Dict[str, Any] = {}
         for key, value in data.items():
             path = f"selection.{key}"
-            if key == "enabled":
+            if key in {"enabled", "prefilter"}:
                 values[key] = require_json_bool(value, path)
-            elif key in {"ohlcv_limit", "top_n"}:
+            elif key in {"ohlcv_limit", "top_n", "max_candidates"}:
                 values[key] = require_json_int(value, path)
-            elif key == "min_score":
+            elif key in {"min_score", "min_quote_volume"}:
                 values[key] = require_json_number(value, path)
+            elif key in {"preferred", "exclude_patterns"}:
+                items = require_json_array(value, path)
+                values[key] = tuple(str(item).strip() for item in items)
             else:
                 values[key] = require_json_string(value, path)
         cfg = cls(**values)
@@ -555,6 +578,10 @@ class DailySelectionConfig:
             raise ConfigError("selection.top_n 至少为 1")
         if not 0 <= self.min_score <= 1:
             raise ConfigError("selection.min_score 必须在 0..1")
+        if self.max_candidates < 0:
+            raise ConfigError("selection.max_candidates 不能为负")
+        if self.min_quote_volume < 0:
+            raise ConfigError("selection.min_quote_volume 不能为负")
 
 
 @dataclass
@@ -948,6 +975,7 @@ class BotState:
     daily_selection_date: str = ""
     daily_selection_key: str = ""
     daily_selected_symbols: List[str] = field(default_factory=list)
+    daily_selection_candidates: List[str] = field(default_factory=list)
     daily_selection_scores: Dict[str, float] = field(default_factory=dict)
     daily_selection_candle_times: Dict[str, str] = field(default_factory=dict)
     halted_reason: str = ""
@@ -975,6 +1003,9 @@ class BotState:
             daily_selection_date=str(data.get("daily_selection_date", "")),
             daily_selection_key=str(data.get("daily_selection_key", "")),
             daily_selected_symbols=[str(item) for item in data.get("daily_selected_symbols", [])],
+            daily_selection_candidates=[
+                str(item) for item in data.get("daily_selection_candidates", [])
+            ],
             daily_selection_scores={
                 str(k): finite(v) for k, v in dict(data.get("daily_selection_scores", {})).items()
             },
@@ -1473,6 +1504,21 @@ class ExchangeGateway:
             raise SafetyError(f"{symbol} ticker 无有效价格")
         return price
 
+    def fetch_quote_volumes(self, symbols: Optional[Iterable[str]] = None) -> Dict[str, float]:
+        """批量 24h 成交额（quoteVolume，计价币）。公开接口，失败由调用方降级。"""
+        symbol_list = list(symbols) if symbols else None
+        tickers = self._safe_call(
+            "fetch_tickers",
+            lambda: self.client.fetch_tickers(symbol_list),
+        )
+        result: Dict[str, float] = {}
+        for symbol, ticker in (tickers or {}).items():
+            try:
+                result[str(symbol)] = finite(ticker.get("quoteVolume") or 0.0)
+            except (TypeError, ValueError):
+                result[str(symbol)] = 0.0
+        return result
+
     def reconcile_pending_orders(self) -> None:
         state = self.state_store.state
         changed = False
@@ -1529,6 +1575,13 @@ class ExchangeGateway:
         for symbol in self.runtime.symbols:
             base = base_asset(symbol)
             amount = max(0.0, finite(total_map.get(base)))
+            if symbol not in prices:
+                if amount > 0:
+                    raise SafetyError(
+                        f"{symbol} 存在持仓余额但无有效价格，无法估值（安全停止）"
+                    )
+                # 无余额的僵尸币（已停交易/无报价）跳过，不影响主流程
+                continue
             price = prices[symbol]
             value = amount * price
             pos_state = state.positions.get(symbol)
@@ -2310,6 +2363,7 @@ class DailySelectionResult:
     selected_symbols: List[str]
     scores: Dict[str, float]
     candle_times: Dict[str, str]
+    candidates: List[str] = field(default_factory=list)
     errors: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -2382,6 +2436,60 @@ class GuFaQuantPro:
         for sig in (signal.SIGINT, signal.SIGTERM):
             with contextlib.suppress(ValueError, OSError):
                 signal.signal(sig, handler)
+    def _fetch_quote_volumes(self, symbols: Sequence[str]) -> Dict[str, float]:
+        """流动性初筛：批量 24h 成交额。失败时降级为空（初筛只是优化，不 fail-closed）。"""
+        fetcher = getattr(self.gateway, "fetch_quote_volumes", None)
+        if fetcher is None:
+            return {}
+        try:
+            return fetcher(symbols)
+        except Exception as exc:  # noqa: BLE001 初筛失败不中断主流程
+            self.log.warning("流动性初筛 ticker 获取失败，降级为纯名字过滤: %s", exc)
+            return {}
+
+    def _prefilter_symbols(self, symbols: Sequence[str]) -> List[str]:
+        """名字初筛：主流优先 + 黑名单正则 + 流动性截断，返回候选池。
+
+        顺序：preferred（主流币）全部保留 → 其余按 24h 成交额排序只留
+        max_candidates 个。ticker 不可用时降级为纯名字过滤，绝不 fail-closed。
+        """
+        selection = self.config.selection
+        if not selection.prefilter:
+            return list(symbols)
+        preferred = set(selection.preferred) if selection.preferred else set(DEFAULT_PREFERRED_BASES)
+        preferred_hits: List[str] = []
+        rest: List[str] = []
+        for symbol in symbols:
+            base = base_asset(symbol).upper()
+            if base in preferred:
+                preferred_hits.append(symbol)
+                continue
+            if re.match(r"^\d", base):
+                # 以数字开头多为新上线/蹭热币（如 2Z、1INCH 知名币在 preferred 内）
+                continue
+            if any(re.search(pattern, base, re.IGNORECASE) for pattern in selection.exclude_patterns):
+                continue
+            rest.append(symbol)
+        if selection.max_candidates > 0 and len(rest) > 0:
+            volumes = self._fetch_quote_volumes(rest)
+            if volumes:
+                if selection.min_quote_volume > 0:
+                    rest = [s for s in rest if volumes.get(s, 0.0) >= selection.min_quote_volume]
+                # 24h 成交额为 0 的僵尸币（已停交易/无流动性）直接剔除
+                rest = [s for s in rest if volumes.get(s, 0.0) > 0]
+                rest.sort(key=lambda s: -volumes.get(s, 0.0))
+                budget = max(0, selection.max_candidates - len(preferred_hits))
+                rest = rest[:budget]
+        candidates = preferred_hits + rest
+        self.log.info(
+            "名字初筛 | %d -> %d 候选 (preferred=%d, rest=%d)",
+            len(symbols),
+            len(candidates),
+            len(preferred_hits),
+            len(rest),
+        )
+        return candidates
+
     def _selection_cache_key(self) -> str:
         selection = self.config.selection
         payload = {
@@ -2392,12 +2500,19 @@ class GuFaQuantPro:
             "top_n": selection.top_n,
             "min_score": selection.min_score,
             "weights": self.config.strategy.weights,
+            "prefilter": {
+                "enabled": selection.prefilter,
+                "preferred": list(selection.preferred),
+                "exclude_patterns": list(selection.exclude_patterns),
+                "max_candidates": selection.max_candidates,
+                "min_quote_volume": selection.min_quote_volume,
+            },
         }
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _daily_selection(self) -> DailySelectionResult:
-        """按 UTC 自然日扫描白名单；扫描不完整时返回空入选集，禁止新增风险。"""
+        """按 UTC 自然日对候选池扫描；扫描不完整时返回空入选集，禁止新增风险。"""
         selection = self.config.selection
         today = utc_now().date().isoformat()
         if not selection.enabled:
@@ -2410,6 +2525,7 @@ class GuFaQuantPro:
                 selected_symbols=list(self.config.runtime.symbols),
                 scores={},
                 candle_times={},
+                candidates=list(self.config.runtime.symbols),
             )
 
         state = self.store.state
@@ -2417,6 +2533,9 @@ class GuFaQuantPro:
         if state.daily_selection_date == today and state.daily_selection_key == cache_key:
             allowed = set(self.config.runtime.symbols)
             selected = [symbol for symbol in state.daily_selected_symbols if symbol in allowed]
+            candidates = [
+                symbol for symbol in state.daily_selection_candidates if symbol in allowed
+            ]
             return DailySelectionResult(
                 enabled=True,
                 date=today,
@@ -2426,12 +2545,14 @@ class GuFaQuantPro:
                 selected_symbols=selected,
                 scores=dict(state.daily_selection_scores),
                 candle_times=dict(state.daily_selection_candle_times),
+                candidates=candidates,
             )
 
+        candidates = self._prefilter_symbols(self.config.runtime.symbols)
         scores: Dict[str, float] = {}
         candle_times: Dict[str, str] = {}
         errors: Dict[str, str] = {}
-        for symbol in self.config.runtime.symbols:
+        for symbol in candidates:
             try:
                 frame = self.gateway.fetch_ohlcv(
                     symbol,
@@ -2459,6 +2580,7 @@ class GuFaQuantPro:
                 selected_symbols=[],
                 scores=scores,
                 candle_times=candle_times,
+                candidates=candidates,
                 errors=errors,
             )
 
@@ -2469,12 +2591,14 @@ class GuFaQuantPro:
         state.daily_selection_date = today
         state.daily_selection_key = cache_key
         state.daily_selected_symbols = list(selected)
+        state.daily_selection_candidates = list(candidates)
         state.daily_selection_scores = dict(scores)
         state.daily_selection_candle_times = dict(candle_times)
         self.store.save()
         self.log.info(
-            "每日古法初选完成 | timeframe=%s | selected=%s | scores=%s",
+            "每日古法初选完成 | timeframe=%s | candidates=%d | selected=%s | scores=%s",
             selection.timeframe,
+            len(candidates),
             selected,
             {symbol: round(scores[symbol], 3) for symbol in ranked},
         )
@@ -2487,14 +2611,24 @@ class GuFaQuantPro:
             selected_symbols=selected,
             scores=scores,
             candle_times=candle_times,
+            candidates=candidates,
         )
 
     def _account_prices(self) -> Dict[str, float]:
-        """账户估值必须覆盖完整白名单，即使标的未通过当日初选。"""
-        return {
-            symbol: self.gateway.fetch_last_price(symbol)
-            for symbol in self.config.runtime.symbols
-        }
+        """账户估值必须覆盖完整白名单，即使标的未通过当日初选。
+
+        无持仓的僵尸币（如已停交易、无有效报价）拉价失败时跳过并告警，
+        避免整个周期被无意义标的卡死；有持仓的币仍硬校验（估值失败即保守停止）。
+        """
+        prices: Dict[str, float] = {}
+        for symbol in self.config.runtime.symbols:
+            try:
+                prices[symbol] = self.gateway.fetch_last_price(symbol)
+            except Exception as exc:  # noqa: BLE001 无持仓僵尸币跳过，不影响主流程
+                if symbol in self.store.state.positions:
+                    raise
+                self.log.warning("%s 无有效价格，跳过估值（该标的无持仓）: %s", symbol, exc)
+        return prices
 
     def _prices_and_signals(
         self,
@@ -2600,7 +2734,11 @@ class GuFaQuantPro:
                         "rank": ranked.index(symbol) + 1 if symbol in ranked else None,
                         "top_n": self.config.selection.top_n,
                         "minimum_score": self.config.selection.min_score,
-                        "candidate_pool_size": len(self.config.runtime.symbols),
+                        "candidate_pool_size": (
+                            len(daily_selection.candidates)
+                            if daily_selection and daily_selection.candidates
+                            else len(self.config.runtime.symbols)
+                        ),
                     })
                 ai_decision = self.ai.interpret(
                     symbol=symbol,

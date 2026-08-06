@@ -179,7 +179,9 @@ def make_gateway_stub(tmp_path: Path):
     gateway.risk = SimpleNamespace()
     gateway.log = logging.getLogger("test.gateway")
     gateway.client = SimpleNamespace()
-    gateway.exchange_cfg = SimpleNamespace(id="fake", client_order_id_param="clientOrderId")
+    gateway.exchange_cfg = SimpleNamespace(
+        id="fake", client_order_id_param="clientOrderId", max_retries=0
+    )
     gateway.runtime = SimpleNamespace(quote_currency="USDT")
     return gateway, store
 
@@ -198,6 +200,36 @@ def test_pending_without_order_id_halts_reconciliation(tmp_path: Path) -> None:
     assert store.state.halted_reason.startswith("ORDER_UNCERTAIN:")
     persisted = json.loads(store.path.read_text(encoding="utf-8"))
     assert persisted["pending_orders"]["BTC/USDT"]["id"] == ""
+
+
+def test_account_snapshot_skips_zombie_symbol_without_balance(tmp_path: Path) -> None:
+    gateway, store = make_gateway_stub(tmp_path)
+    gateway.risk = SimpleNamespace(dust_quote=1.0, reject_unmanaged_positions=False)
+    gateway.runtime = SimpleNamespace(quote_currency="USDT", symbols=["BTC/USDT", "CC/USDT"])
+    gateway.client = SimpleNamespace(
+        fetch_balance=lambda: {
+            "free": {"USDT": 100.0, "BTC": 0.0},
+            "total": {"USDT": 100.0, "BTC": 0.0},
+        }
+    )
+    snapshot = gateway.account_snapshot(prices={"BTC/USDT": 50000.0})
+    assert snapshot.equity == 100.0
+    assert "BTC/USDT" in snapshot.positions
+    assert "CC/USDT" not in snapshot.positions
+
+
+def test_account_snapshot_requires_price_when_balance_exists(tmp_path: Path) -> None:
+    gateway, store = make_gateway_stub(tmp_path)
+    gateway.risk = SimpleNamespace(dust_quote=1.0, reject_unmanaged_positions=False)
+    gateway.runtime = SimpleNamespace(quote_currency="USDT", symbols=["CC/USDT"])
+    gateway.client = SimpleNamespace(
+        fetch_balance=lambda: {
+            "free": {"USDT": 100.0, "CC": 5.0},
+            "total": {"USDT": 100.0, "CC": 5.0},
+        }
+    )
+    with pytest.raises(g.SafetyError, match="无有效价格"):
+        gateway.account_snapshot(prices={})
 
 
 def test_create_order_network_failure_is_not_retried(tmp_path: Path, monkeypatch) -> None:
@@ -373,6 +405,113 @@ def test_daily_selection_failure_is_fail_closed_and_not_cached(tmp_path: Path) -
 
     controller._daily_selection()
     assert len(calls) == 4
+
+
+def make_prefilter_controller(prefilter=True, preferred=(), exclude=(), max_candidates=15,
+                              min_quote_volume=0.0, volumes=None, volumes_raise=False):
+    controller = object.__new__(g.GuFaQuantPro)
+    controller.config = SimpleNamespace(
+        runtime=SimpleNamespace(symbols=[]),
+        selection=g.DailySelectionConfig(
+            enabled=True,
+            timeframe="1d",
+            ohlcv_limit=180,
+            top_n=2,
+            min_score=0.55,
+            prefilter=prefilter,
+            preferred=tuple(preferred),
+            exclude_patterns=tuple(exclude),
+            max_candidates=max_candidates,
+            min_quote_volume=min_quote_volume,
+        ),
+        strategy=g.StrategyConfig(),
+    )
+    controller.store = g.StateStore(Path("unused-state.json"), "prefilter-profile")
+    controller.log = logging.getLogger("test.prefilter")
+
+    class FakeGateway:
+        def fetch_quote_volumes(self, symbols):
+            if volumes_raise:
+                raise RuntimeError("ticker unavailable")
+            return {s: (volumes or {}).get(s, 1000.0) for s in symbols}
+
+    controller.gateway = FakeGateway()
+    return controller
+
+
+def test_name_prefilter_keeps_preferred_and_drops_numeric() -> None:
+    controller = make_prefilter_controller()
+    symbols = ["BTC/USDT", "ETH/USDT", "2Z/USDT", "1INCH/USDT", "BABYDOGE/USDT"]
+    out = controller._prefilter_symbols(symbols)
+    assert "BTC/USDT" in out
+    assert "ETH/USDT" in out
+    assert "2Z/USDT" not in out
+    assert "1INCH/USDT" not in out  # 数字开头且不在 preferred
+    assert "BABYDOGE/USDT" in out   # 非数字开头，保留进流动性层
+
+
+def test_name_prefilter_exclude_patterns_and_preferred_override() -> None:
+    controller = make_prefilter_controller(
+        preferred=["BTC"], exclude=["^BABY", "DOGE$"]
+    )
+    symbols = ["BTC/USDT", "BABYDOGE/USDT", "DOGE/USDT", "SHIB/USDT"]
+    out = controller._prefilter_symbols(symbols)
+    assert out == ["BTC/USDT", "SHIB/USDT"]
+
+
+def test_name_prefilter_liquidity_cap_respects_budget() -> None:
+    controller = make_prefilter_controller(
+        preferred=["BTC"], max_candidates=3,
+        volumes={"SOL/USDT": 9e8, "XRP/USDT": 5e8, "ADA/USDT": 1e8, "LTC/USDT": 1e7},
+    )
+    symbols = ["BTC/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "LTC/USDT"]
+    out = controller._prefilter_symbols(symbols)
+    assert out[0] == "BTC/USDT"          # preferred 优先
+    assert out[1:] == ["SOL/USDT", "XRP/USDT"]  # 剩余按成交额取 3-1 个
+
+
+def test_name_prefilter_min_quote_volume_filters_low_liquidity() -> None:
+    controller = make_prefilter_controller(
+        max_candidates=10, min_quote_volume=1e8,
+        volumes={"BONK/USDT": 9e8, "CETUS/USDT": 1e7},
+    )
+    out = controller._prefilter_symbols(["BONK/USDT", "CETUS/USDT"])
+    assert out == ["BONK/USDT"]
+
+
+def test_name_prefilter_ticker_failure_degrades_to_name_only() -> None:
+    controller = make_prefilter_controller(volumes_raise=True)
+    symbols = ["BTC/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "LTC/USDT"]
+    out = controller._prefilter_symbols(symbols)
+    # ticker 失败时降级为纯名字过滤：不截断、不抛错
+    assert set(out) == set(symbols)
+
+
+def test_name_prefilter_disabled_returns_all() -> None:
+    controller = make_prefilter_controller(prefilter=False)
+    symbols = ["BTC/USDT", "2Z/USDT"]
+    assert controller._prefilter_symbols(symbols) == symbols
+
+
+def test_daily_selection_uses_prefiltered_candidates_and_caches(tmp_path: Path) -> None:
+    scores = {
+        "BTC/USDT": 0.61,
+        "ETH/USDT": 0.82,
+        "2Z/USDT": 0.99,   # 名字初筛直接排除，即使古法得分最高也不入选
+    }
+    controller, calls = make_selection_controller(tmp_path, scores)
+    controller.gateway.fetch_quote_volumes = lambda symbols: {s: 1e9 for s in symbols}
+
+    first = controller._daily_selection()
+    assert first.complete is True
+    assert "2Z/USDT" not in first.candidates
+    assert first.selected_symbols == ["ETH/USDT", "BTC/USDT"]
+    assert controller.store.state.daily_selection_candidates == ["BTC/USDT", "ETH/USDT"]
+    assert len(calls) == 2  # 只对初筛后的候选拉 K 线
+
+    second = controller._daily_selection()
+    assert second.cached is True
+    assert second.candidates == first.candidates
 
 
 def test_fine_screen_rejects_symbols_outside_manual_pool() -> None:
