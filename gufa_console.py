@@ -26,7 +26,7 @@ import sys
 import time
 import threading
 import urllib.request
-import urllib.request
+import urllib.error
 from copy import deepcopy
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,7 +50,7 @@ _ALLOWED_CONFIG: Dict[str, List[str]] = {
     "runtime": ["symbols", "quote_currency", "timeframe", "ohlcv_limit",
                 "poll_interval_seconds", "closed_candle_only", "max_candle_lag_seconds",
                 "log_level", "log_max_bytes", "log_backup_count", "webhook_url"],
-    "ai": ["enabled", "model", "base_url", "timeout_seconds", "minimum_allow_confidence",
+    "ai": ["enabled", "model", "base_url", "api_key_name", "timeout_seconds", "minimum_allow_confidence",
            "decision_mode", "fail_closed", "max_output_tokens"],
 }
 
@@ -264,6 +264,15 @@ class ConsoleServer(ThreadingHTTPServer):
 
     def credentials_store(self) -> g.CredentialStore:
         return g.CredentialStore(g.default_credentials_path(self.config_path))
+
+    def credentials_list(self) -> Dict[str, Any]:
+        """返回凭据列表（仅 Key 名称，不暴露值）。"""
+        store = self.credentials_store()
+        return {
+            "ai_key_names": store.list_ai_key_names(),
+            "exchange_key_set": bool(store.stored("GUFA_API_KEY")),
+            "exchange_secret_set": bool(store.stored("GUFA_API_SECRET")),
+        }
 
     # ---- 自助选择交易标的 ----
     def symbols_candidates(self) -> Dict[str, Any]:
@@ -662,6 +671,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_json(self._config_payload())
         elif path == "/api/symbols/candidates":
             self._send_json(self.server.symbols_candidates())
+        elif path == "/api/credentials":
+            self._send_json(self.server.credentials_list())
+        elif path == "/api/ai/models":
+            self._handle_ai_models()
+        elif path == "/api/ai/test":
+            self._handle_ai_test()
         else:
             self._send_json({"error": "未知接口"}, 404)
 
@@ -713,6 +728,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             },
             "ai": {
                 "enabled": cfg.ai.enabled, "model": cfg.ai.model, "base_url": cfg.ai.base_url,
+                "api_key_name": cfg.ai.api_key_name,
                 "timeout_seconds": cfg.ai.timeout_seconds,
                 "minimum_allow_confidence": cfg.ai.minimum_allow_confidence,
                 "decision_mode": cfg.ai.decision_mode, "fail_closed": cfg.ai.fail_closed,
@@ -751,6 +767,37 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "配置无效，请先保存配置"}, 400)
             return
         store = self.server.credentials_store()
+        # 命名 AI Key（多 Key 档案）
+        if "ai_key_name" in body and "ai_key_value" in body:
+            name = str(body["ai_key_name"]).strip()
+            value = str(body["ai_key_value"]).strip()
+            if not name:
+                self._send_json({"ok": False, "error": "AI Key 名称不能为空"}, 400)
+                return
+            if not value:
+                self._send_json({"ok": False, "error": "AI Key 值不能为空"}, 400)
+                return
+            try:
+                store.set_ai_key(name, value)
+                store.save()
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"保存失败: {exc}"}, 400)
+                return
+            self._send_json({"ok": True, "saved": True, "ai_key_names": store.list_ai_key_names(),
+                             "note": f"AI Key「{name}」已保存"})
+            return
+        if "ai_key_delete" in body:
+            name = str(body["ai_key_delete"]).strip()
+            try:
+                store.delete_ai_key(name)
+                store.save()
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"删除失败: {exc}"}, 400)
+                return
+            self._send_json({"ok": True, "deleted": name, "ai_key_names": store.list_ai_key_names(),
+                             "note": f"AI Key「{name}」已删除"})
+            return
+        # 旧式凭据
         mapping = [
             ("exchange_api_key", cfg.exchange.api_key_env),
             ("exchange_secret", cfg.exchange.secret_env),
@@ -769,6 +816,106 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
         self._send_json({"ok": True, "saved": saved,
                          "note": "凭据已保存到本地凭据文件；环境变量仍优先"})
+
+    def _handle_ai_models(self) -> None:
+        """GET /api/ai/models：用当前配置的 base_url + key 拉取模型列表。"""
+        cfg = self.server.resolve_config()
+        if cfg is None or not cfg.ai.enabled:
+            self._send_json({"ok": False, "error": "AI 未启用或配置无效"}, 400)
+            return
+        base_url = cfg.ai.base_url.strip()
+        if not base_url:
+            self._send_json({"ok": False, "error": "请先保存 Base URL"}, 400)
+            return
+        # 解析 Key：优先命名 Key，其次旧式凭据
+        store = self.server.credentials_store()
+        name = cfg.ai.api_key_name.strip()
+        try:
+            if name:
+                key = store.resolve_ai_key(name, required=True)
+            else:
+                key = store.resolve(cfg.ai.api_key_env, required=True, purpose="AI API")
+        except g.ConfigError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        url = base_url.rstrip("/") + "/models"
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+            # 走代理（如果配置了）
+            proxy_url = (cfg.exchange.proxy_url or "").strip()
+            if proxy_url:
+                handler = urllib.request.ProxyHandler({
+                    "http": proxy_url, "https": proxy_url,
+                })
+                opener = urllib.request.build_opener(handler)
+                resp = opener.open(req, timeout=15)
+            else:
+                resp = urllib.request.urlopen(req, timeout=15)
+            data = json.loads(resp.read().decode("utf-8"))
+            models = [m.get("id", "") for m in data.get("data", []) if m.get("id")]
+            models.sort()
+            self._send_json({"ok": True, "models": models, "total": len(models)})
+        except json.JSONDecodeError:
+            self._send_json({"ok": False, "error": "API 返回非 JSON 响应，请检查 Base URL 是否正确", "models": []}, 400)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"拉取模型列表失败: {exc}", "models": []}, 400)
+
+    def _handle_ai_test(self) -> None:
+        """GET /api/ai/test：用当前配置发一条 chat/completions 探测连通性。"""
+        cfg = self.server.resolve_config()
+        if cfg is None or not cfg.ai.enabled:
+            self._send_json({"ok": False, "error": "AI 未启用或配置无效"}, 400)
+            return
+        base_url = cfg.ai.base_url.strip()
+        if not base_url:
+            self._send_json({"ok": False, "error": "请先保存 Base URL"}, 400)
+            return
+        store = self.server.credentials_store()
+        name = cfg.ai.api_key_name.strip()
+        try:
+            key = (store.resolve_ai_key(name, required=True) if name
+                   else store.resolve(cfg.ai.api_key_env, required=True, purpose="AI API"))
+        except g.ConfigError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        url = base_url.rstrip("/") + "/chat/completions"
+        payload = json.dumps({
+            "model": cfg.ai.model or "gpt-4.1-mini",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 5,
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        })
+        try:
+            proxy_url = (cfg.exchange.proxy_url or "").strip()
+            if proxy_url:
+                handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+                opener = urllib.request.build_opener(handler)
+                resp = opener.open(req, timeout=15)
+            else:
+                resp = urllib.request.urlopen(req, timeout=15)
+            data = json.loads(resp.read().decode("utf-8"))
+            model_used = data.get("model", "?")
+            content = ""
+            choices = data.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+            self._send_json({"ok": True, "model": model_used,
+                             "reply": content[:200],
+                             "note": f"✅ 连接成功，模型 {model_used} 响应正常"})
+        except json.JSONDecodeError:
+            self._send_json({"ok": False, "error": "API 返回非 JSON 响应，请检查 Base URL"}, 400)
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="replace")[:500]
+            except Exception:
+                pass
+            self._send_json({"ok": False, "error": f"HTTP {exc.code}: {body}"}, 400)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": f"连接失败: {exc}"}, 400)
 
     def _handle_control(self, body: Dict[str, Any]) -> None:
         action = str(body.get("action", "")).strip()
@@ -971,10 +1118,26 @@ input[type=checkbox]{width:auto}
   <div class="step" id="step-2" style="display:none">
     <div class="form-row check"><input type="checkbox" id="f_ai_enabled" checked><label for="f_ai_enabled">启用 AI 十项古法解读</label></div>
     <div class="form-row"><label>中转站 Base URL（OpenAI 兼容）</label><input id="f_ai_url" placeholder="https://tokenrhythm.studio/v1"></div>
-    <div class="form-row"><label>模型 ID</label><input id="f_ai_model" placeholder="qwen3.7-max"></div>
-    <div class="form-row"><label>AI API Key</label><input id="f_ai_key" type="password" autocomplete="off" placeholder="留空则保留已保存值"></div>
-    <div class="form-row"><label>超时（秒）</label><input id="f_ai_timeout" type="number" value="120"></div>
+    <div class="form-row"><label>AI Key 档案（多 Key 自主切换）</label>
+      <select id="f_ai_key_name" onchange="onKeyChange()"><option value="">— 旧式凭据（环境变量） —</option></select>
+    </div>
+    <div class="form-row" style="display:flex;gap:8px;align-items:flex-end">
+      <div style="flex:1"><label style="font-size:11px">新 Key 名称</label><input id="f_ai_key_name_new" placeholder="如：tokenrhythm-主号"></div>
+      <div style="flex:2"><label style="font-size:11px">新 Key 值</label><input id="f_ai_key_value_new" type="password" autocomplete="off" placeholder="sk-..."></div>
+      <button onclick="saveNamedKey()" style="white-space:nowrap;margin-bottom:0">➕ 添加</button>
+    </div>
+    <div class="form-row" id="rowDelKey" style="display:none">
+      <button class="danger" onclick="deleteNamedKey()" style="width:100%">🗑 删除当前选中的 Key 档案</button>
+    </div>
+    <div class="form-row"><label>模型 ID</label>
+      <div style="display:flex;gap:8px">
+        <select id="f_ai_model" onchange="onModelChange()" style="flex:1"><option value="">— 加载中… —</option></select>
+        <button onclick="loadModels()" style="margin-bottom:0;white-space:nowrap">🔄 刷新</button>
+      </div>
+      <input id="f_ai_model_custom" style="display:none;margin-top:6px" placeholder="手动输入模型 ID，如 qwen3.7-max">
+    </div>
     <button class="primary" onclick="saveStep2()">保存 AI 设置</button>
+    <button onclick="testAiConnection()" style="margin-top:8px;width:100%">🔍 测试连接</button>
   </div>
 
   <div class="step" id="step-3" style="display:none">
@@ -1113,8 +1276,13 @@ function loadConfig(){
     document.getElementById('f_proxy').value = c.exchange.proxy_url;
     document.getElementById('f_ai_enabled').checked = c.ai.enabled;
     document.getElementById('f_ai_url').value = c.ai.base_url||'';
-    document.getElementById('f_ai_model').value = c.ai.model||'';
     document.getElementById('f_ai_timeout').value = c.ai.timeout_seconds;
+    // 模型列表：先设当前值，再异步拉取
+    curModel = c.ai.model||'';
+    loadModels();
+    // Key 档案选择器
+    curKeyName = c.ai.api_key_name||'';
+    loadKeyNames();
     document.getElementById('f_symbols').value = c.runtime.symbols.join(',');
     document.getElementById('f_tf').value = c.runtime.timeframe;
     document.getElementById('f_poll').value = c.runtime.poll_interval_seconds;
@@ -1163,7 +1331,10 @@ function saveStep1(){
 }
 function saveStep2(){
   const cred={}; if(document.getElementById('f_ai_key').value.trim()) cred.ai_api_key=document.getElementById('f_ai_key').value.trim();
-  const cfg={ai:{enabled:document.getElementById('f_ai_enabled').checked, base_url:document.getElementById('f_ai_url').value.trim(), model:document.getElementById('f_ai_model').value.trim(), timeout_seconds:Number(document.getElementById('f_ai_timeout').value)||120}};
+  let model = document.getElementById('f_ai_model').value;
+  if(model === '__custom__') model = document.getElementById('f_ai_model_custom').value.trim();
+  if(!model){ toast('请选择或输入模型 ID'); return; }
+  const cfg={ai:{enabled:document.getElementById('f_ai_enabled').checked, base_url:document.getElementById('f_ai_url').value.trim(), api_key_name:document.getElementById('f_ai_key_name').value, model, timeout_seconds:Number(document.getElementById('f_ai_timeout').value)||120}};
   Promise.all([
     api('/api/config',{method:'POST',body:JSON.stringify(cfg)}),
     Object.keys(cred).length?api('/api/credentials',{method:'POST',body:JSON.stringify(cred)}):Promise.resolve({ok:true})
@@ -1184,6 +1355,78 @@ function saveStep3(){
     if(!r) return;
     toast(r.ok?(r.note||'运行设置已保存'):(r.error||'保存失败'));
     if(r.ok) refresh();
+  }).catch(e=>toast(e.message));
+}
+
+// ---- 多 Key 档案 + 模型列表 ----
+let curModel = '', curKeyName = '';
+
+function loadModels(){
+  const sel = document.getElementById('f_ai_model');
+  document.getElementById('f_ai_model_custom').style.display = 'none';
+  sel.innerHTML = '<option value="">— 加载中… —</option>';
+  api('/api/ai/models').then(r=>{
+    sel.innerHTML = '';
+    if(!r.ok){ sel.innerHTML = `<option value="${esc(curModel)}">${esc(curModel)}</option><option value="">⚠ ${esc(r.error)}</option>`; return; }
+    r.models.forEach(m=>{ sel.innerHTML += `<option value="${esc(m)}"${m===curModel?' selected':''}>${esc(m)}</option>`; });
+    if(curModel && !r.models.includes(curModel)){
+      sel.innerHTML = `<option value="${esc(curModel)}" selected>${esc(curModel)} (当前)</option>` + sel.innerHTML;
+    }
+    sel.innerHTML += '<option value="__custom__">✏ 自定义…</option>';
+  }).catch(e=>{
+    sel.innerHTML = `<option value="${esc(curModel)}">${esc(curModel)}</option><option value="">⚠ ${esc(e.message)}</option>`;
+  });
+}
+
+function loadKeyNames(){
+  const sel = document.getElementById('f_ai_key_name');
+  sel.innerHTML = '<option value="">— 旧式凭据（环境变量） —</option>';
+  api('/api/credentials').then(r=>{
+    r.ai_key_names.forEach(n=>{ sel.innerHTML += `<option value="${esc(n)}"${n===curKeyName?' selected':''}>${esc(n)}</option>`; });
+    onKeyChange();
+  }).catch(()=>{});
+}
+
+function onKeyChange(){
+  const v = document.getElementById('f_ai_key_name').value;
+  document.getElementById('rowDelKey').style.display = v ? '' : 'none';
+}
+
+function onModelChange(){
+  const sel = document.getElementById('f_ai_model');
+  const custom = document.getElementById('f_ai_model_custom');
+  const isCustom = sel.value === '__custom__';
+  custom.style.display = isCustom ? '' : 'none';
+  if(isCustom) custom.focus();
+}
+
+function saveNamedKey(){
+  const name = document.getElementById('f_ai_key_name_new').value.trim();
+  const value = document.getElementById('f_ai_key_value_new').value.trim();
+  if(!name){ toast('请输入 Key 名称'); return; }
+  if(!value){ toast('请输入 Key 值'); return; }
+  api('/api/credentials',{method:'POST',body:JSON.stringify({ai_key_name:name, ai_key_value:value})})
+    .then(r=>{
+      toast(r.ok?r.note:(r.error||'保存失败'));
+      if(r.ok){ document.getElementById('f_ai_key_name_new').value=''; document.getElementById('f_ai_key_value_new').value=''; loadKeyNames(); }
+    }).catch(e=>toast(e.message));
+}
+
+function deleteNamedKey(){
+  const name = document.getElementById('f_ai_key_name').value;
+  if(!name) return;
+  if(!confirm(`确定删除 Key 档案「${name}」？`)) return;
+  api('/api/credentials',{method:'POST',body:JSON.stringify({ai_key_delete:name})})
+    .then(r=>{
+      toast(r.ok?r.note:(r.error||'删除失败'));
+      if(r.ok){ curKeyName=''; loadKeyNames(); }
+    }).catch(e=>toast(e.message));
+}
+
+function testAiConnection(){
+  toast('⏳ 正在测试连接…');
+  api('/api/ai/test').then(r=>{
+    toast(r.ok?r.note:(r.error||'连接失败'));
   }).catch(e=>toast(e.message));
 }
 

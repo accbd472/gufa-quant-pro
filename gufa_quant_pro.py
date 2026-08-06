@@ -67,7 +67,8 @@ APP_NAME = "GuFaQuant-Pro"
 APP_VERSION = "8.4.1"
 CONFIG_VERSION = 3
 STATE_VERSION = 4
-CREDENTIALS_VERSION = 1
+CREDENTIALS_VERSION = 2
+AI_KEYS_VERSION = 1
 STRATEGY_NAMES = ("奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱")
 AI_ACTIONS = {"BUY", "SELL", "HOLD"}
 AI_TARGET_LEVELS = {"FLAT", "HALF", "FULL", "UNCHANGED"}
@@ -221,11 +222,17 @@ def default_credentials_path(config_path: Path) -> Path:
 
 
 class CredentialStore:
-    """权限收紧的本地明文凭据仓库；环境变量始终具有更高优先级。"""
+    """权限收紧的本地明文凭据仓库；环境变量始终具有更高优先级。
+
+    支持两类凭据：
+    - secrets：按环境变量名存储（exchange key/secret/password, 旧式 AI key）
+    - ai_keys：按自定义名称存储（支持多个 AI API Key 自主切换）
+    """
 
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
         self.secrets: Dict[str, str] = {}
+        self.ai_keys: Dict[str, str] = {}
         self._load()
 
     def _load(self) -> None:
@@ -238,8 +245,23 @@ class CredentialStore:
             raise ConfigError(f"凭据文件无法读取或 JSON 无效: {self.path}: {exc}") from exc
         if type(payload) is not dict:
             raise ConfigError(f"凭据文件顶层必须是 JSON object: {self.path}")
-        reject_unknown(payload, {"version", "secrets"}, "credentials")
+        # v1: 只有 secrets；v2: 新增 ai_keys
+        allowed = {"version", "secrets", "ai_keys"}
+        reject_unknown(payload, allowed, "credentials")
         version = require_json_int(payload.get("version"), "credentials.version")
+        if version == 1:
+            # v1 → v2 自动升级：加载 secrets，新增 ai_keys 字段
+            raw = require_json_object(payload.get("secrets", {}), "credentials.secrets")
+            self.secrets = {}
+            for name, value in raw.items():
+                key = require_json_string(name, "credentials.secrets key").strip()
+                secret = require_json_string(value, f"credentials.secrets.{key}").strip()
+                if key and secret:
+                    self.secrets[key] = secret
+            self.ai_keys = {}
+            self._tighten_permissions()
+            self.save()  # 升级到 v2 格式
+            return
         if version != CREDENTIALS_VERSION:
             raise ConfigError(
                 f"凭据文件版本不兼容: {version} != {CREDENTIALS_VERSION}: {self.path}"
@@ -251,6 +273,17 @@ class CredentialStore:
             secret = require_json_string(value, f"credentials.secrets.{key}").strip()
             if key and secret:
                 self.secrets[key] = secret
+        # ai_keys 字段（v2 新增；v1 文件不包含此字段，默认为空）
+        raw_ai = payload.get("ai_keys", {})
+        if raw_ai is not None and not isinstance(raw_ai, dict):
+            raise ConfigError("credentials.ai_keys 必须是 JSON object")
+        self.ai_keys = {}
+        if raw_ai:
+            for name, value in raw_ai.items():
+                k = str(name).strip()
+                v = str(value).strip()
+                if k and v:
+                    self.ai_keys[k] = v
         self._tighten_permissions()
 
     def _tighten_permissions(self) -> None:
@@ -267,7 +300,11 @@ class CredentialStore:
         self._tighten_permissions()
         atomic_write_json(
             self.path,
-            {"version": CREDENTIALS_VERSION, "secrets": self.secrets},
+            {
+                "version": CREDENTIALS_VERSION,
+                "secrets": self.secrets,
+                "ai_keys": self.ai_keys,
+            },
             mode=0o600,
         )
         self._tighten_permissions()
@@ -304,6 +341,42 @@ class CredentialStore:
         if self.stored(name):
             return "credential-store"
         return "missing"
+
+    # ---- 命名 AI Key（多 Key 档案） ----
+    def list_ai_key_names(self) -> List[str]:
+        """返回已保存的 AI Key 名称列表（不含值）。"""
+        return sorted(self.ai_keys)
+
+    def set_ai_key(self, name: str, value: str) -> None:
+        """保存或更新一个命名 AI Key。"""
+        k = name.strip()
+        v = value.strip()
+        if not k:
+            raise ConfigError("AI Key 名称不能为空")
+        if not v:
+            self.ai_keys.pop(k, None)
+            return
+        # 名称限中英文数字短横下划线
+        if not re.fullmatch(r'[\u4e00-\u9fffA-Za-z0-9_\-]+', k):
+            raise ConfigError("AI Key 名称只能包含中文、字母、数字、短横、下划线")
+        self.ai_keys[k] = v
+
+    def delete_ai_key(self, name: str) -> None:
+        """删除一个命名 AI Key。"""
+        self.ai_keys.pop(name.strip(), None)
+
+    def resolve_ai_key(self, name: str, required: bool) -> str:
+        """从 ai_keys 档案中解析指定名称的 Key。"""
+        if not name:
+            if required:
+                raise ConfigError("AI Key 名称不能为空")
+            return ""
+        value = self.ai_keys.get(name.strip(), "").strip()
+        if required and not value:
+            raise ConfigError(
+                f"缺少 AI API Key「{name}」。请在控制台凭据页添加。"
+            )
+        return value
 
 
 def secret_from_env(
@@ -734,6 +807,7 @@ class AIConfig:
     enabled: bool = False
     model: str = "gpt-4.1-mini"
     api_key_env: str = "OPENAI_API_KEY"
+    api_key_name: str = ""          # 命名 AI Key（多 Key 档案），优先于 api_key_env
     base_url: str = ""
     timeout_seconds: int = 20
     fail_closed: bool = True
@@ -766,6 +840,7 @@ class AIConfig:
             raise ConfigError("ai.max_output_tokens 必须在 300..4000")
         self.model = self.model.strip()
         self.api_key_env = self.api_key_env.strip()
+        self.api_key_name = self.api_key_name.strip()
         self.base_url = self.base_url.strip()
         self.decision_mode = self.decision_mode.strip().lower()
         if self.decision_mode not in {"bounded", "explain_only"}:
@@ -2096,10 +2171,14 @@ class AIAdvisor:
             from openai import OpenAI
         except ImportError as exc:
             raise ConfigError("启用 AI 需要安装 openai") from exc
-        key = secret_from_env(
-            config.api_key_env, required=True,
-            credentials=self.credentials, purpose="AI API",
-        )
+        key = (
+                self.credentials.resolve_ai_key(config.api_key_name, required=True)
+                if config.api_key_name
+                else secret_from_env(
+                    config.api_key_env, required=True,
+                    credentials=self.credentials, purpose="AI API",
+                )
+            )
         kwargs: Dict[str, Any] = {
             "api_key": key,
             "timeout": config.timeout_seconds,

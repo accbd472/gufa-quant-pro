@@ -1058,3 +1058,92 @@ def test_cmd_stats_summary(tmp_path: Path, capsys) -> None:
     # 峰值 1100 → 最低 990 回撤 10%
     assert out["max_drawdown_pct"] == 10.0
     assert out["health_exists"] is False
+
+
+# ====== 8.5.0: 多 AI Key 档案 + api_key_name ======
+
+def test_credentials_ai_keys_roundtrip(tmp_path: Path) -> None:
+    """添加、解析、列出、删除命名 AI Key。"""
+    store = g.CredentialStore(tmp_path / "creds.json")
+    assert store.list_ai_key_names() == []
+    store.set_ai_key("rb1", "sk-rb1-abc")
+    store.set_ai_key("rb2", "sk-rb2-xyz")
+    store.save()
+    store2 = g.CredentialStore(tmp_path / "creds.json")
+    assert store2.list_ai_key_names() == ["rb1", "rb2"]
+    assert store2.resolve_ai_key("rb1", required=True) == "sk-rb1-abc"
+    assert store2.resolve_ai_key("rb2", required=True) == "sk-rb2-xyz"
+    store2.delete_ai_key("rb1")
+    store2.save()
+    store3 = g.CredentialStore(tmp_path / "creds.json")
+    assert store3.list_ai_key_names() == ["rb2"]
+    assert store3.resolve_ai_key("rb1", required=False) == ""
+
+
+def test_credentials_ai_key_empty_name_raises(tmp_path: Path) -> None:
+    store = g.CredentialStore(tmp_path / "creds.json")
+    with pytest.raises(g.ConfigError, match="名称不能为空"):
+        store.set_ai_key("  ", "value")
+
+
+def test_credentials_ai_key_required_missing_raises(tmp_path: Path) -> None:
+    store = g.CredentialStore(tmp_path / "creds.json")
+    with pytest.raises(g.ConfigError, match="AI API Key"):
+        store.resolve_ai_key("nonexistent", required=True)
+
+
+def test_credentials_v1_to_v2_auto_upgrade(tmp_path: Path) -> None:
+    """v1 凭据文件自动升级到 v2。"""
+    v1 = {"version": 1, "secrets": {"GUFA_API_KEY": "old-key"}}
+    p = tmp_path / "creds.json"
+    p.write_text(json.dumps(v1), encoding="utf-8")
+    store = g.CredentialStore(p)
+    assert store.secrets["GUFA_API_KEY"] == "old-key"
+    assert store.ai_keys == {}
+    raw = json.loads(p.read_text())
+    assert raw["version"] == 2
+    assert "ai_keys" in raw
+
+
+def test_credentials_v2_loads_ai_keys(tmp_path: Path) -> None:
+    v2 = {"version": 2, "secrets": {"X": "v"}, "ai_keys": {"k1": "v1", "k2": "v2"}}
+    p = tmp_path / "creds.json"
+    p.write_text(json.dumps(v2), encoding="utf-8")
+    store = g.CredentialStore(p)
+    assert store.ai_keys == {"k1": "v1", "k2": "v2"}
+    assert store.resolve_ai_key("k1", required=True) == "v1"
+
+
+def test_ai_config_parses_api_key_name() -> None:
+    cfg = g.AIConfig.from_dict({"enabled": True, "api_key_name": "rb1", "model": "m1",
+                                 "base_url": "https://x/v1"})
+    assert cfg.api_key_name == "rb1"
+
+
+def test_ai_config_validate_strips_api_key_name() -> None:
+    cfg = g.AIConfig.from_dict({"enabled": True, "api_key_name": "  rb1  ", "model": "m1",
+                                 "base_url": "https://x/v1"})
+    cfg.validate()
+    assert cfg.api_key_name == "rb1"
+
+
+def test_ai_config_default_api_key_name_empty() -> None:
+    cfg = g.AIConfig()
+    assert cfg.api_key_name == ""
+
+
+def test_credential_store_ignores_empty_ai_keys_on_load(tmp_path: Path) -> None:
+    """加载时跳过空 key 名或空 key 值。"""
+    v2 = {"version": 2, "secrets": {}, "ai_keys": {"ok": "v", "  ": "x", "bad": "  "}}
+    p = tmp_path / "creds.json"
+    p.write_text(json.dumps(v2), encoding="utf-8")
+    store = g.CredentialStore(p)
+    assert store.ai_keys == {"ok": "v"}
+    assert store.list_ai_key_names() == ["ok"]
+
+
+def test_credentials_ai_key_rejects_invalid_chars(tmp_path: Path) -> None:
+    store = g.CredentialStore(tmp_path / "creds.json")
+    for bad in ["key/name", "key@name", "key name", "<script>"]:
+        with pytest.raises(g.ConfigError, match="只能包含"):
+            store.set_ai_key(bad, "value")
