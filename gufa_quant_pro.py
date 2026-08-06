@@ -827,6 +827,9 @@ class AIConfig:
     minimum_allow_confidence: float = 0.60
     decision_mode: str = "bounded"
     max_output_tokens: int = 1200
+    # 拆分模式：十项古法各发一次小请求（每次输出 ~100-300 token），再做一次综合请求。
+    # 对 reasoning 型模型（如 deepseek-v4-flash）可靠，避免单次大请求输出被思考预算耗尽返回空正文。
+    split_readings: bool = False
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "AIConfig":
@@ -834,7 +837,7 @@ class AIConfig:
         values: Dict[str, Any] = {}
         for key, value in data.items():
             path = f"ai.{key}"
-            if key in {"enabled", "fail_closed"}:
+            if key in {"enabled", "fail_closed", "split_readings"}:
                 values[key] = require_json_bool(value, path)
             elif key in {"timeout_seconds", "max_output_tokens"}:
                 values[key] = require_json_int(value, path)
@@ -2362,12 +2365,17 @@ class AIAdvisor:
                 output.append(text[:300])
         return output[:10]
 
-    def _parse_decision(self, content: str) -> AIDecision:
+    def _parse_decision(self, content: str, require_readings: bool = True) -> AIDecision:
         parsed = require_json_object(json.loads(content), "AI response")
         required_fields = {
-            "action", "target_level", "confidence", "summary", "readings", "conflicts", "risk_notes",
+            "action", "target_level", "confidence", "summary", "conflicts", "risk_notes",
         }
+        if require_readings:
+            required_fields.add("readings")
         allowed_fields = required_fields | {"next_review_minutes"}
+        if not require_readings:
+            # 拆分模式的聚合响应：模型可能回显 readings，允许但忽略（已单独获取）
+            allowed_fields.add("readings")
         reject_unknown(parsed, allowed_fields, "AI response")
         missing_fields = sorted(required_fields - set(parsed))
         if missing_fields:
@@ -2384,29 +2392,30 @@ class AIAdvisor:
         if not 0 <= confidence <= 1:
             raise ConfigError("AI response.confidence 必须在 0..1")
         summary = require_json_string(parsed.get("summary"), "AI response.summary").strip()[:500]
-        raw_readings = require_json_object(parsed.get("readings"), "AI response.readings")
-        reject_unknown(raw_readings, STRATEGY_NAMES, "AI response.readings")
-        missing = set(STRATEGY_NAMES) - set(raw_readings)
-        if missing:
-            raise ConfigError(f"AI response.readings 缺少古法项: {sorted(missing)}")
         readings: Dict[str, AncientMethodReading] = {}
-        for name in STRATEGY_NAMES:
-            item = require_json_object(raw_readings[name], f"AI response.readings.{name}")
-            reject_unknown(item, {"bias", "confidence", "reading"}, f"AI response.readings.{name}")
-            bias = require_json_string(
-                item.get("bias"), f"AI response.readings.{name}.bias"
-            ).strip().lower()
-            if bias not in AI_BIASES:
-                raise ConfigError(f"AI response.readings.{name}.bias 无效")
-            item_confidence = require_json_number(
-                item.get("confidence"), f"AI response.readings.{name}.confidence"
-            )
-            if not 0 <= item_confidence <= 1:
-                raise ConfigError(f"AI response.readings.{name}.confidence 必须在 0..1")
-            reading = require_json_string(
-                item.get("reading"), f"AI response.readings.{name}.reading"
-            ).strip()[:400]
-            readings[name] = AncientMethodReading(bias, item_confidence, reading)
+        if require_readings:
+            raw_readings = require_json_object(parsed.get("readings"), "AI response.readings")
+            reject_unknown(raw_readings, STRATEGY_NAMES, "AI response.readings")
+            missing = set(STRATEGY_NAMES) - set(raw_readings)
+            if missing:
+                raise ConfigError(f"AI response.readings 缺少古法项: {sorted(missing)}")
+            for name in STRATEGY_NAMES:
+                item = require_json_object(raw_readings[name], f"AI response.readings.{name}")
+                reject_unknown(item, {"bias", "confidence", "reading"}, f"AI response.readings.{name}")
+                bias = require_json_string(
+                    item.get("bias"), f"AI response.readings.{name}.bias"
+                ).strip().lower()
+                if bias not in AI_BIASES:
+                    raise ConfigError(f"AI response.readings.{name}.bias 无效")
+                item_confidence = require_json_number(
+                    item.get("confidence"), f"AI response.readings.{name}.confidence"
+                )
+                if not 0 <= item_confidence <= 1:
+                    raise ConfigError(f"AI response.readings.{name}.confidence 必须在 0..1")
+                reading = require_json_string(
+                    item.get("reading"), f"AI response.readings.{name}.reading"
+                ).strip()[:400]
+                readings[name] = AncientMethodReading(bias, item_confidence, reading)
         conflicts = self._parse_string_list(parsed["conflicts"], "AI response.conflicts")
         risk_notes = self._parse_string_list(parsed["risk_notes"], "AI response.risk_notes")
         next_review_minutes: Optional[int] = None
@@ -2420,16 +2429,19 @@ class AIAdvisor:
             next_review_minutes=next_review_minutes,
         )
 
-    def _parse_with_one_format_repair(self, content: str) -> Tuple[AIDecision, bool]:
+    def _parse_with_one_format_repair(
+        self, content: str, require_readings: bool = True
+    ) -> Tuple[AIDecision, bool]:
         """严格解析；仅『非空正文且结构无效』时请求一次格式修复。
 
         空正文（余额不足/中转站异常常表现为空响应）与 AIRelayError
         （传输层/HTTP 错误）直接抛出不修复——重试只会继续失败或继续扣费。
+        require_readings=False 用于拆分模式的聚合响应（readings 已单独获取）。
         """
         if not isinstance(content, str) or not content.strip():
             raise ConfigError("AI 响应正文必须是非空 JSON string")
         try:
-            return self._parse_decision(content), False
+            return self._parse_decision(content, require_readings=require_readings), False
         except AIRelayError:
             raise
         except (ConfigError, json.JSONDecodeError) as parse_exc:
@@ -2517,6 +2529,13 @@ class AIAdvisor:
     ) -> AIDecision:
         if not self.config.enabled:
             return self.rule_fallback(result, rule_target, current_fraction, rule_reason)
+        if self.config.split_readings:
+            # 拆分模式：十项各发一次小请求（输出 ~100-300 token），再做一次综合决策。
+            # 对 reasoning 型模型（如 deepseek-v4-flash）可靠，避免单次大请求空响应。
+            return self._interpret_split(
+                symbol, result, rule_target, current_fraction, rule_reason,
+                position, account_equity, selection_context,
+            )
         methods = {
             name: {
                 "value": round(clamp(result.signals[name]), 6),
@@ -2578,6 +2597,220 @@ class AIAdvisor:
                 result, min(rule_target, current_fraction), current_fraction, rule_reason, self.last_error
             )
         return self.rule_fallback(result, rule_target, current_fraction, rule_reason, self.last_error)
+
+    # ------------------------------------------------------------------
+    # 拆分模式：十项各发一次小请求，再做一次综合决策
+    # ------------------------------------------------------------------
+
+    def _interpret_split(
+        self,
+        symbol: str,
+        result: SignalResult,
+        rule_target: float,
+        current_fraction: float,
+        rule_reason: str,
+        position: AccountPosition,
+        account_equity: float,
+        selection_context: Optional[Mapping[str, Any]] = None,
+    ) -> AIDecision:
+        """拆分模式主流程：十项小请求 → 综合决策请求。"""
+        try:
+            readings = self._readings_split(
+                symbol, result, position, account_equity, selection_context
+            )
+            try:
+                decision = self._aggregate_decision(
+                    symbol, result, rule_target, current_fraction, rule_reason,
+                    position, account_equity, selection_context, readings,
+                )
+            except Exception as exc:
+                # 聚合决策失败（如空响应）：保留十项 AI 解读，动作/仓位用规则兜底。
+                # fallback=True 使仓位只降不增，保持安全。
+                self.log.warning("AI 拆分聚合决策失败，使用规则动作 + AI 十项解读: %s", exc)
+                decision = self.rule_fallback(
+                    result, rule_target, current_fraction, rule_reason, str(exc)
+                )
+                decision.readings = readings
+                return decision
+            decision.readings = readings
+            self.last_error = ""
+            return decision
+        except AIRelayError as exc:
+            # 中转站整体故障（余额/鉴权/网络）：不再浪费后续请求，整体回退。
+            self.last_error = str(exc)
+            self.log.error("AI 十项古法解读失败（拆分模式·中转站错误）: %s", exc)
+        except Exception as exc:
+            self.last_error = repr(exc)
+            self.log.error("AI 十项古法解读失败（拆分模式）: %s", exc, exc_info=True)
+        if self.config.fail_closed:
+            return self.rule_fallback(
+                result, min(rule_target, current_fraction), current_fraction, rule_reason, self.last_error
+            )
+        return self.rule_fallback(result, rule_target, current_fraction, rule_reason, self.last_error)
+
+    def _readings_split(
+        self,
+        symbol: str,
+        result: SignalResult,
+        position: AccountPosition,
+        account_equity: float,
+        selection_context: Optional[Mapping[str, Any]],
+    ) -> Dict[str, AncientMethodReading]:
+        readings: Dict[str, AncientMethodReading] = {}
+        for name in STRATEGY_NAMES:
+            try:
+                readings[name] = self._read_single_method(
+                    name, symbol, result, position, account_equity, selection_context
+                )
+            except AIRelayError:
+                raise  # 中转站整体故障：上抛，由 _interpret_split 统一回退
+            except Exception as exc:
+                # 单项失败（空正文/结构无效/超时）：该项用规则解读兜底，不影响其余九项
+                self.log.warning("AI 拆分解读「%s」失败，该项使用规则解读兜底: %s", name, exc)
+                readings[name] = self._rule_reading(name, result)
+        return readings
+
+    def _rule_reading(self, name: str, result: SignalResult) -> AncientMethodReading:
+        value = clamp(result.signals[name])
+        bias = self._bias_from_value(value)
+        confidence = clamp(abs(value - 0.5) * 2)
+        return AncientMethodReading(
+            bias=bias,
+            confidence=confidence,
+            reading=f"（AI 单项解读失败，规则兜底）{ANCIENT_METHOD_DESCRIPTIONS[name]} 当前归一化值={value:.3f}，规则判定={bias}。",
+        )
+
+    def _read_single_method(
+        self,
+        name: str,
+        symbol: str,
+        result: SignalResult,
+        position: AccountPosition,
+        account_equity: float,
+        selection_context: Optional[Mapping[str, Any]],
+    ) -> AncientMethodReading:
+        value = round(clamp(result.signals[name]), 6)
+        weight = round(float(self.configured_weight(name)), 6)
+        paipan = result.diagnostics.get("paipan")
+        method_paipan = None
+        if isinstance(paipan, dict):
+            method_paipan = paipan.get(name)
+        request: Dict[str, Any] = {
+            "symbol": symbol,
+            "candle_time": result.candle_time,
+            "aggregate_score": round(result.score, 6),
+            "method": name,
+            "value": value,
+            "weight": weight,
+            "meaning": ANCIENT_METHOD_DESCRIPTIONS[name],
+            "position": {
+                "amount": position.amount,
+                "quote_value": position.quote_value,
+                "average_entry": position.avg_entry,
+                "high_water": position.high_water,
+                "account_equity": account_equity,
+            },
+            "daily_selection": dict(selection_context or {}),
+        }
+        if method_paipan is not None:
+            request["paipan"] = method_paipan
+        system = (
+            f"你是中国古法「{name}」断卦师。只负责解读「{name}」这一项，不要解读其他古法，"
+            "不要给出交易动作。输出必须是一个 JSON object，字段只能且必须包含 bias、confidence、reading。"
+            "bias 只能是 bullish、bearish、neutral 之一；confidence 是 0 到 1 的 JSON number；"
+            "reading 是中文断卦解读（如体用生克、三传与日干关系、值符吉门、命宫主星、日主旺衰、"
+            "风水飞星吉凶等），须结合盘面具体断卦，不得泛泛重复 value 数值，200 字以内。"
+        )
+        content = self._completion_content([
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+        ])
+        return self._parse_single_method(name, content)
+
+    def _parse_single_method(self, name: str, content: str) -> AncientMethodReading:
+        if not isinstance(content, str) or not content.strip():
+            raise ConfigError(f"AI 响应正文必须是非空 JSON string（{name}）")
+        try:
+            return self._parse_single_method_strict(name, content)
+        except AIRelayError:
+            raise
+        except (ConfigError, json.JSONDecodeError) as parse_exc:
+            self.log.warning("AI 拆分解读「%s」首次响应结构无效，尝试一次格式修复: %s", name, parse_exc)
+            repaired = self._completion_content([
+                {"role": "system", "content": (
+                    "你是 JSON 接口格式修复器。只能修复字段结构与 JSON 类型，不得重新分析行情。"
+                    "只输出包含 bias、confidence、reading 的 JSON object，不得输出其他字段。"
+                )},
+                {"role": "user", "content": json.dumps({
+                    "validation_error": str(parse_exc),
+                    "invalid_response": content,
+                }, ensure_ascii=False)},
+            ])
+            return self._parse_single_method_strict(name, repaired)
+
+    @staticmethod
+    def _parse_single_method_strict(name: str, content: str) -> AncientMethodReading:
+        parsed = require_json_object(json.loads(content), f"AI response.{name}")
+        reject_unknown(parsed, {"bias", "confidence", "reading"}, f"AI response.{name}")
+        bias = require_json_string(parsed.get("bias"), f"AI response.{name}.bias").strip().lower()
+        if bias not in AI_BIASES:
+            raise ConfigError(f"AI response.{name}.bias 无效")
+        confidence = require_json_number(parsed.get("confidence"), f"AI response.{name}.confidence")
+        if not 0 <= confidence <= 1:
+            raise ConfigError(f"AI response.{name}.confidence 必须在 0..1")
+        reading = require_json_string(parsed.get("reading"), f"AI response.{name}.reading").strip()[:400]
+        return AncientMethodReading(bias, confidence, reading)
+
+    def _aggregate_decision(
+        self,
+        symbol: str,
+        result: SignalResult,
+        rule_target: float,
+        current_fraction: float,
+        rule_reason: str,
+        position: AccountPosition,
+        account_equity: float,
+        selection_context: Optional[Mapping[str, Any]],
+        readings: Mapping[str, AncientMethodReading],
+    ) -> AIDecision:
+        readings_payload = {
+            name: {"bias": r.bias, "confidence": r.confidence, "reading": r.reading[:60]}
+            for name, r in readings.items()
+        }
+        request = {
+            "symbol": symbol,
+            "candle_time": result.candle_time,
+            "aggregate_score": round(result.score, 6),
+            "rule_target_level": self._target_level(rule_target, current_fraction),
+            "rule_target_fraction": round(clamp(rule_target), 6),
+            "rule_reason": rule_reason,
+            "current_fraction": round(clamp(current_fraction), 6),
+            "position": {
+                "amount": position.amount,
+                "quote_value": position.quote_value,
+                "average_entry": position.avg_entry,
+                "high_water": position.high_water,
+                "account_equity": account_equity,
+            },
+            "daily_selection": dict(selection_context or {}),
+            "readings": readings_payload,  # 十项已解读结果，只做综合，不再逐项重读
+        }
+        system = (
+            "你是中国古法十项断卦的汇总决策师。输入已包含十项古法的完整解读（bias/confidence/reading），"
+            "你不得重新解读各项，只需综合十项解读、规则目标与持仓状态，输出最终交易决策。"
+            "你是现货单向做多的仓位决策者：规则目标是仓位上限，BUY 不得高于规则目标；"
+            "SELL 可以降低风险；HOLD 保持当前仓位。"
+            "注意：输出中不得包含 readings 字段（十项解读已由上游单独提供），"
+            "只需输出 action、target_level、confidence、summary、conflicts、risk_notes、next_review_minutes。"
+            + self._response_contract()
+        )
+        content = self._completion_content([
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+        ])
+        # 聚合响应不含 readings（已单独获取），解析时跳过 readings 校验
+        decision, _ = self._parse_with_one_format_repair(content, require_readings=False)
+        return decision
 
     def configured_weight(self, name: str) -> float:
         # 由控制器在构造后绑定 StrategyConfig；保留默认值以便独立测试。

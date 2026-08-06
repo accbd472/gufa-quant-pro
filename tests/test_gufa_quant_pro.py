@@ -931,6 +931,138 @@ def test_low_confidence_ai_holds_current_but_respects_rule_cap() -> None:
     assert "HOLD" in reason
 
 
+def _make_split_advisor(**ai_kwargs):
+    advisor = object.__new__(g.AIAdvisor)
+    advisor.config = g.AIConfig(enabled=True, split_readings=True, **ai_kwargs)
+    advisor.log = logging.getLogger("test.ai.split")
+    advisor.bind_strategy_weights(g.StrategyConfig().weights)
+    return advisor
+
+
+def _split_aggregate_payload(**overrides):
+    payload = {
+        "action": "BUY",
+        "target_level": "FULL",
+        "confidence": 0.8,
+        "summary": "十项综合看多",
+        "conflicts": ["奇门与六壬冲突"],
+        "risk_notes": ["拆分模式测试"],
+        "next_review_minutes": 30,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_ai_split_mode_full_success() -> None:
+    advisor = _make_split_advisor()
+    calls = []
+
+    def completion(messages):
+        calls.append(messages)
+        system = messages[0]["content"]
+        if "汇总决策师" in system:
+            return json.dumps(_split_aggregate_payload(), ensure_ascii=False)
+        return json.dumps(
+            {"bias": "bullish", "confidence": 0.7, "reading": "盘面看多"}, ensure_ascii=False
+        )
+
+    advisor._completion_content = completion
+    position = g.AccountPosition("BTC/USDT", 0.0, 0.0, 0.0, 0.0, 0.0)
+    decision = advisor.interpret("BTC/USDT", make_signal_result(), 1.0, 0.0, "rule full", position, 1000.0)
+    assert decision.fallback is False
+    assert decision.action == "BUY"
+    assert decision.target_level == "FULL"
+    assert decision.next_review_minutes == 30
+    assert set(decision.readings) == set(g.STRATEGY_NAMES)
+    assert all(r.reading == "盘面看多" for r in decision.readings.values())
+    assert len(calls) == 11  # 10 个单项 + 1 个聚合
+
+
+def test_ai_split_single_method_failure_uses_rule_fallback() -> None:
+    advisor = _make_split_advisor()
+    failed = {"奇门"}
+
+    def completion(messages):
+        system = messages[0]["content"]
+        if "汇总决策师" in system:
+            return json.dumps(_split_aggregate_payload(), ensure_ascii=False)
+        user = json.loads(messages[1]["content"])
+        if user.get("method") in failed:
+            raise g.ConfigError("AI 响应正文必须是非空 JSON string（奇门）")
+        return json.dumps(
+            {"bias": "bearish", "confidence": 0.6, "reading": "单项解读"}, ensure_ascii=False
+        )
+
+    advisor._completion_content = completion
+    position = g.AccountPosition("BTC/USDT", 0.0, 0.0, 0.0, 0.0, 0.0)
+    decision = advisor.interpret("BTC/USDT", make_signal_result(), 0.5, 0.0, "rule half", position, 1000.0)
+    assert decision.fallback is False  # 整体仍成功
+    assert "规则兜底" in decision.readings["奇门"].reading
+    assert decision.readings["六壬"].reading == "单项解读"
+    assert len(decision.readings) == 10
+
+
+def test_ai_split_relay_error_aborts_and_falls_back() -> None:
+    advisor = _make_split_advisor(fail_closed=True)
+
+    def completion(messages):
+        raise g.AIRelayError("AI 中转站错误（HTTP 402）: INSUFFICIENT_BALANCE 余额不足", status=402)
+
+    advisor._completion_content = completion
+    position = g.AccountPosition("BTC/USDT", 0.0, 0.0, 0.0, 0.0, 0.0)
+    decision = advisor.interpret("BTC/USDT", make_signal_result(), 1.0, 0.0, "rule full", position, 1000.0)
+    assert decision.fallback is True
+    assert decision.action == "HOLD"
+    assert "402" in advisor.last_error
+
+
+def test_ai_split_aggregate_failure_keeps_readings_with_rule_action() -> None:
+    advisor = _make_split_advisor()
+
+    def completion(messages):
+        system = messages[0]["content"]
+        if "汇总决策师" in system:
+            raise g.ConfigError("AI 响应正文必须是非空 JSON string")
+        return json.dumps(
+            {"bias": "bullish", "confidence": 0.7, "reading": "单项解读"}, ensure_ascii=False
+        )
+
+    advisor._completion_content = completion
+    position = g.AccountPosition("BTC/USDT", 0.0, 0.0, 0.0, 0.0, 0.0)
+    decision = advisor.interpret("BTC/USDT", make_signal_result(), 1.0, 0.0, "rule full", position, 1000.0)
+    assert decision.fallback is True  # 规则兜底，仓位只降不增
+    assert len(decision.readings) == 10  # 十项 AI 解读仍保留
+    assert all(r.reading == "单项解读" for r in decision.readings.values())
+
+
+def test_ai_split_aggregate_payload_truncates_readings() -> None:
+    advisor = _make_split_advisor()
+    seen: dict = {}
+
+    def completion(messages):
+        system = messages[0]["content"]
+        if "汇总决策师" in system:
+            seen["aggregate_user"] = json.loads(messages[1]["content"])
+            return json.dumps(_split_aggregate_payload(), ensure_ascii=False)
+        return json.dumps(
+            {"bias": "bullish", "confidence": 0.7, "reading": "x" * 300}, ensure_ascii=False
+        )
+
+    advisor._completion_content = completion
+    position = g.AccountPosition("BTC/USDT", 0.0, 0.0, 0.0, 0.0, 0.0)
+    advisor.interpret("BTC/USDT", make_signal_result(), 1.0, 0.0, "rule full", position, 1000.0)
+    agg = seen["aggregate_user"]
+    assert len(agg["readings"]) == 10
+    assert len(agg["readings"]["奇门"]["reading"]) <= 60
+
+
+def test_ai_split_config_roundtrip() -> None:
+    cfg = g.AIConfig.from_dict({"enabled": True, "split_readings": True})
+    assert cfg.split_readings is True
+    cfg2 = g.AIConfig.from_dict({"enabled": True})
+    assert cfg2.split_readings is False
+
+
 def test_ai_explain_only_retains_rule_target() -> None:
     controller = make_controller_for_bounds(mode="explain_only")
     decision = g.AIDecision(

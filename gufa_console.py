@@ -51,7 +51,7 @@ _ALLOWED_CONFIG: Dict[str, List[str]] = {
                 "poll_interval_seconds", "closed_candle_only", "max_candle_lag_seconds",
                 "log_level", "log_max_bytes", "log_backup_count", "webhook_url"],
     "ai": ["enabled", "model", "base_url", "api_key_name", "timeout_seconds", "minimum_allow_confidence",
-           "decision_mode", "fail_closed", "max_output_tokens"],
+           "decision_mode", "fail_closed", "max_output_tokens", "split_readings"],
 }
 
 # OKX 公开现货合约列表（用于自助选择交易标的；经代理拉取，失败则回退内置列表）
@@ -737,6 +737,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 "minimum_allow_confidence": cfg.ai.minimum_allow_confidence,
                 "decision_mode": cfg.ai.decision_mode, "fail_closed": cfg.ai.fail_closed,
                 "max_output_tokens": cfg.ai.max_output_tokens,
+                "split_readings": cfg.ai.split_readings,
             },
         }
 
@@ -1140,6 +1141,7 @@ input[type=checkbox]{width:auto}
       </div>
       <input id="f_ai_model_custom" style="display:none;margin-top:6px" placeholder="手动输入模型 ID，如 qwen3.7-max">
     </div>
+    <div class="form-row check"><input type="checkbox" id="f_ai_split"><label for="f_ai_split">拆分模式：十项各发一次小请求再综合（修复 reasoning 模型大请求空响应）</label></div>
     <button class="primary" onclick="saveStep2()">保存 AI 设置</button>
     <button onclick="testAiConnection()" style="margin-top:8px;width:100%">🔍 测试连接</button>
   </div>
@@ -1279,6 +1281,7 @@ function loadConfig(){
     document.getElementById('f_ex_id').value = c.exchange.id;
     document.getElementById('f_proxy').value = c.exchange.proxy_url;
     document.getElementById('f_ai_enabled').checked = c.ai.enabled;
+    document.getElementById('f_ai_split').checked = !!c.ai.split_readings;
     document.getElementById('f_ai_url').value = c.ai.base_url||'';
     document.getElementById('f_ai_timeout').value = c.ai.timeout_seconds;
     // 模型列表：先设当前值，再异步拉取
@@ -1338,7 +1341,7 @@ function saveStep2(){
   let model = document.getElementById('f_ai_model').value;
   if(model === '__custom__') model = document.getElementById('f_ai_model_custom').value.trim();
   if(!model){ toast('请选择或输入模型 ID'); return; }
-  const cfg={ai:{enabled:document.getElementById('f_ai_enabled').checked, base_url:document.getElementById('f_ai_url').value.trim(), api_key_name:document.getElementById('f_ai_key_name').value, model, timeout_seconds:Number(document.getElementById('f_ai_timeout').value)||120}};
+  const cfg={ai:{enabled:document.getElementById('f_ai_enabled').checked, base_url:document.getElementById('f_ai_url').value.trim(), api_key_name:document.getElementById('f_ai_key_name').value, model, timeout_seconds:Number(document.getElementById('f_ai_timeout').value)||120, split_readings:document.getElementById('f_ai_split').checked}};
   Promise.all([
     api('/api/config',{method:'POST',body:JSON.stringify(cfg)}),
     Object.keys(cred).length?api('/api/credentials',{method:'POST',body:JSON.stringify(cred)}):Promise.resolve({ok:true})
