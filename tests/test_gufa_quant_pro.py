@@ -340,7 +340,7 @@ def make_signal_result(score: float = 0.7) -> g.SignalResult:
     )
 
 
-def make_selection_controller(tmp_path: Path, scores, fail_symbol=None):
+def make_selection_controller(tmp_path: Path, scores, fail_symbol=None, dead_symbols=()):
     controller = object.__new__(g.GuFaQuantPro)
     controller.config = SimpleNamespace(
         runtime=SimpleNamespace(symbols=list(scores)),
@@ -361,6 +361,8 @@ def make_selection_controller(tmp_path: Path, scores, fail_symbol=None):
         calls.append((symbol, timeframe, ohlcv_limit))
         if symbol == fail_symbol:
             raise g.SafetyError("daily data unavailable")
+        if symbol in dead_symbols:
+            raise g.SafetyError(f"{symbol} 无有效 K 线，行情为空")
         return symbol
 
     controller.gateway = SimpleNamespace(fetch_ohlcv=fetch_ohlcv)
@@ -368,6 +370,75 @@ def make_selection_controller(tmp_path: Path, scores, fail_symbol=None):
         calculate=lambda frame, symbol=None: make_signal_result(scores[symbol])
     )
     return controller, calls
+
+
+def test_daily_selection_dead_symbols_excluded_not_fail_closed(tmp_path: Path) -> None:
+    """死币（无行情数据）只被当日剔除，不触发 fail-closed；其余标的正常入选。"""
+    scores = {
+        "BTC/USDT": 0.61,
+        "ETH/USDT": 0.82,
+        "CC/USDT": 0.99,   # 死币：即使古法分数最高也不入选，且不拖垮当日初选
+    }
+    controller, calls = make_selection_controller(
+        tmp_path, scores, dead_symbols=("CC/USDT",)
+    )
+
+    first = controller._daily_selection()
+    assert first.complete is True          # 死币不 fail-closed
+    assert first.cached is False
+    assert "CC/USDT" in first.dead         # 死币被记录
+    assert first.selected_symbols == ["ETH/USDT", "BTC/USDT"]
+    assert "CC/USDT" not in first.candidates
+    assert "无有效" in controller.store.state.daily_selection_dead.get("CC/USDT", "")
+
+    # 当日缓存命中时死币状态保持一致，且不重复拉 K 线
+    second = controller._daily_selection()
+    assert second.cached is True
+    assert second.dead == first.dead
+    assert len(calls) == 3
+
+
+def test_daily_selection_dead_symbols_reprobe_next_day(tmp_path: Path) -> None:
+    """次日自动重新探测死币：即使仍无行情，也会重新探测而非永久缓存。"""
+    scores = {"BTC/USDT": 0.61, "CC/USDT": 0.99}
+    controller, calls = make_selection_controller(tmp_path, scores, dead_symbols=("CC/USDT",))
+
+    first = controller._daily_selection()
+    assert "CC/USDT" in first.dead
+    first_calls = len(calls)
+
+    # 模拟次日：死币被重新探测（calls 增加），而非从缓存拿
+    controller.store.state.daily_selection_date = "2000-01-01"
+    controller.store.state.daily_selection_dead = {}
+    controller.store.save()
+    second = controller._daily_selection()
+    assert len(calls) > first_calls      # 重新探测了
+    assert "CC/USDT" in second.dead      # 仍死，但已重新探测
+
+
+def test_account_prices_skips_dead_symbols_without_position(tmp_path: Path) -> None:
+    """账户估值跳过当日死币（无持仓），避免每周期重复拉价刷屏。"""
+    controller, _ = make_selection_controller(tmp_path, {"BTC/USDT": 0.61, "CC/USDT": 0.0})
+    controller.store.state.daily_selection_dead = {"CC/USDT": "无有效价格"}
+    fetched = []
+
+    def fetch_last_price(symbol):
+        fetched.append(symbol)
+        if symbol == "CC/USDT":
+            raise g.SafetyError("CC/USDT ticker 无有效价格")
+        return 100.0
+
+    controller.gateway.fetch_last_price = fetch_last_price
+    prices = controller._account_prices()
+    assert "CC/USDT" not in fetched
+    assert prices == {"BTC/USDT": 100.0}
+
+    # 有持仓的死币仍硬校验：估值失败必须保守停止
+    controller.store.state.positions["CC/USDT"] = g.PositionState(
+        amount=1.0, avg_entry=10.0
+    )
+    with pytest.raises(g.SafetyError, match="无有效价格"):
+        controller._account_prices()
 
 
 def test_daily_selection_ranks_thresholds_and_caches(tmp_path: Path) -> None:

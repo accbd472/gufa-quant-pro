@@ -64,7 +64,7 @@ except ImportError as exc:  # pragma: no cover
     _PAIPAN_IMPORT_ERROR = exc
 
 APP_NAME = "GuFaQuant-Pro"
-APP_VERSION = "8.3.0"
+APP_VERSION = "8.4.0"
 CONFIG_VERSION = 3
 STATE_VERSION = 4
 CREDENTIALS_VERSION = 1
@@ -72,6 +72,29 @@ STRATEGY_NAMES = ("奇门", "六壬", "太乙", "易经", "风水", "八字", "�
 AI_ACTIONS = {"BUY", "SELL", "HOLD"}
 AI_TARGET_LEVELS = {"FLAT", "HALF", "FULL", "UNCHANGED"}
 AI_BIASES = {"bullish", "bearish", "neutral"}
+# 死币特征：无有效行情数据，古法无法分析。这些失败只剔除该标的当日候选资格，
+# 不视为系统故障（真实故障如网络/超时/限流仍走 fail-closed）。次日自动重新探测。
+DEAD_SYMBOL_MARKERS: Tuple[str, ...] = (
+    "无有效价格",
+    "无有效 K 线",
+    "无有效K线",
+    "有效 K 线不足",
+    "有效K线不足",
+    "行情为空",
+    "无报价",
+    "no valid price",
+    "not enough data",
+    "empty data",
+    "no data",
+    "not found",
+    "does not exist",
+    "invalid symbol",
+    "unsupported symbol",
+    "delisted",
+    "已下架",
+    "停交易",
+    "无交易",
+)
 ANCIENT_METHOD_DESCRIPTIONS = {
     "奇门": "时家转盘奇门：阴阳遁局数与九宫八门九星八神盘，值符星所临宫之门定吉凶。",
     "六壬": "大六壬：月将加时起天地盘，四课三传与课体（贼克/比用/遥克等）断事。",
@@ -973,6 +996,7 @@ class BotState:
     daily_selection_candidates: List[str] = field(default_factory=list)
     daily_selection_scores: Dict[str, float] = field(default_factory=dict)
     daily_selection_candle_times: Dict[str, str] = field(default_factory=dict)
+    daily_selection_dead: Dict[str, str] = field(default_factory=dict)
     halted_reason: str = ""
 
     @classmethod
@@ -1006,6 +1030,9 @@ class BotState:
             },
             daily_selection_candle_times={
                 str(k): str(v) for k, v in dict(data.get("daily_selection_candle_times", {})).items()
+            },
+            daily_selection_dead={
+                str(k): str(v) for k, v in dict(data.get("daily_selection_dead", {})).items()
             },
             halted_reason=str(data.get("halted_reason", "")),
         )
@@ -2376,6 +2403,7 @@ class DailySelectionResult:
     candle_times: Dict[str, str]
     candidates: List[str] = field(default_factory=list)
     errors: Dict[str, str] = field(default_factory=dict)
+    dead: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -2529,6 +2557,11 @@ class GuFaQuantPro:
             candidates = [
                 symbol for symbol in state.daily_selection_candidates if symbol in allowed
             ]
+            dead = {
+                symbol: reason
+                for symbol, reason in state.daily_selection_dead.items()
+                if symbol in allowed
+            }
             return DailySelectionResult(
                 enabled=True,
                 date=today,
@@ -2539,12 +2572,14 @@ class GuFaQuantPro:
                 scores=dict(state.daily_selection_scores),
                 candle_times=dict(state.daily_selection_candle_times),
                 candidates=candidates,
+                dead=dead,
             )
 
         candidates = self._prefilter_symbols(self.config.runtime.symbols)
         scores: Dict[str, float] = {}
         candle_times: Dict[str, str] = {}
         errors: Dict[str, str] = {}
+        dead: Dict[str, str] = {}
         for symbol in candidates:
             try:
                 frame = self.gateway.fetch_ohlcv(
@@ -2556,8 +2591,19 @@ class GuFaQuantPro:
                 scores[symbol] = result.score
                 candle_times[symbol] = result.candle_time
             except Exception as exc:
-                errors[symbol] = str(exc)[:300]
-                self.log.error("%s 每日古法初选失败: %s", symbol, exc, exc_info=True)
+                message = str(exc)[:300]
+                if self._is_dead_symbol_error(message):
+                    # 死币：无行情数据，古法无法分析。只剔除该标的当日候选资格，
+                    # 不算系统故障；次日自动重新探测，恢复行情后自动回归候选池。
+                    dead[symbol] = message
+                    self.log.warning("%s 无有效行情，当日剔除出候选池: %s", symbol, message)
+                else:
+                    # 真实故障（网络/超时/限流等）：严格 fail-closed，禁止新开仓。
+                    errors[symbol] = message
+                    self.log.error("%s 每日古法初选失败: %s", symbol, exc, exc_info=True)
+
+        # 活候选（死币不计入，当日不可用古法分析）
+        live_candidates = [s for s in candidates if s not in dead]
 
         if errors:
             self.log.warning(
@@ -2573,8 +2619,9 @@ class GuFaQuantPro:
                 selected_symbols=[],
                 scores=scores,
                 candle_times=candle_times,
-                candidates=candidates,
+                candidates=live_candidates,
                 errors=errors,
+                dead=dead,
             )
 
         ranked = sorted(scores, key=lambda symbol: (-scores[symbol], symbol))
@@ -2584,14 +2631,16 @@ class GuFaQuantPro:
         state.daily_selection_date = today
         state.daily_selection_key = cache_key
         state.daily_selected_symbols = list(selected)
-        state.daily_selection_candidates = list(candidates)
+        state.daily_selection_candidates = list(live_candidates)
         state.daily_selection_scores = dict(scores)
         state.daily_selection_candle_times = dict(candle_times)
+        state.daily_selection_dead = dict(dead)
         self.store.save()
         self.log.info(
-            "每日古法初选完成 | timeframe=%s | candidates=%d | selected=%s | scores=%s",
+            "每日古法初选完成 | timeframe=%s | candidates=%d | dead=%s | selected=%s | scores=%s",
             selection.timeframe,
             len(candidates),
+            sorted(dead) or "-",
             selected,
             {symbol: round(scores[symbol], 3) for symbol in ranked},
         )
@@ -2604,20 +2653,30 @@ class GuFaQuantPro:
             selected_symbols=selected,
             scores=scores,
             candle_times=candle_times,
-            candidates=candidates,
+            candidates=live_candidates,
+            dead=dead,
         )
+
+    @staticmethod
+    def _is_dead_symbol_error(message: str) -> bool:
+        """判断一个初选失败是否属于死币（无行情数据），而非系统故障。"""
+        return any(marker in message for marker in DEAD_SYMBOL_MARKERS)
 
     def _account_prices(self) -> Dict[str, float]:
         """账户估值必须覆盖完整白名单，即使标的未通过当日初选。
 
-        无持仓的僵尸币（如已停交易、无有效报价）拉价失败时跳过并告警，
-        避免整个周期被无意义标的卡死；有持仓的币仍硬校验（估值失败即保守停止）。
+        当日已确认的死币（无有效行情，见 daily_selection_dead）且无持仓时直接
+        跳过，避免每周期重复拉价刷屏告警；有持仓的币仍硬校验（估值失败即保守
+        停止），绝不因死币缓存而放松持仓保护。
         """
+        dead = self.store.state.daily_selection_dead
         prices: Dict[str, float] = {}
         for symbol in self.config.runtime.symbols:
+            if symbol in dead and symbol not in self.store.state.positions:
+                continue
             try:
                 prices[symbol] = self.gateway.fetch_last_price(symbol)
-            except Exception as exc:  # noqa: BLE001 无持仓僵尸币跳过，不影响主流程
+            except Exception as exc:  # noqa: BLE001 无持仓死币跳过，不影响主流程
                 if symbol in self.store.state.positions:
                     raise
                 self.log.warning("%s 无有效价格，跳过估值（该标的无持仓）: %s", symbol, exc)
