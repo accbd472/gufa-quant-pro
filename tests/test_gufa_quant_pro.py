@@ -135,7 +135,7 @@ def test_old_config_without_selection_uses_safe_defaults(tmp_path: Path) -> None
     assert cfg.selection.enabled is True
     assert cfg.selection.timeframe == "1d"
     assert cfg.selection.top_n == 3
-    assert cfg.selection.min_score == 0.55
+    assert cfg.selection.min_score == 0.45
 
 
 def test_selection_config_bounds_are_validated(tmp_path: Path) -> None:
@@ -931,6 +931,30 @@ def test_ai_buy_cannot_exceed_rule_cap() -> None:
     assert "rule_cap=0.50" in reason
 
 
+def test_ai_hold_with_empty_position_allows_rule_target() -> None:
+    """空仓 + AI HOLD + 规则目标 > 0：规则目标应生效（AI 未明确看空不阻止建仓）。"""
+    controller = make_controller_for_bounds()
+    decision = g.AIDecision(
+        action="HOLD",
+        target_level="UNCHANGED",
+        confidence=0.8,
+        summary="hold",
+        readings={},
+    )
+    target, _ = controller._apply_ai_bounds(decision, rule_target=0.5, current_fraction=0.0)
+    assert target == 0.5
+    # 有持仓时 HOLD 仍维持当前仓位
+    decision2 = g.AIDecision(
+        action="HOLD",
+        target_level="UNCHANGED",
+        confidence=0.8,
+        summary="hold",
+        readings={},
+    )
+    target2, _ = controller._apply_ai_bounds(decision2, rule_target=0.5, current_fraction=0.4)
+    assert target2 == 0.4
+
+
 def test_ai_sell_can_reduce_below_rule_target() -> None:
     controller = make_controller_for_bounds()
     decision = g.AIDecision(
@@ -942,6 +966,32 @@ def test_ai_sell_can_reduce_below_rule_target() -> None:
     )
     target, _ = controller._apply_ai_bounds(decision, rule_target=1.0, current_fraction=1.0)
     assert target == 0.0
+
+
+def test_ai_fallback_empty_position_allows_rule_target() -> None:
+    """AI 失败兜底 + 空仓 + 规则目标 > 0：遵循规则目标建仓（rule_fallback 已判 BUY）。"""
+    controller = make_controller_for_bounds()
+    decision = g.AIDecision(
+        action="BUY",
+        target_level="HALF",
+        confidence=0.5,
+        summary="fallback",
+        readings={},
+        fallback=True,
+    )
+    target, _ = controller._apply_ai_bounds(decision, rule_target=0.5, current_fraction=0.0)
+    assert target == 0.5
+    # 有持仓时 fallback 仍只减不增（fail-closed）
+    decision2 = g.AIDecision(
+        action="BUY",
+        target_level="FULL",
+        confidence=0.5,
+        summary="fallback",
+        readings={},
+        fallback=True,
+    )
+    target2, _ = controller._apply_ai_bounds(decision2, rule_target=1.0, current_fraction=0.4)
+    assert target2 == 0.4
 
 
 def test_low_confidence_ai_holds_current_but_respects_rule_cap() -> None:

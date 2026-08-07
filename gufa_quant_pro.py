@@ -658,7 +658,10 @@ class DailySelectionConfig:
     timeframe: str = "1d"
     ohlcv_limit: int = 250
     top_n: int = 3
-    min_score: float = 0.55
+    # 选股门槛校准：十项时间起卦信号的实测分布为 0.45~0.52（中位 ~0.49），
+    # 旧默认 0.55 高于信号上限导致永远选不出标的（连续数日 selected=[]）。
+    # 0.45 保证信号合理区间内总能选出 top3；真实行情下本命盘参与后分差拉开。
+    min_score: float = 0.45
     prefilter: bool = True
     preferred: Tuple[str, ...] = ()
     exclude_patterns: Tuple[str, ...] = ()
@@ -710,9 +713,15 @@ class StrategyConfig:
         "八卦": 0.10,
         "四柱": 0.08,
     })
-    entry_half: float = 0.64
-    entry_full: float = 0.76
-    exit_score: float = 0.42
+    # 交易阈值校准（8.6）：十项古法（时间起卦）信号实测分布为 0.45~0.52，
+    # 中位 ~0.49。旧阈值（half=0.64/full=0.76）是旧技术因子时代的，信号
+    # 分布不同导致永远不触发买入（分数恒 < 0.64）。按古法分布重校：
+    #   half=0.47 偏多即半仓（信号 ~80% 分位以下仍有纪律）；
+    #   full=0.55 高于信号上限，需本命盘/强势时辰才满仓；
+    #   exit=0.44 低于弱市下限，跌破即清仓。
+    entry_half: float = 0.47
+    entry_full: float = 0.55
+    exit_score: float = 0.44
     hold_hysteresis: float = 0.03
     min_signal_change: float = 0.015
 
@@ -2814,8 +2823,10 @@ class AIAdvisor:
         system = (
             "你是中国古法十项断卦的汇总决策师。输入已包含十项古法的完整解读（bias/confidence/reading），"
             "你不得重新解读各项，只需综合十项解读、规则目标与持仓状态，输出最终交易决策。"
-            "你是现货单向做多的仓位决策者：规则目标是仓位上限，BUY 不得高于规则目标；"
-            "SELL 可以降低风险；HOLD 保持当前仓位。"
+            "你是现货单向做多的仓位决策者：rule_target_level 是规则引擎给出的默认仓位目标，"
+            "你必须以它为准：当前仓位低于规则目标且十项解读无明确看空时，默认 BUY 至规则目标；"
+            "SELL 只能在明确看空时降低风险；HOLD 只能用于持仓已接近规则目标或信号中性（分数接近 0.5）时。"
+            "空仓 + 规则目标为 HALF/FULL 时，不要输出 HOLD，除非十项解读强烈看空。"
             "注意：输出中不得包含 readings 字段（十项解读已由上游单独提供），"
             "只需输出 action、target_level、confidence、summary、conflicts、risk_notes、next_review_minutes。"
             + self._response_contract()
@@ -2825,7 +2836,22 @@ class AIAdvisor:
             {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
         ])
         # 聚合响应不含 readings（已单独获取），解析时跳过 readings 校验
-        decision, _ = self._parse_with_one_format_repair(content, require_readings=False)
+        try:
+            decision, _ = self._parse_with_one_format_repair(content, require_readings=False)
+        except (ConfigError, json.JSONDecodeError) as exc:
+            # 聚合请求较大（十项解读载荷），flash 偶发空正文/截断：
+            # 削减载荷重试一次，仍失败才上抛由 _interpret_split 规则兜底。
+            self.log.warning("AI 聚合决策首次失败，削减载荷重试一次: %s", exc)
+            retry_readings = {
+                name: {"bias": r.bias, "confidence": r.confidence, "reading": r.reading[:40]}
+                for name, r in readings.items()
+            }
+            retry_request = dict(request, readings=retry_readings)
+            retry_content = self._completion_content([
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(retry_request, ensure_ascii=False)},
+            ])
+            decision, _ = self._parse_with_one_format_repair(retry_content, require_readings=False)
         return decision
 
     def configured_weight(self, name: str) -> float:
@@ -3172,7 +3198,13 @@ class GuFaQuantPro:
         if not ai.enabled or self.config.ai.decision_mode == "explain_only":
             return clamp(rule_target), "AI explanation only; deterministic rule target retained"
         if ai.fallback:
-            fallback_target = min(requested, current_fraction, rule_target)
+            # 规则兜底：rule_fallback 已按 rule_target vs current 生成 BUY/SELL/HOLD。
+            # 空仓且规则目标 > 0 时遵循规则目标（AI 失败不应阻止确定性规则建仓，
+            # 与 rule_fallback 的 BUY 语义一致）；有持仓时保持 fail-closed：只减不增。
+            if current_fraction <= 0.001 and rule_target > 0.001:
+                fallback_target = min(requested, rule_target)
+            else:
+                fallback_target = min(requested, current_fraction, rule_target)
             return clamp(fallback_target), (
                 f"AI fallback; requested={requested:.2f}; current={current_fraction:.2f}; "
                 f"rule_cap={rule_target:.2f}; applied={fallback_target:.2f}"
@@ -3192,7 +3224,12 @@ class GuFaQuantPro:
             requested = min(current_fraction, requested)
             bounded = min(requested, rule_target)
         else:
-            bounded = min(current_fraction, rule_target)
+            # HOLD：持仓接近规则目标时维持；空仓且规则目标 > 0 时，
+            # 让规则目标生效（AI 未明确看空不应阻止建仓，见聚合 prompt）。
+            if current_fraction <= 0.001 and rule_target > 0.001:
+                bounded = clamp(rule_target)
+            else:
+                bounded = min(current_fraction, rule_target)
         return clamp(bounded), (
             f"{confidence_reason}; AI {ai.action}/{ai.target_level}; "
             f"requested={requested:.2f}; rule_cap={rule_target:.2f}; applied={bounded:.2f}"

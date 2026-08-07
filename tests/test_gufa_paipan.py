@@ -240,6 +240,46 @@ def test_paipan_signals_shape(svc):
     assert len(result.natal) == 10
 
 
+def test_paipan_signals_natal_combines_listing_time(svc):
+    """本命盘（上市时间）参与信号：不同上市时间的标的分差应拉开，选股才有区分度。"""
+    service = gp.PaipanService(g.PaipanConfig(listing_time_source="ohlcv"))
+    for panzer in (QimenPaipan(), LiurenPaipan(), TaiyiPaipan(), YijingPaipan(),
+                   FengshuiPaipan(), BaziPaipan(), MeihuaPaipan(), ZiweiPaipan(),
+                   BaguaPaipan(), SizhuPaipan()):
+        service.register(panzer)
+    # 同一时刻、不同上市时间的两个标的
+    r1 = service.paipan("BTC/USDT", now_dt=SAMPLE_DT, listing_ts=1502956800000)
+    r2 = service.paipan("BTC/USDT", now_dt=SAMPLE_DT, listing_ts=1609459200000)
+    s1 = gps.paipan_signals(r1.to_dict())
+    s2 = gps.paipan_signals(r2.to_dict())
+    # 至少一项信号因本命盘不同而不同（否则选股无区分度）
+    assert any(abs(s1[k] - s2[k]) > 1e-6 for k in g.STRATEGY_NAMES), \
+        "本命盘未参与信号：不同上市时间分数完全相同，选股退化为随机"
+    # 同一上市时间应确定
+    r3 = service.paipan("BTC/USDT", now_dt=SAMPLE_DT, listing_ts=1502956800000)
+    s3 = gps.paipan_signals(r3.to_dict())
+    assert s1 == s3
+
+
+def test_paipan_signals_natal_missing_falls_back_to_current(svc):
+    """本命盘缺失时退化为纯时空盘信号（与旧行为一致，兼容无上市时间场景）。"""
+    service = gp.PaipanService(g.PaipanConfig(listing_time_source="ohlcv"))
+    for panzer in (QimenPaipan(), LiurenPaipan(), TaiyiPaipan(), YijingPaipan(),
+                   FengshuiPaipan(), BaziPaipan(), MeihuaPaipan(), ZiweiPaipan(),
+                   BaguaPaipan(), SizhuPaipan()):
+        service.register(panzer)
+    # 无 listing_ts -> natal_missing
+    r = service.paipan("BTC/USDT", now_dt=SAMPLE_DT, listing_ts=None)
+    signals = gps.paipan_signals(r.to_dict())
+    assert set(signals.keys()) == set(g.STRATEGY_NAMES)
+    # 与仅用 current 的旧实现一致
+    only_current = {
+        k: float(gps.RULE_FUNCS[k](r.to_dict()["current"][k])[0]) for k in g.STRATEGY_NAMES
+    }
+    for k in g.STRATEGY_NAMES:
+        assert abs(signals[k] - round(only_current[k], 4)) < 1e-6
+
+
 def test_paipan_verdicts_shape(svc):
     service = gp.PaipanService(g.PaipanConfig(listing_time_source="ohlcv"))
     for panzer in (QimenPaipan(), LiurenPaipan(), TaiyiPaipan(), YijingPaipan(),

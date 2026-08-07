@@ -202,15 +202,39 @@ def _current_charts(result_dict: dict) -> dict[str, dict]:
     return result_dict.get("current", {})
 
 
-def paipan_signals(result_dict: dict) -> dict[str, float]:
-    """把 PaipanResult.to_dict() 映射为 {古法名: 置信度}。"""
+def _natal_charts(result_dict: dict) -> dict[str, dict]:
+    return result_dict.get("natal", {})
+
+
+def paipan_signals(result_dict: dict, natal_weight: float = 0.30) -> dict[str, float]:
+    """把 PaipanResult.to_dict() 映射为 {古法名: 看多置信度}。
+
+    综合时空盘（current，当前时辰）与本命盘（natal，标的上市时间）：
+    current 主导（1 - natal_weight），natal 提供标的个性因子——不同上市时间
+    的标的在同一天会得到不同分数，选股才能区分标的，而不是所有币同分。
+    natal 缺失（未提供上市时间）时退化为纯 current 信号，保持兼容。
+    """
     signals: dict[str, float] = {}
+    current = _current_charts(result_dict)
+    natal = _natal_charts(result_dict)
+    natal_usable = bool(natal) and any(
+        chart and "error" not in chart for chart in natal.values()
+    )
     for method, func in RULE_FUNCS.items():
-        chart = _current_charts(result_dict).get(method, {})
+        chart = current.get(method, {})
         if chart and "error" not in chart:
-            signals[method] = round(float(func(chart)[0]), 4)
+            base = float(func(chart)[0])
         else:
-            signals[method] = 0.50  # 缺盘时中性，避免扭曲
+            base = 0.50  # 缺盘时中性，避免扭曲
+        if natal_usable:
+            nchart = natal.get(method, {})
+            if nchart and "error" not in nchart:
+                natal_sig = float(func(nchart)[0])
+            else:
+                natal_sig = 0.50
+            signals[method] = round(base * (1 - natal_weight) + natal_sig * natal_weight, 4)
+        else:
+            signals[method] = round(base, 4)
     return signals
 
 
