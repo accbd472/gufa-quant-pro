@@ -4,6 +4,7 @@
     "id": "okx",
     "sandbox": true,
     "market_type": "spot",
+    "allowed_markets": ["spot"],
     "api_key_env": "GUFA_API_KEY",
     "secret_env": "GUFA_API_SECRET",
     "password_env": "GUFA_API_PASSWORD",
@@ -81,7 +82,11 @@
     "order_fill_timeout_seconds": 20,
     "reject_unmanaged_positions": true,
     "dust_quote": 5.0,
-    "live_trading_ack": ""
+    "live_trading_ack": "",
+    "max_leverage": 1.0,
+    "futures_margin_cap_pct": 0.3,
+    "futures_allow_short": false,
+    "max_futures_notional_pct": 0.5
   },
   "ai": {
     "enabled": false,

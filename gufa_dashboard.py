@@ -343,11 +343,15 @@ function render(d){
   // 决策
   if (d.quotes && Object.keys(d.quotes).length){
     if (d.live_updated_at) $("liveTs").textContent = "// " + d.live_updated_at.slice(11,19) + " 实时价";
+    const shortName = (sym)=>{
+      const m = String(sym).match(/^(?:swap:)?([^/]+)\//);
+      return (m?m[1]:sym) + (String(sym).startsWith("swap:")?"◆":"");
+    };
     const qs = Object.entries(d.quotes).map(([sym,q])=>{
       const pct = q.change_pct!=null ? q.change_pct : 0;
       const cls = pct>0.0001 ? "up" : (pct<-0.0001 ? "down" : "");
       const arrow = pct>0.0001 ? "▲" : (pct<-0.0001 ? "▼" : "•");
-      return `<div class="quote"><span class="sym">${sym.replace('/USDT','')}</span>
+      return `<div class="quote"><span class="sym">${shortName(sym)}</span>
         <span class="qp">${Number(q.price).toPrecision(6)}</span>
         <span class="qch ${cls}">${arrow}${Math.abs(pct).toFixed(2)}%</span>
         <span class="qv">${Number(q.value).toFixed(2)}U</span></div>`;

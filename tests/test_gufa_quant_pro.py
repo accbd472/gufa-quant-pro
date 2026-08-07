@@ -348,7 +348,7 @@ def test_account_snapshot_requires_price_when_balance_exists(tmp_path: Path) -> 
 def test_create_order_network_failure_is_not_retried(tmp_path: Path, monkeypatch) -> None:
     gateway, store = make_gateway_stub(tmp_path)
     gateway.risk = SimpleNamespace(max_slippage_bps=30.0)
-    gateway.has_open_order = lambda symbol: False
+    gateway.has_open_order = lambda symbol, market="spot": False
     gateway.estimate_vwap = lambda symbol, side, amount, price: (price, 0.0)
 
     calls = {"count": 0}
@@ -1586,3 +1586,262 @@ def test_credentials_ai_key_rejects_invalid_chars(tmp_path: Path) -> None:
     for bad in ["key/name", "key@name", "key name", "<script>"]:
         with pytest.raises(g.ConfigError, match="只能包含"):
             store.set_ai_key(bad, "value")
+
+
+# =============================================================================
+# 多市场（现货/合约）支持
+# =============================================================================
+
+
+def _swap_snapshot(equity: float = 10000.0) -> g.AccountSnapshot:
+    """含一个 swap 多头仓位的账户快照。"""
+    pos = g.AccountPosition(
+        "BTC/USDT",
+        amount=0.5,
+        price=50000.0,
+        quote_value=25000.0,
+        avg_entry=48000.0,
+        high_water=51000.0,
+        market=g.MARKET_SWAP,
+        side="long",
+        notional=25000.0,
+        leverage=2.0,
+        contracts=1,
+    )
+    return g.AccountSnapshot(
+        equity=equity,
+        quote_free=8000.0,
+        quote_total=9000.0,
+        positions={g.position_key(g.MARKET_SWAP, "BTC/USDT"): pos},
+        timestamp=g.iso_now(),
+    )
+
+
+def _swap_gateway_stub(tmp_path: Path):
+    """带合约市场信息的 gateway 桩。"""
+    gateway, store = make_gateway_stub(tmp_path)
+    gateway.markets = {
+        "BTC/USDT:USDT": {"contractSize": 0.01, "swap": True, "spot": False},
+    }
+    gateway.risk.min_order_quote = 0.0  # 计划测试不卡最小金额
+    return gateway, store
+
+
+def test_swap_plan_rebalance_buys_contracts(tmp_path: Path) -> None:
+    gateway, _ = _swap_gateway_stub(tmp_path)
+    gateway.risk = SimpleNamespace(
+        max_symbol_allocation=0.2,
+        max_futures_notional_pct=0.5,
+        futures_margin_cap_pct=0.5,
+        max_leverage=5.0,
+        min_rebalance_quote=1.0,
+        min_rebalance_pct=0.001,
+        min_order_quote=0.0,
+    )
+    gateway.exchange_cfg = SimpleNamespace(id="okx")
+    gateway.runtime = SimpleNamespace(quote_currency="USDT")
+    gateway.client = SimpleNamespace(
+        amount_to_precision=lambda sym, x: round(x, 1),
+    )
+    snapshot = _swap_snapshot()
+    plan = gateway.plan_rebalance(
+        snapshot,
+        "BTC/USDT",
+        target_allocation=0.15,  # 目标名义 1500 USDT（当前 25000，需卖出）
+        reason="test",
+        market=g.MARKET_SWAP,
+        leverage=2.0,
+    )
+    assert plan is not None
+    assert plan.side == "sell"
+    assert plan.market == g.MARKET_SWAP
+    assert plan.amount > 0
+    assert plan.contracts == plan.amount
+
+
+def test_swap_plan_rebalance_respects_notional_cap(tmp_path: Path) -> None:
+    gateway, _ = _swap_gateway_stub(tmp_path)
+    gateway.risk = SimpleNamespace(
+        max_symbol_allocation=0.2,
+        max_futures_notional_pct=0.1,  # 名义顶 = 1000 USDT
+        futures_margin_cap_pct=0.5,
+        max_leverage=5.0,
+        min_rebalance_quote=1.0,
+        min_rebalance_pct=0.001,
+        min_order_quote=0.0,
+    )
+    gateway.exchange_cfg = SimpleNamespace(id="okx")
+    gateway.runtime = SimpleNamespace(quote_currency="USDT")
+    gateway.client = SimpleNamespace(
+        amount_to_precision=lambda sym, x: round(x, 1),
+    )
+    snapshot = _swap_snapshot()
+    plan = gateway.plan_rebalance(
+        snapshot,
+        "BTC/USDT",
+        target_allocation=0.15,
+        reason="test",
+        market=g.MARKET_SWAP,
+        leverage=5.0,
+    )
+    assert plan is not None
+    # 卖出方向：减少的名义被钳制在 notional_cap=1000 以内
+    assert abs(plan.estimated_quote) <= 1000.0 + 1e-6
+
+
+def test_swap_execute_sets_posside_and_margin_mode(tmp_path: Path, monkeypatch) -> None:
+    gateway, store = make_gateway_stub(tmp_path)
+    gateway.risk = SimpleNamespace(
+        max_slippage_bps=30.0, order_fill_timeout_seconds=1,
+    )
+    gateway.exchange_cfg = SimpleNamespace(
+        id="okx", client_order_id_param="clientOrderId", max_retries=0,
+    )
+    gateway.runtime = SimpleNamespace(quote_currency="USDT")
+    gateway.has_open_order = lambda symbol, market="spot": False
+    gateway.estimate_vwap = lambda symbol, side, amount, price: (price, 0.0)
+
+    captured = {}
+
+    def fake_set_leverage(lev, symbol, params):
+        captured["leverage"] = (lev, symbol, params)
+        return {}
+
+    def fake_create_order(symbol, order_type, side, amount, price, params):
+        captured["order"] = (symbol, order_type, side, amount, price, params)
+        return {"id": "swap-1", "status": "closed", "filled": amount,
+                "average": 50000.0, "fee": {"cost": 0.0}}
+
+    gateway.client = SimpleNamespace(
+        set_leverage=fake_set_leverage,
+        create_order=fake_create_order,
+        fetch_order=lambda symbol, order_id: {
+            "id": order_id, "status": "closed", "filled": amount,
+            "average": 50000.0, "fee": {"cost": 0.0},
+        },
+    )
+    monkeypatch.setattr(g.ExchangeGateway, "_network_error_types", staticmethod(lambda: (TimeoutError,)))
+    gateway._wait_for_order = lambda symbol, order_id, initial: {
+        "id": order_id, "status": "closed", "filled": initial["filled"],
+        "average": initial["average"], "fee": initial["fee"],
+    }
+    gateway._parse_fill = lambda plan, order: g.FillResult(
+        order_id="swap-1", symbol=plan.symbol, side=plan.side,
+        requested_amount=plan.amount, filled_amount=plan.amount,
+        average_price=50000.0, fee_quote=0.0, status="closed",
+        market=plan.market, leverage=plan.leverage,
+    )
+    gateway._apply_fill = lambda fill: None
+
+    plan = g.OrderPlan(
+        "BTC/USDT", "buy", 0.1, 50000.0, 5000.0, 0.15, 0.0, "test",
+        market=g.MARKET_SWAP, leverage=3.0, contracts=0.1,
+    )
+    result = gateway.execute(plan)
+    assert result.market == g.MARKET_SWAP
+    assert captured["leverage"][0] == 3.0
+    order_symbol, _, _, _, _, params = captured["order"]
+    assert order_symbol == "BTC/USDT:USDT"
+    assert params.get("marginMode") == "cross"
+    assert params.get("posSide") == "long"
+    assert store.state.pending_orders.get("swap:BTC/USDT") is None  # closed 后清理
+
+
+def test_resolve_market_respects_whitelist_and_holding() -> None:
+    bot = object.__new__(g.GuFaQuantPro)
+    bot.config = SimpleNamespace(
+        exchange=SimpleNamespace(allowed_markets=(g.MARKET_SPOT, g.MARKET_SWAP)),
+    )
+    bot.gateway = SimpleNamespace(
+        markets={"BTC/USDT:USDT": {"swap": True}},
+        exchange_symbol=lambda market, symbol: f"{symbol}:USDT",
+    )
+
+    class FakeAI:
+        def __init__(self, market, symbol="BTC/USDT"):
+            self.market = market
+            self.symbol = symbol
+
+    # AI 选合约且白名单允许 -> 合约
+    assert bot._resolve_market(FakeAI(g.MARKET_SWAP), g.MARKET_SPOT) == g.MARKET_SWAP
+    # AI 选合约但白名单只允许现货 -> 回退当前持仓市场
+    bot.config.exchange.allowed_markets = (g.MARKET_SPOT,)
+    assert bot._resolve_market(FakeAI(g.MARKET_SWAP), g.MARKET_SPOT) == g.MARKET_SPOT
+    # AI 选合约但该币无 swap 市场 -> 回退现货
+    bot.config.exchange.allowed_markets = (g.MARKET_SPOT, g.MARKET_SWAP)
+    assert bot._resolve_market(FakeAI(g.MARKET_SWAP, "OKB/USDT"), g.MARKET_SPOT) == g.MARKET_SPOT
+    # AI 未表态（默认 spot）-> spot
+    assert bot._resolve_market(FakeAI(g.MARKET_SPOT), g.MARKET_SWAP) == g.MARKET_SPOT
+    # 白名单为空 -> 强制现货
+    bot.config.exchange.allowed_markets = ()
+    assert bot._resolve_market(FakeAI(g.MARKET_SWAP), g.MARKET_SPOT) == g.MARKET_SPOT
+
+
+def test_parse_fill_converts_swap_contracts_to_base(tmp_path: Path) -> None:
+    """合约成交 filled 是张数，必须乘以 contractSize 换算为 base 数量。"""
+    gateway, _ = _swap_gateway_stub(tmp_path)
+    gateway.markets = {
+        "BTC/USDT:USDT": {"contractSize": 0.01, "swap": True},
+    }
+    gateway.runtime = SimpleNamespace(quote_currency="USDT")
+    plan = g.OrderPlan(
+        "BTC/USDT", "buy", 1.23, 64800.0, 797.0, 0.01, 0.0, "test",
+        market=g.MARKET_SWAP, leverage=3.0, contracts=1.23,
+    )
+    order = {
+        "id": "swap-1", "status": "closed",
+        "filled": 1.23,          # 张数
+        "average": 64800.0,
+        "cost": 797.04,          # 名义价值 = 1.23 张 × 0.01 × 64800
+        "fee": {"currency": "USDT", "cost": 0.08},
+    }
+    fill = gateway._parse_fill(plan, order)
+    assert fill.filled_amount == 1.23 * 0.01  # 0.0123 BTC
+    assert fill.average_price == 64800.0
+    assert fill.fee_quote == 0.08
+    assert fill.market == g.MARKET_SWAP
+    assert fill.leverage == 3.0
+
+
+def test_parse_fill_spot_keeps_base_amount(tmp_path: Path) -> None:
+    """现货成交 filled 就是 base 数量，不做换算。"""
+    gateway, _ = make_gateway_stub(tmp_path)
+    gateway.runtime = SimpleNamespace(quote_currency="USDT")
+    plan = g.OrderPlan("BTC/USDT", "buy", 0.01, 64800.0, 648.0, 0.01, 0.0, "test")
+    order = {
+        "id": "spot-1", "status": "closed",
+        "filled": 0.01,
+        "average": 64800.0,
+        "cost": 648.0,
+        "fee": {"currency": "USDT", "cost": 0.1},
+    }
+    fill = gateway._parse_fill(plan, order)
+    assert fill.filled_amount == 0.01
+    assert fill.market == g.MARKET_SPOT
+
+
+def test_exchange_config_allowed_markets_validation(tmp_path: Path) -> None:
+    # 合约必须 OKX + 沙箱（直接用 ExchangeConfig 测 validate，避开 AppConfig.load）
+    cfg = g.ExchangeConfig(id="binance", sandbox=True, market_type="swap",
+                           allowed_markets=("spot", "swap"))
+    with pytest.raises(g.ConfigError, match="仅适配 OKX"):
+        cfg.validate()
+
+    cfg = g.ExchangeConfig(id="okx", sandbox=False, market_type="spot",
+                           allowed_markets=("spot", "swap"))
+    with pytest.raises(g.ConfigError, match="sandbox"):
+        cfg.validate()
+
+    # market_type 必须在 allowed_markets 内
+    cfg = g.ExchangeConfig(id="okx", sandbox=True, market_type="swap",
+                           allowed_markets=("spot",))
+    with pytest.raises(g.ConfigError, match="包含在 allowed_markets"):
+        cfg.validate()
+
+    # 合法：OKX 沙箱双市场
+    cfg = g.ExchangeConfig(id="okx", sandbox=True, market_type="spot",
+                           allowed_markets=("spot", "swap"))
+    cfg.validate()
+    assert cfg.allowed_markets == ("spot", "swap")
+
+

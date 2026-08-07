@@ -73,6 +73,33 @@ STRATEGY_NAMES = ("奇门", "六壬", "太乙", "易经", "风水", "八字", "�
 AI_ACTIONS = {"BUY", "SELL", "HOLD"}
 AI_TARGET_LEVELS = {"FLAT", "HALF", "FULL", "UNCHANGED"}
 AI_BIASES = {"bullish", "bearish", "neutral"}
+# 市场类型：现货与永续合约（USDT 本位）。AI 可在配置允许的范围内自主选择。
+MARKET_SPOT = "spot"
+MARKET_SWAP = "swap"
+MARKETS = (MARKET_SPOT, MARKET_SWAP)
+AI_MARKETS = {MARKET_SPOT, MARKET_SWAP}
+
+
+def market_symbol(market: str, symbol: str, quote: str) -> str:
+    """现货与合约的交易所统一符号：spot -> BTC/USDT；swap -> BTC/USDT:USDT。"""
+    if market == MARKET_SWAP:
+        return f"{symbol}:{quote}"
+    return symbol
+
+
+def position_key(market: str, symbol: str) -> str:
+    """状态文件持仓键：现货保持原符号（向后兼容旧 state），合约加 swap: 前缀。"""
+    if market == MARKET_SWAP:
+        return f"swap:{symbol}"
+    return symbol
+
+
+def split_position_key(key: str) -> Tuple[str, str]:
+    """拆分持仓键 -> (market, base_symbol)。旧 state 中裸符号视为现货。"""
+    if isinstance(key, str) and key.startswith("swap:"):
+        return MARKET_SWAP, key[len("swap:"):]
+    return MARKET_SPOT, str(key)
+
 # 死币特征：无有效行情数据，古法无法分析。这些失败只剔除该标的当日候选资格，
 # 不视为系统故障（真实故障如网络/超时/限流仍走 fail-closed）。次日自动重新探测。
 DEAD_SYMBOL_MARKERS: Tuple[str, ...] = (
@@ -500,6 +527,9 @@ class ExchangeConfig:
     id: str = "okx"
     sandbox: bool = True
     market_type: str = "spot"
+    # AI 可自主选择的市场白名单（现货/合约）。默认仅现货，行为与旧版一致；
+    # 启用合约需同时满足：id=okx、risk.max_leverage>1 且账户支持 USDT 本位永续。
+    allowed_markets: Tuple[str, ...] = (MARKET_SPOT,)
     api_key_env: str = "GUFA_API_KEY"
     secret_env: str = "GUFA_API_SECRET"
     password_env: str = "GUFA_API_PASSWORD"
@@ -518,6 +548,7 @@ class ExchangeConfig:
             "id": require_json_string,
             "sandbox": require_json_bool,
             "market_type": require_json_string,
+            "allowed_markets": cls._parse_market_list,
             "api_key_env": require_json_string,
             "secret_env": require_json_string,
             "password_env": require_json_string,
@@ -541,6 +572,23 @@ class ExchangeConfig:
             items = [require_json_string(item, path) for item in require_json_array(value, path)]
         return tuple(dict.fromkeys(items))
 
+    @staticmethod
+    def _parse_market_list(value: Any, path: str) -> Tuple[str, ...]:
+        """市场白名单：JSON 数组或逗号分隔字符串；小写去重。"""
+        if isinstance(value, str):
+            items = [item.strip().lower() for item in value.split(",") if item.strip()]
+        else:
+            items = [
+                require_json_string(item, path).strip().lower()
+                for item in require_json_array(value, path)
+            ]
+        unknown = set(items) - set(MARKETS)
+        if unknown:
+            raise ConfigError(f"{path} 包含不支持的市场类型: {sorted(unknown)}（支持 {list(MARKETS)}）")
+        if not items:
+            raise ConfigError(f"{path} 不能为空")
+        return tuple(dict.fromkeys(items))
+
     def effective_proxies(self) -> Tuple[str, ...]:
         """当前生效的代理池：proxy_url 优先，proxy_list 追加去重。"""
         items: List[str] = []
@@ -556,8 +604,14 @@ class ExchangeConfig:
         self.market_type = self.market_type.strip().lower()
         if not self.id:
             raise ConfigError("exchange.id 不能为空")
-        if self.market_type != "spot":
-            raise ConfigError("当前生产基线仅支持 spot；合约的仓位模式、contractSize 和强平风控必须单独适配")
+        if self.market_type not in MARKETS:
+            raise ConfigError(f"exchange.market_type 必须是 {list(MARKETS)}")
+        if self.market_type not in self.allowed_markets:
+            raise ConfigError("exchange.market_type 必须包含在 allowed_markets 内")
+        if MARKET_SWAP in self.allowed_markets and self.id != "okx":
+            raise ConfigError("合约市场目前仅适配 OKX（ccxt okx 适配器）")
+        if MARKET_SWAP in self.allowed_markets and not self.sandbox:
+            raise ConfigError("合约市场当前仅允许在 sandbox 模拟盘启用；实盘合约需人工复核杠杆与强平风控后再开放")
         if self.timeout_ms < 3000:
             raise ConfigError("exchange.timeout_ms 不应小于 3000")
         if not 0 <= self.max_retries <= 10:
@@ -825,6 +879,11 @@ class RiskConfig:
     reject_unmanaged_positions: bool = True
     dust_quote: float = 5.0
     live_trading_ack: str = ""
+    # ---- 合约（永续）风控 ----
+    max_leverage: float = 1.0              # 合约最大杠杆（1.0 = 无杠杆）
+    futures_margin_cap_pct: float = 0.30   # 合约保证金占用占权益上限
+    futures_allow_short: bool = False      # 默认禁止做空（SELL 无持仓=开空，高风险）
+    max_futures_notional_pct: float = 0.50  # 单标的合约名义敞口占权益上限
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "RiskConfig":
@@ -834,6 +893,8 @@ class RiskConfig:
         for key, value in data.items():
             path = f"risk.{key}"
             if key == "reject_unmanaged_positions":
+                values[key] = require_json_bool(value, path)
+            elif key == "futures_allow_short":
                 values[key] = require_json_bool(value, path)
             elif key in int_fields:
                 values[key] = require_json_int(value, path)
@@ -870,6 +931,14 @@ class RiskConfig:
             raise ConfigError("max_trades_per_day 至少为 1")
         if self.cooldown_seconds < 0 or self.order_fill_timeout_seconds < 1:
             raise ConfigError("冷却/成交等待时间无效")
+        if not 1.0 <= self.max_leverage <= 50:
+            raise ConfigError("risk.max_leverage 必须在 [1, 50]")
+        if not 0 <= self.futures_margin_cap_pct < 1:
+            raise ConfigError("risk.futures_margin_cap_pct 必须在 [0, 1)")
+        if not 0 < self.max_futures_notional_pct <= 1:
+            raise ConfigError("risk.max_futures_notional_pct 必须在 (0, 1]")
+        if self.max_leverage > 1.0 and self.max_futures_notional_pct > self.max_total_allocation:
+            raise ConfigError("合约名义敞口上限不得大于现货最大总仓位上限")
 
 
 @dataclass
@@ -1189,11 +1258,19 @@ class PositionState:
     high_water: float = 0.0
     opened_at: str = ""
     updated_at: str = ""
+    # 多市场支持：market=spot/swap；swap 侧 side 固定 long（默认禁止做空）。
+    market: str = MARKET_SPOT
+    side: str = "long"
+    leverage: float = 1.0
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "PositionState":
         allowed = cls.__dataclass_fields__.keys()
-        return cls(**{k: data[k] for k in allowed if k in data})
+        values = {k: data[k] for k in allowed if k in data}
+        values.setdefault("market", MARKET_SPOT)
+        values.setdefault("side", "long")
+        values.setdefault("leverage", 1.0)
+        return cls(**values)
 
 
 @dataclass
@@ -1562,6 +1639,14 @@ class AccountPosition:
     quote_value: float
     avg_entry: float
     high_water: float
+    # 多市场支持（spot 仓位这些字段用默认值）
+    market: str = MARKET_SPOT
+    side: str = "long"
+    notional: float = 0.0          # 合约名义价值（long 为正）；现货=quote_value
+    unrealized_pnl: float = 0.0
+    leverage: float = 1.0
+    contracts: float = 0.0         # 合约张数（现货为 0）
+    liquidation_price: float = 0.0
 
 
 @dataclass
@@ -1583,6 +1668,10 @@ class OrderPlan:
     target_allocation: float
     current_allocation: float
     reason: str
+    # 多市场支持：spot 合约（swap）按张数下单
+    market: str = MARKET_SPOT
+    leverage: float = 1.0
+    contracts: float = 0.0
 
 
 @dataclass
@@ -1596,6 +1685,8 @@ class FillResult:
     fee_quote: float
     status: str
     raw: Dict[str, Any] = field(default_factory=dict)
+    market: str = MARKET_SPOT
+    leverage: float = 1.0
 
 
 class ExchangeGateway:
@@ -1622,16 +1713,34 @@ class ExchangeGateway:
         self._proxy_switches: int = 0
         self._connect()
 
+    def exchange_symbol(self, market: str, symbol: str) -> str:
+        """现货/合约的交易所统一符号（合约 = base:quote）。"""
+        return market_symbol(market, symbol, self.runtime.quote_currency)
+
+    @property
+    def allowed_markets(self) -> Tuple[str, ...]:
+        """配置允许的市场列表；旧配置对象/测试桩缺字段时回退纯现货。"""
+        value = getattr(self.exchange_cfg, "allowed_markets", None)
+        if value:
+            return tuple(value)
+        return (MARKET_SPOT,)
+
     def _connect(self) -> None:
         exchange_id = self.exchange_cfg.id
         if not hasattr(ccxt, exchange_id):
             raise ConfigError(f"CCXT 不支持交易所: {exchange_id}")
         exchange_class = getattr(ccxt, exchange_id)
+        # 默认市场类型：纯合约配置走 swap，否则保持 spot（load_markets 对 OKX 会加载全部市场）
+        default_type = (
+            MARKET_SWAP
+            if tuple(self.allowed_markets) == (MARKET_SWAP,)
+            else MARKET_SPOT
+        )
         params: Dict[str, Any] = {
             "enableRateLimit": True,
             "timeout": self.exchange_cfg.timeout_ms,
             "options": {
-                "defaultType": "spot",
+                "defaultType": default_type,
                 "adjustForTimeDifference": True,
                 "recvWindow": self.exchange_cfg.recv_window_ms,
             },
@@ -1677,11 +1786,16 @@ class ExchangeGateway:
         if not hasattr(ccxt, exchange_id):
             raise ConfigError(f"CCXT 不支持交易所: {exchange_id}")
         exchange_class = getattr(ccxt, exchange_id)
+        default_type = (
+            MARKET_SWAP
+            if tuple(self.allowed_markets) == (MARKET_SWAP,)
+            else MARKET_SPOT
+        )
         params: Dict[str, Any] = {
             "enableRateLimit": True,
             "timeout": self.exchange_cfg.timeout_ms,
             "options": {
-                "defaultType": "spot",
+                "defaultType": default_type,
                 "adjustForTimeDifference": True,
                 "recvWindow": self.exchange_cfg.recv_window_ms,
             },
@@ -1749,16 +1863,35 @@ class ExchangeGateway:
         return False
 
     def _validate_markets(self) -> None:
+        allowed = set(self.allowed_markets)
         for symbol in self.runtime.symbols:
-            market = self.markets.get(symbol)
-            if not market:
-                raise ConfigError(f"交易所不存在交易对: {symbol}")
-            if not market.get("spot", False):
-                raise ConfigError(f"交易对不是现货市场: {symbol}")
-            if market.get("active") is False:
-                raise ConfigError(f"交易对已停用: {symbol}")
-            if str(market.get("quote", "")).upper() != self.runtime.quote_currency:
-                raise ConfigError(f"交易所市场 {symbol} 的 quote 与配置不一致")
+            if MARKET_SPOT in allowed:
+                market = self.markets.get(symbol)
+                if not market:
+                    raise ConfigError(f"交易所不存在现货交易对: {symbol}")
+                if not market.get("spot", False):
+                    raise ConfigError(f"交易对不是现货市场: {symbol}")
+                if market.get("active") is False:
+                    raise ConfigError(f"交易对已停用: {symbol}")
+                if str(market.get("quote", "")).upper() != self.runtime.quote_currency:
+                    raise ConfigError(f"交易所市场 {symbol} 的 quote 与配置不一致")
+            if MARKET_SWAP in allowed:
+                swap_symbol = self.exchange_symbol(MARKET_SWAP, symbol)
+                swap_market = self.markets.get(swap_symbol)
+                if not swap_market or not swap_market.get("swap", False):
+                    # 混合白名单下个别币无永续合约：允许（AI 只选有 swap 的币，execute 前会再校验），
+                    # 但记录警告便于排查。纯合约配置（allowed_markets==("swap",)）仍硬校验。
+                    if tuple(self.allowed_markets) == (MARKET_SWAP,):
+                        raise ConfigError(f"交易所不存在永续合约交易对: {swap_symbol}")
+                    self.log.warning("%s 无永续合约，该标的仅可使用现货", symbol)
+                    continue
+                if swap_market.get("active") is False:
+                    raise ConfigError(f"永续合约已停用: {swap_symbol}")
+                if str(swap_market.get("quote", "")).upper() != self.runtime.quote_currency:
+                    raise ConfigError(f"合约市场 {swap_symbol} 的 quote 与配置不一致")
+                contract_size = finite(swap_market.get("contractSize"), 0.0)
+                if contract_size <= 0:
+                    raise ConfigError(f"合约市场缺少有效 contractSize: {swap_symbol}")
         required_timeframes = {self.runtime.timeframe}
         if self.config.selection.enabled:
             required_timeframes.add(self.config.selection.timeframe)
@@ -1810,13 +1943,15 @@ class ExchangeGateway:
         symbol: str,
         timeframe: Optional[str] = None,
         ohlcv_limit: Optional[int] = None,
+        market: str = MARKET_SPOT,
     ) -> pd.DataFrame:
         requested_timeframe = timeframe or self.runtime.timeframe
         requested_limit = ohlcv_limit or self.runtime.ohlcv_limit
         limit = requested_limit + 2
+        exchange_symbol = self.exchange_symbol(market, symbol)
         rows = self._safe_call(
-            f"fetch_ohlcv:{symbol}:{requested_timeframe}",
-            lambda: self.client.fetch_ohlcv(symbol, requested_timeframe, limit=limit),
+            f"fetch_ohlcv:{exchange_symbol}:{requested_timeframe}",
+            lambda: self.client.fetch_ohlcv(exchange_symbol, requested_timeframe, limit=limit),
         )
         if not rows:
             raise SafetyError(f"{symbol} {requested_timeframe} 返回空 K 线")
@@ -1837,19 +1972,27 @@ class ExchangeGateway:
             )
         return df.tail(requested_limit).reset_index(drop=True)
 
-    def fetch_last_price(self, symbol: str) -> float:
-        ticker = self._safe_call(f"fetch_ticker:{symbol}", lambda: self.client.fetch_ticker(symbol))
+    def fetch_last_price(self, symbol: str, market: str = MARKET_SPOT) -> float:
+        exchange_symbol = self.exchange_symbol(market, symbol)
+        ticker = self._safe_call(
+            f"fetch_ticker:{exchange_symbol}",
+            lambda: self.client.fetch_ticker(exchange_symbol),
+        )
         price = finite(ticker.get("last") or ticker.get("close"))
         if price <= 0:
-            raise SafetyError(f"{symbol} ticker 无有效价格")
+            raise SafetyError(f"{exchange_symbol} ticker 无有效价格")
         return price
 
-    def fetch_quote_volumes(self, symbols: Optional[Iterable[str]] = None) -> Dict[str, float]:
+    def fetch_quote_volumes(
+        self, symbols: Optional[Iterable[str]] = None, market: str = MARKET_SPOT
+    ) -> Dict[str, float]:
         """批量 24h 成交额（quoteVolume，计价币）。公开接口，失败由调用方降级。"""
-        symbol_list = list(symbols) if symbols else None
+        exchange_symbols = (
+            [self.exchange_symbol(market, s) for s in symbols] if symbols else None
+        )
         tickers = self._safe_call(
             "fetch_tickers",
-            lambda: self.client.fetch_tickers(symbol_list),
+            lambda: self.client.fetch_tickers(exchange_symbols),
         )
         result: Dict[str, float] = {}
         for symbol, ticker in (tickers or {}).items():
@@ -1862,12 +2005,14 @@ class ExchangeGateway:
     def reconcile_pending_orders(self) -> None:
         state = self.state_store.state
         changed = False
-        for symbol, pending in list(state.pending_orders.items()):
+        for key, pending in list(state.pending_orders.items()):
+            market, base_symbol = split_position_key(key)
+            exchange_symbol = str(pending.get("exchange_symbol") or self.exchange_symbol(market, base_symbol))
             order_id = str(pending.get("id", ""))
             if not order_id:
                 client_id = str(pending.get("client_id", ""))
                 message = (
-                    f"{symbol} 存在无交易所 order id 的提交记录"
+                    f"{key} 存在无交易所 order id 的提交记录"
                     + (f" (client_id={client_id})" if client_id else "")
                     + "，无法证明订单未成交"
                 )
@@ -1877,22 +2022,22 @@ class ExchangeGateway:
             try:
                 order = self._safe_call(
                     f"fetch_order:{order_id}",
-                    lambda s=symbol, oid=order_id: self.client.fetch_order(oid, s),
+                    lambda oid=order_id, sym=exchange_symbol: self.client.fetch_order(oid, sym),
                 )
                 status = str(order.get("status", "")).lower()
                 if status in {"closed", "canceled", "cancelled", "rejected", "expired"}:
-                    del state.pending_orders[symbol]
+                    del state.pending_orders[key]
                     changed = True
-                    self.log.info("挂单已终结: %s %s status=%s", symbol, order_id, status)
+                    self.log.info("挂单已终结: %s %s status=%s", key, order_id, status)
             except getattr(ccxt, "OrderNotFound"):
                 # 无法确认时不立即重下；保留一个周期并记录时间。
                 created = parse_iso(str(pending.get("created_at", "")))
                 if created and (utc_now() - created).total_seconds() > 3600:
-                    self.log.error("挂单超过 1h 且无法查询，人工确认后再清理状态: %s %s", symbol, order_id)
+                    self.log.error("挂单超过 1h 且无法查询，人工确认后再清理状态: %s %s", key, order_id)
             except self._network_error_types() as exc:
-                self.log.warning("挂单对账网络失败，保留 pending: %s %s: %s", symbol, order_id, exc)
+                self.log.warning("挂单对账网络失败，保留 pending: %s %s: %s", key, order_id, exc)
             except Exception as exc:
-                message = f"{symbol} 挂单对账发生非网络异常，无法安全确认订单状态: {exc}"
+                message = f"{key} 挂单对账发生非网络异常，无法安全确认订单状态: {exc}"
                 state.halted_reason = "ORDER_UNCERTAIN: " + message
                 self.state_store.save()
                 raise OrderUncertainError(message + "；必须人工核对交易所订单和余额") from exc
@@ -1912,6 +2057,8 @@ class ExchangeGateway:
         quote_total = max(0.0, finite(total_map.get(self.runtime.quote_currency)))
         equity = quote_total
         unmanaged: List[str] = []
+        allowed = set(self.allowed_markets)
+        # ---- 现货持仓估值（保持旧逻辑；键 = 裸 symbol，向后兼容）----
         for symbol in self.runtime.symbols:
             base = base_asset(symbol)
             amount = max(0.0, finite(total_map.get(base)))
@@ -1926,27 +2073,77 @@ class ExchangeGateway:
             value = amount * price
             pos_state = state.positions.get(symbol)
             if value > self.risk.dust_quote and pos_state is None:
-                unmanaged.append(f"{symbol}={amount}")
+                unmanaged.append(f"spot:{symbol}={amount}")
             avg_entry = finite(pos_state.avg_entry) if pos_state else 0.0
             high_water = finite(pos_state.high_water) if pos_state else 0.0
             equity += value
-            positions[symbol] = AccountPosition(symbol, amount, price, value, avg_entry, high_water)
+            positions[symbol] = AccountPosition(
+                symbol, amount, price, value, avg_entry, high_water,
+                market=MARKET_SPOT, notional=value,
+            )
+        # ---- 合约持仓估值（fetch_positions；键 = swap:SYMBOL）----
+        if MARKET_SWAP in allowed:
+            raw_positions = self._safe_call("fetch_positions", self.client.fetch_positions)
+            for raw in raw_positions or []:
+                raw_symbol = str(raw.get("symbol", ""))
+                base = base_asset(raw_symbol)
+                if base not in {base_asset(s) for s in self.runtime.symbols}:
+                    continue  # 白名单外的合约仓位不接管（也不估值，避免误算权益）
+                contracts = max(0.0, finite(raw.get("contracts"), 0.0))
+                side = str(raw.get("side", "long")).lower()
+                if contracts <= 0:
+                    continue
+                if side != "long":
+                    if self.risk.futures_allow_short:
+                        # 做空支持暂未开放下单路径；若账户出现空头仓位则拒绝自动接管
+                        raise SafetyError(f"检测到合约空头仓位 {raw_symbol}，当前版本不支持做空自动管理")
+                    raise SafetyError(
+                        f"检测到合约空头仓位 {raw_symbol}，但 risk.futures_allow_short=false，"
+                        "拒绝自动接管；请人工处理或启用做空配置"
+                    )
+                key = position_key(MARKET_SWAP, base)
+                mark_price = finite(raw.get("markPrice"), 0.0)
+                if mark_price <= 0:
+                    raise SafetyError(f"{raw_symbol} 合约仓位缺少有效 markPrice，无法估值（安全停止）")
+                contract_size = finite(raw.get("contractSize"), 0.0)
+                if contract_size <= 0:
+                    market_info = self.markets.get(raw_symbol) or {}
+                    contract_size = finite(market_info.get("contractSize"), 0.0)
+                amount = contracts * max(contract_size, EPSILON)
+                notional = finite(raw.get("notional"), amount * mark_price)
+                unrealized = finite(raw.get("unrealizedPnl"), 0.0)
+                pos_state = state.positions.get(key)
+                avg_entry = finite(pos_state.avg_entry) if pos_state else finite(raw.get("entryPrice"), mark_price)
+                high_water = finite(pos_state.high_water) if pos_state else avg_entry
+                leverage = finite(raw.get("leverage"), 1.0) or 1.0
+                liquidation = finite(raw.get("liquidationPrice"), 0.0)
+                if notional > self.risk.dust_quote and pos_state is None:
+                    unmanaged.append(f"{key} contracts={contracts}")
+                equity += unrealized
+                positions[key] = AccountPosition(
+                    base, amount, mark_price, notional, avg_entry, high_water,
+                    market=MARKET_SWAP, side="long", notional=notional,
+                    unrealized_pnl=unrealized, leverage=leverage,
+                    contracts=contracts, liquidation_price=liquidation,
+                )
         if unmanaged and self.risk.reject_unmanaged_positions:
             raise SafetyError(
-                "检测到未被状态文件管理的交易所现货余额，拒绝自动接管: " + ", ".join(unmanaged)
+                "检测到未被状态文件管理的交易所仓位，拒绝自动接管: " + ", ".join(unmanaged)
                 + "。确认成本后使用 adopt-positions 命令接管。"
             )
         return AccountSnapshot(equity, quote_free, quote_total, positions, iso_now())
 
-    def has_open_order(self, symbol: str) -> bool:
-        if symbol in self.state_store.state.pending_orders:
+    def has_open_order(self, symbol: str, market: str = MARKET_SPOT) -> bool:
+        key = position_key(market, symbol)
+        if key in self.state_store.state.pending_orders:
             return True
+        exchange_symbol = self.exchange_symbol(market, symbol)
         orders = self._safe_call(
-            f"fetch_open_orders:{symbol}",
-            lambda: self.client.fetch_open_orders(symbol),
+            f"fetch_open_orders:{exchange_symbol}",
+            lambda: self.client.fetch_open_orders(exchange_symbol),
         )
         if orders:
-            self.log.warning("%s 存在 %d 个交易所挂单，本周期跳过", symbol, len(orders))
+            self.log.warning("%s 存在 %d 个交易所挂单，本周期跳过", key, len(orders))
             return True
         return False
 
@@ -2001,10 +2198,39 @@ class ExchangeGateway:
         symbol: str,
         target_allocation: float,
         reason: str,
+        market: str = MARKET_SPOT,
+        leverage: float = 1.0,
     ) -> Optional[OrderPlan]:
         if snapshot.equity <= 0:
             raise SafetyError("账户权益不大于 0")
-        position = snapshot.positions[symbol]
+        key = position_key(market, symbol)
+        position = snapshot.positions.get(key)
+        if position is None:
+            # 开新仓：账户尚无该市场持仓。目标分配>0 时用最新价构造零持仓位置；
+            # 否则无仓可减，返回 None。
+            if target_allocation <= 0:
+                return None
+            try:
+                price = self.fetch_last_price(symbol, market)
+            except Exception as exc:
+                raise SafetyError(f"{key} 无有效价格，无法开新仓: {exc}") from exc
+            position = AccountPosition(
+                symbol, 0.0, price, 0.0, 0.0, 0.0,
+                market=market, notional=0.0,
+            )
+        leverage = clamp(leverage, 1.0, self.risk.max_leverage)
+        if market == MARKET_SWAP:
+            return self._plan_swap(snapshot, symbol, position, target_allocation, reason, leverage)
+        return self._plan_spot(snapshot, symbol, position, target_allocation, reason)
+
+    def _plan_spot(
+        self,
+        snapshot: AccountSnapshot,
+        symbol: str,
+        position: AccountPosition,
+        target_allocation: float,
+        reason: str,
+    ) -> Optional[OrderPlan]:
         current_quote = position.quote_value
         desired_quote = snapshot.equity * clamp(target_allocation, 0, self.risk.max_symbol_allocation)
         delta_quote = desired_quote - current_quote
@@ -2032,23 +2258,124 @@ class ExchangeGateway:
             target_allocation=target_allocation,
             current_allocation=current_allocation,
             reason=reason,
+            market=MARKET_SPOT,
         )
 
+    def _plan_swap(
+        self,
+        snapshot: AccountSnapshot,
+        symbol: str,
+        position: AccountPosition,
+        target_allocation: float,
+        reason: str,
+        leverage: float,
+    ) -> Optional[OrderPlan]:
+        """合约（永续）调仓：按名义敞口（notional）计算，long-only。
+
+        - desired_notional = equity × target_allocation（受 max_symbol_allocation 钳制）
+        - 只做多：sell 最多平到 0，不反向开空（futures_allow_short 预留）
+        - 硬顶：单笔名义 ≤ max_futures_notional_pct×equity；保证金 = 名义/杠杆 ≤ futures_margin_cap_pct×equity
+        - amount 以张（contracts）为单位
+        """
+        exchange_symbol = self.exchange_symbol(MARKET_SWAP, symbol)
+        market_info = self.markets.get(exchange_symbol) or {}
+        if not market_info.get("swap"):
+            raise SafetyError(
+                f"{exchange_symbol} 无永续合约市场，无法生成合约计划（请确认 allowed_markets 与交易所市场）"
+            )
+        contract_size = finite(market_info.get("contractSize"), 1.0)
+        current_notional = position.notional  # long 为正
+        desired_notional = snapshot.equity * clamp(target_allocation, 0, self.risk.max_symbol_allocation)
+        delta_notional = desired_notional - current_notional
+        current_allocation = current_notional / snapshot.equity
+        min_delta = max(self.risk.min_rebalance_quote, snapshot.equity * self.risk.min_rebalance_pct)
+        if abs(delta_notional) < min_delta:
+            return None
+        side = "buy" if delta_notional > 0 else "sell"
+        if side == "sell":
+            # long-only：最多平到 0
+            delta_notional = max(delta_notional, -current_notional)
+            if abs(delta_notional) < min_delta:
+                return None
+        # 硬风控顶
+        notional_cap = snapshot.equity * self.risk.max_futures_notional_pct
+        if abs(delta_notional) > notional_cap + EPSILON:
+            delta_notional = math.copysign(notional_cap, delta_notional)
+        margin_required = abs(delta_notional) / leverage
+        if margin_required > snapshot.equity * self.risk.futures_margin_cap_pct + EPSILON:
+            raise SafetyError(
+                f"{exchange_symbol} 合约保证金需求 {margin_required:.2f} USDT 超过上限 "
+                f"{snapshot.equity * self.risk.futures_margin_cap_pct:.2f} USDT "
+                f"(notional={abs(delta_notional):.2f}, leverage={leverage:.1f})"
+            )
+        contracts = abs(delta_notional) / position.price / contract_size
+        contracts = self._normalize_contracts(exchange_symbol, contracts)
+        if contracts <= 0:
+            return None
+        estimated_quote = contracts * contract_size * position.price
+        # 最小量校验：estimated_quote 不得低于 min_order_quote（与现货一致），
+        # 低于则放弃该计划（避免 OKX 51020 最小量不足）。
+        if estimated_quote < self.risk.min_order_quote:
+            return None
+        return OrderPlan(
+            symbol=symbol,
+            side=side,
+            amount=contracts,  # 合约订单量以张为单位
+            reference_price=position.price,
+            estimated_quote=estimated_quote,
+            target_allocation=target_allocation,
+            current_allocation=current_allocation,
+            reason=reason,
+            market=MARKET_SWAP,
+            leverage=leverage,
+            contracts=contracts,
+        )
+
+    def _normalize_contracts(self, exchange_symbol: str, contracts: float) -> float:
+        if contracts <= 0:
+            return 0.0
+        try:
+            normalized = float(self.client.amount_to_precision(exchange_symbol, contracts))
+        except Exception as exc:
+            raise SafetyError(f"{exchange_symbol} 张数精度转换失败: {exc}") from exc
+        if normalized <= 0:
+            return 0.0
+        return normalized
+
     def execute(self, plan: OrderPlan) -> FillResult:
-        if self.has_open_order(plan.symbol):
-            raise SafetyError(f"{plan.symbol} 存在未完成订单，拒绝重复下单")
+        key = position_key(plan.market, plan.symbol)
+        exchange_symbol = self.exchange_symbol(plan.market, plan.symbol)
+        if self.has_open_order(plan.symbol, plan.market):
+            raise SafetyError(f"{key} 存在未完成订单，拒绝重复下单")
         vwap, slippage_bps = self.estimate_vwap(
-            plan.symbol, plan.side, plan.amount, plan.reference_price
+            exchange_symbol, plan.side, plan.amount, plan.reference_price
         )
         if slippage_bps > self.risk.max_slippage_bps:
             raise SafetyError(
-                f"{plan.symbol} 预计滑点 {slippage_bps:.2f}bps 超过上限 {self.risk.max_slippage_bps:.2f}bps"
+                f"{exchange_symbol} 预计滑点 {slippage_bps:.2f}bps 超过上限 {self.risk.max_slippage_bps:.2f}bps"
             )
-        client_id = stable_client_order_id(self.exchange_cfg.id, plan.symbol, plan.side)
+        client_id = stable_client_order_id(self.exchange_cfg.id, exchange_symbol, plan.side)
         params: Dict[str, Any] = {}
         if self.exchange_cfg.client_order_id_param:
             params[self.exchange_cfg.client_order_id_param] = client_id
-        if self.exchange_cfg.id == "okx" and self.exchange_cfg.market_type == "spot":
+        if plan.market == MARKET_SWAP:
+            # 合约：组合保证金账户（acctLv=3）+ 对冲模式（posMode=long_short_mode）下单必须带 posSide。
+            # 当前版本 long-only：买入=开多/加多，卖出=平多，posSide 恒为 long。
+            if self.exchange_cfg.id != "okx":
+                raise SafetyError("合约市场仅适配 OKX")
+            # 杠杆设置是保证金计算的前提：失败即中止，避免按错误杠杆下单。
+            try:
+                self._safe_call(
+                    f"set_leverage:{exchange_symbol}",
+                    lambda: self.client.set_leverage(
+                        plan.leverage, exchange_symbol, {"mgnMode": "cross", "posSide": "long"}
+                    ),
+                )
+            except Exception as exc:
+                raise SafetyError(f"{exchange_symbol} 设置杠杆 {plan.leverage}x 失败: {exc}") from exc
+            params["marginMode"] = "cross"
+            params["posSide"] = "long"
+        elif self.exchange_cfg.id == "okx" and self.exchange_cfg.market_type == "spot":
             # OKX 跨币种保证金账户（acctLv=3，经 GET /api/v5/account/config 实测）只接受
             # tdMode=cross 的现货单：
             #   1) ccxt 4.5.71 对现货默认 tdMode=cash -> OKX 拒绝 51000 "Parameter tdMode error"
@@ -2065,7 +2392,7 @@ class ExchangeGateway:
         state = self.state_store.state
         # Write-ahead intent：必须先落盘再发请求。进程若在请求期间崩溃，重启后会停机人工核对，
         # 绝不能把“未收到响应”当作“订单未提交”并自动重试。
-        state.pending_orders[plan.symbol] = {
+        state.pending_orders[key] = {
             "id": "",
             "client_id": client_id,
             "side": plan.side,
@@ -2073,50 +2400,52 @@ class ExchangeGateway:
             "created_at": iso_now(),
             "stage": "submitting",
             "uncertain": False,
+            "market": plan.market,
+            "exchange_symbol": exchange_symbol,
         }
         self.state_store.save()
         try:
             # 下单属于非幂等副作用，禁止使用带自动重试的 _safe_call。
             order = self.client.create_order(
-                plan.symbol, "market", plan.side, plan.amount, None, params
+                exchange_symbol, "market", plan.side, plan.amount, None, params
             )
         except self._network_error_types() as exc:
-            message = f"{plan.symbol} 下单请求发生网络/超时异常，结果未知: {exc}"
-            state.pending_orders[plan.symbol]["uncertain"] = True
-            state.pending_orders[plan.symbol]["submit_error"] = repr(exc)
+            message = f"{key} 下单请求发生网络/超时异常，结果未知: {exc}"
+            state.pending_orders[key]["uncertain"] = True
+            state.pending_orders[key]["submit_error"] = repr(exc)
             state.halted_reason = "ORDER_UNCERTAIN: " + message
             self.state_store.save()
             raise OrderUncertainError(message + "；禁止自动重试，必须人工核对") from exc
         except Exception:
             # 非网络类错误按交易所明确拒绝处理；清理尚未提交的本地 intent。
-            state.pending_orders.pop(plan.symbol, None)
+            state.pending_orders.pop(key, None)
             self.state_store.save()
             raise
         if not isinstance(order, Mapping):
-            message = f"{plan.symbol} 下单响应不是 JSON object，订单结果未知"
-            state.pending_orders[plan.symbol]["uncertain"] = True
-            state.pending_orders[plan.symbol]["response_type"] = type(order).__name__
+            message = f"{key} 下单响应不是 JSON object，订单结果未知"
+            state.pending_orders[key]["uncertain"] = True
+            state.pending_orders[key]["response_type"] = type(order).__name__
             state.halted_reason = "ORDER_UNCERTAIN: " + message
             self.state_store.save()
             raise OrderUncertainError(message + "；必须人工核对交易所")
         order_id = str(order.get("id", "")).strip()
         if not order_id:
-            message = f"{plan.symbol} 下单响应缺少 order id，订单结果未知"
-            state.pending_orders[plan.symbol]["uncertain"] = True
-            state.pending_orders[plan.symbol]["response_client_id"] = order.get("clientOrderId")
+            message = f"{key} 下单响应缺少 order id，订单结果未知"
+            state.pending_orders[key]["uncertain"] = True
+            state.pending_orders[key]["response_client_id"] = order.get("clientOrderId")
             state.halted_reason = "ORDER_UNCERTAIN: " + message
             self.state_store.save()
             raise OrderUncertainError(message + "；禁止自动重下，必须人工核对")
-        state.pending_orders[plan.symbol].update({
+        state.pending_orders[key].update({
             "id": order_id,
             "stage": "accepted",
             "uncertain": False,
         })
         self.state_store.save()
-        final_order = self._wait_for_order(plan.symbol, order_id, order)
+        final_order = self._wait_for_order(exchange_symbol, order_id, order)
         result = self._parse_fill(plan, final_order)
         if result.status in {"closed", "canceled", "cancelled", "rejected", "expired"}:
-            state.pending_orders.pop(plan.symbol, None)
+            state.pending_orders.pop(key, None)
         if result.filled_amount > 0:
             self._apply_fill(result)
         else:
@@ -2149,6 +2478,19 @@ class ExchangeGateway:
             average = cost / filled
         if average <= 0:
             average = plan.reference_price
+        # 合约订单的 filled 以张为单位；统一换算为 base 数量（amount=contracts×contractSize）。
+        # 否则 _apply_fill 会把 1.23 张当成 1.23 BTC 累加，仓位估值放大 ~100 倍。
+        if plan.market == MARKET_SWAP and filled > 0:
+            market_info = self.markets.get(plan.symbol) or {}
+            contract_size = finite(market_info.get("contractSize"), 0.0)
+            if contract_size <= 0:
+                market_info = self.markets.get(self.exchange_symbol(MARKET_SWAP, plan.symbol)) or {}
+                contract_size = finite(market_info.get("contractSize"), 0.0)
+            if contract_size <= 0:
+                raise SafetyError(
+                    f"{self.exchange_symbol(MARKET_SWAP, plan.symbol)} 缺少 contractSize，无法换算成交张数"
+                )
+            filled = filled * contract_size
         fee_quote = 0.0
         fee = order.get("fee") or {}
         if str(fee.get("currency", "")).upper() == self.runtime.quote_currency:
@@ -2166,11 +2508,17 @@ class ExchangeGateway:
             fee_quote=fee_quote,
             status=str(order.get("status", "unknown")).lower(),
             raw={"clientOrderId": order.get("clientOrderId")},
+            market=plan.market,
+            leverage=plan.leverage,
         )
 
     def _apply_fill(self, fill: FillResult) -> None:
         state = self.state_store.state
-        pos = state.positions.get(fill.symbol, PositionState())
+        key = position_key(fill.market, fill.symbol)
+        pos = state.positions.get(key, PositionState())
+        pos.market = fill.market
+        pos.side = "long"
+        pos.leverage = fill.leverage if fill.market == MARKET_SWAP else 1.0
         amount = max(0.0, fill.filled_amount)
         if fill.side == "buy":
             gross = pos.amount * pos.avg_entry + amount * fill.average_price + fill.fee_quote
@@ -2187,10 +2535,10 @@ class ExchangeGateway:
                 pos = PositionState()
         pos.updated_at = iso_now()
         if pos.amount > 0:
-            state.positions[fill.symbol] = pos
+            state.positions[key] = pos
         else:
-            state.positions.pop(fill.symbol, None)
-        state.last_trade_at[fill.symbol] = iso_now()
+            state.positions.pop(key, None)
+        state.last_trade_at[key] = iso_now()
         self._roll_trade_day()
         state.trades_today += 1
         self.state_store.save()
@@ -2343,6 +2691,9 @@ class AIDecision:
     fallback: bool = False
     # AI 建议的下一次行情复查间隔（分钟）；None 表示未提供，由系统用默认轮询间隔。
     next_review_minutes: Optional[int] = None
+    # 多市场支持：AI 自主选择现货/合约（仅限配置允许范围）与合约杠杆。
+    market: str = MARKET_SPOT
+    leverage: float = 1.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -2393,6 +2744,8 @@ class AIAdvisor:
             "action": "HOLD",
             "target_level": "UNCHANGED",
             "confidence": 0.0,
+            "market": "spot",
+            "leverage": 1.0,
             "summary": "中文总结",
             "next_review_minutes": 60,
             "readings": {
@@ -2412,9 +2765,13 @@ class AIAdvisor:
         template = json.dumps(cls._response_template(), ensure_ascii=False, separators=(",", ":"))
         return (
             "输出协议是强制接口契约：只能输出一个 JSON object，不得输出 Markdown、代码块、解释、前后缀或思维过程。"
-            "顶层必须且只能包含 action、target_level、confidence、summary、next_review_minutes、readings、conflicts、risk_notes。"
+            "顶层必须且只能包含 action、target_level、confidence、market、leverage、summary、next_review_minutes、readings、conflicts、risk_notes。"
             "action 必须是 JSON string，并且只能精确等于 BUY、SELL、HOLD 之一；不得为 null、数字或对象。"
             "target_level 必须是 JSON string，并且只能精确等于 FLAT、HALF、FULL、UNCHANGED 之一。"
+            "market 必须是 JSON string，只能精确等于 spot 或 swap（永续合约）；只能从输入给出的 allowed_markets 中选择，"
+            "未给出 swap 时只能选 spot。看多且希望放大敞口才选 swap，并同时给出 1..max_leverage 的 leverage；"
+            "方向不确定或盘面偏弱时必须选 spot（现货不放大风险）。"
+            "leverage 必须是 1 到 50 的 JSON number；现货市场必须为 1。"
             "confidence 必须是 0 到 1 的 JSON number；summary 必须是 JSON string。"
             "next_review_minutes 必须是 1 到 360 的 JSON integer，表示你建议的下一次行情复查间隔（分钟）："
             "波动剧烈、持仓重或方向不确定时用短间隔（如 5-30），市场平淡、空仓且无信号时可用长间隔（如 120-360）；"
@@ -2424,7 +2781,7 @@ class AIAdvisor:
             "reading 必须是该古法盘面的断卦解读（如体用生克、三传与日干关系、值符吉门、命宫主星、日主旺衰等），"
             "不得泛泛重复 value 数值。"
             "conflicts 与 risk_notes 必须是 JSON string array。不得改字段名，不得把字段放入 decision、result、data 等嵌套对象。"
-            "若无法确定交易动作，必须使用 action=HOLD、target_level=UNCHANGED、低 confidence，仍须完整填写十项 readings。"
+            "若无法确定交易动作，必须使用 action=HOLD、target_level=UNCHANGED、market=spot、leverage=1、低 confidence，仍须完整填写十项 readings。"
             f"严格结构示例（内容应根据输入重写，但结构和字段名不得改变）：{template}"
         )
 
@@ -2553,7 +2910,7 @@ class AIAdvisor:
         }
         if require_readings:
             required_fields.add("readings")
-        allowed_fields = required_fields | {"next_review_minutes"}
+        allowed_fields = required_fields | {"next_review_minutes", "market", "leverage"}
         if not require_readings:
             # 拆分模式的聚合响应：模型可能回显 readings，允许但忽略（已单独获取）
             allowed_fields.add("readings")
@@ -2605,9 +2962,25 @@ class AIAdvisor:
             if type(raw_next) is not int or not (1 <= raw_next <= 360):
                 raise ConfigError("AI response.next_review_minutes 必须是 1..360 的 JSON integer")
             next_review_minutes = raw_next
+        market = MARKET_SPOT
+        raw_market = parsed.get("market")
+        if raw_market is not None:
+            market = require_json_string(raw_market, "AI response.market").strip().lower()
+            if market not in AI_MARKETS:
+                raise ConfigError(f"AI response.market 必须是 {sorted(AI_MARKETS)}")
+        leverage = 1.0
+        raw_leverage = parsed.get("leverage")
+        if raw_leverage is not None:
+            leverage = require_json_number(raw_leverage, "AI response.leverage")
+            if not 1.0 <= leverage <= 50:
+                raise ConfigError("AI response.leverage 必须在 1..50")
+            if market == MARKET_SPOT and abs(leverage - 1.0) > 1e-9:
+                leverage = 1.0  # 现货强制无杠杆，不因模型幻觉放大风险
         return AIDecision(
             action, target_level, confidence, summary, readings, conflicts, risk_notes,
             next_review_minutes=next_review_minutes,
+            market=market,
+            leverage=leverage,
         )
 
     def _parse_with_one_format_repair(
@@ -2707,6 +3080,7 @@ class AIAdvisor:
         position: AccountPosition,
         account_equity: float,
         selection_context: Optional[Mapping[str, Any]] = None,
+        market_context: Optional[Mapping[str, Any]] = None,
     ) -> AIDecision:
         if not self.config.enabled:
             return self.rule_fallback(result, rule_target, current_fraction, rule_reason)
@@ -2715,7 +3089,7 @@ class AIAdvisor:
             # 对 reasoning 型模型（如 deepseek-v4-flash）可靠，避免单次大请求空响应。
             return self._interpret_split(
                 symbol, result, rule_target, current_fraction, rule_reason,
-                position, account_equity, selection_context,
+                position, account_equity, selection_context, market_context,
             )
         methods = {
             name: {
@@ -2742,6 +3116,7 @@ class AIAdvisor:
                 "account_equity": account_equity,
             },
             "daily_selection": dict(selection_context or {}),
+            "market_context": dict(market_context or {}),
             "methods": methods,
             "diagnostics": result.diagnostics,
         }
@@ -2752,8 +3127,11 @@ class AIAdvisor:
             "输入包含两项：1) 每项古法的确定性简化置信度（value，由公开规则生成，仅作参考）；"
             "2) paipan_charts 中每项古法的完整盘面（真实排盘结果：卦象/四课三传/九宫/星盘等）。"
             "你必须以断卦师身份解读盘面本身（如梅花体用生克、六壬三传与日干关系、奇门值符吉门、"
-            "紫微命宫主星、八字日主旺衰用神、风水飞星吉凶），识别多法共振与冲突，再转译为现货单向做多的 "
-            "BUY/SELL/HOLD。你不是自由下单主体：规则目标是仓位上限，BUY 不得高于规则目标；SELL 可以降低风险；"
+            "紫微命宫主星、八字日主旺衰用神、风水飞星吉凶），识别多法共振与冲突，再转译为 "
+            "BUY/SELL/HOLD，并按 market_context.allowed_markets 自主选择现货（spot）或合约（swap）表达仓位："
+            "只有强烈看多且愿意承担更高波动时才选 swap 并给出 1..max_leverage 的杠杆；"
+            "方向不明、看空或盘面中性时选 spot。你不是自由下单主体：规则目标是仓位上限，"
+            "BUY 不得高于规则目标；SELL 可以降低风险；"
             "保护性止损与组合风控始终优先。不得声称预知未来或保证收益，不得编造输入中没有的盘面数据。"
             + self._response_contract()
         )
@@ -2793,6 +3171,7 @@ class AIAdvisor:
         position: AccountPosition,
         account_equity: float,
         selection_context: Optional[Mapping[str, Any]] = None,
+        market_context: Optional[Mapping[str, Any]] = None,
     ) -> AIDecision:
         """拆分模式主流程：十项小请求 → 综合决策请求。"""
         try:
@@ -2802,7 +3181,7 @@ class AIAdvisor:
             try:
                 decision = self._aggregate_decision(
                     symbol, result, rule_target, current_fraction, rule_reason,
-                    position, account_equity, selection_context, readings,
+                    position, account_equity, selection_context, readings, market_context,
                 )
             except Exception as exc:
                 # 聚合决策失败（如空响应）：保留十项 AI 解读，动作/仓位用规则兜底。
@@ -2953,6 +3332,7 @@ class AIAdvisor:
         account_equity: float,
         selection_context: Optional[Mapping[str, Any]],
         readings: Mapping[str, AncientMethodReading],
+        market_context: Optional[Mapping[str, Any]] = None,
     ) -> AIDecision:
         readings_payload = {
             name: {"bias": r.bias, "confidence": r.confidence, "reading": r.reading[:60]}
@@ -2974,17 +3354,20 @@ class AIAdvisor:
                 "account_equity": account_equity,
             },
             "daily_selection": dict(selection_context or {}),
+            "market_context": dict(market_context or {}),
             "readings": readings_payload,  # 十项已解读结果，只做综合，不再逐项重读
         }
         system = (
             "你是中国古法十项断卦的汇总决策师。输入已包含十项古法的完整解读（bias/confidence/reading），"
             "你不得重新解读各项，只需综合十项解读、规则目标与持仓状态，输出最终交易决策。"
-            "你是现货单向做多的仓位决策者：rule_target_level 是规则引擎给出的默认仓位目标，"
+            "你是仓位决策者：rule_target_level 是规则引擎给出的默认仓位目标，"
             "你必须以它为准：当前仓位低于规则目标且十项解读无明确看空时，默认 BUY 至规则目标；"
             "SELL 只能在明确看空时降低风险；HOLD 只能用于持仓已接近规则目标或信号中性（分数接近 0.5）时。"
             "空仓 + 规则目标为 HALF/FULL 时，不要输出 HOLD，除非十项解读强烈看空。"
+            "market 只能从 market_context.allowed_markets 中选择：允许 swap 且强烈看多时才选 swap 放大敞口"
+            "（leverage 取 1..max_leverage 且不超过 max_futures_notional_pct 约束）；其余情况选 spot、leverage=1。"
             "注意：输出中不得包含 readings 字段（十项解读已由上游单独提供），"
-            "只需输出 action、target_level、confidence、summary、conflicts、risk_notes、next_review_minutes。"
+            "只需输出 action、target_level、confidence、market、leverage、summary、conflicts、risk_notes、next_review_minutes。"
             + self._response_contract()
         )
         content = self._completion_content([
@@ -3051,6 +3434,9 @@ class SymbolDecision:
     reason: str
     signal_result: SignalResult
     ai_decision: AIDecision
+    # AI 选择的市场（spot/swap）与合约杠杆
+    market: str = MARKET_SPOT
+    leverage: float = 1.0
 
 
 def _send_webhook(url: str, payload: Dict[str, Any], timeout: int = 5) -> bool:
@@ -3407,7 +3793,11 @@ class GuFaQuantPro:
 
         raw: Dict[str, Tuple[float, str, AIDecision]] = {}
         for symbol, result in results.items():
-            position = snapshot.positions[symbol]
+            position = snapshot.positions.get(symbol)
+            if position is None:
+                position = AccountPosition(
+                    symbol, 0.0, result.diagnostics.get("price", 0.0), 0.0, 0.0, 0.0
+                )
             current_target_fraction = 0.0
             if snapshot.equity > 0 and self.config.risk.max_symbol_allocation > 0:
                 current_target_fraction = (
@@ -3445,11 +3835,18 @@ class GuFaQuantPro:
                     position=position,
                     account_equity=snapshot.equity,
                     selection_context=selection_context,
+                    market_context={
+                        "allowed_markets": list(self.config.exchange.allowed_markets),
+                        "max_leverage": self.config.risk.max_leverage,
+                        "max_futures_notional_pct": self.config.risk.max_futures_notional_pct,
+                        "futures_allow_short": self.config.risk.futures_allow_short,
+                    },
                 )
                 target, ai_bound_reason = self._apply_ai_bounds(
                     ai_decision, rule_target, current_target_fraction
                 )
                 reason = f"{rule_reason}; {ai_bound_reason}; AI summary={ai_decision.summary}"
+                market = self._resolve_market(ai_decision, position.market)
             else:
                 # 落选标的只可能因已有仓位进入精筛范围；跳过远程 AI，且永远不得加仓。
                 target = min(rule_target, current_target_fraction)
@@ -3469,6 +3866,7 @@ class GuFaQuantPro:
                 ai_decision.summary = "未通过当日古法初选；不调用远程 AI，只允许持有、减仓或保护性退出。"
                 ai_decision.risk_notes = ["每日初选门控禁止该标的新增风险。"]
                 reason = f"{rule_reason}; {gate_reason}"
+                market = position.market
 
             if symbol in protective:
                 target, reason = 0.0, protective[symbol] + "; hard risk overrides AI/selection"
@@ -3495,8 +3893,45 @@ class GuFaQuantPro:
                 reason=reason,
                 signal_result=results[symbol],
                 ai_decision=ai_decision,
+                market=market,
+                leverage=ai_decision.leverage if ai_decision.enabled else 1,
             )
         return decisions
+
+    def _resolve_market(self, ai_decision: AIDecision, current_market: str) -> str:
+        """把 AI 选择的市场收敛到配置白名单 + 交易所实际支持范围内。
+
+        - AI 要求的市场不在白名单：优先回退到当前持仓市场，再回退到默认市场。
+        - 合约市场对个别币不存在（如 OKB 无永续）：回退现货。
+        - AI 未表态（默认 spot）：直接取白名单里的默认市场，保持老行为。
+        """
+        allowed = self.config.exchange.allowed_markets
+        if not allowed:
+            return "spot"
+
+        def market_supported(market: str, symbol: str) -> bool:
+            if market == MARKET_SPOT:
+                return True
+            if market != MARKET_SWAP:
+                return False
+            if MARKET_SWAP not in allowed:
+                return False
+            try:
+                info = self.gateway.markets.get(
+                    self.gateway.exchange_symbol(MARKET_SWAP, symbol)
+                ) or {}
+            except Exception:
+                return False
+            return bool(info.get("swap"))
+
+        symbol = ai_decision.symbol if hasattr(ai_decision, "symbol") else None
+        if ai_decision.market in allowed and (
+            symbol is None or market_supported(ai_decision.market, symbol)
+        ):
+            return ai_decision.market
+        if symbol is not None and current_market in allowed and market_supported(current_market, symbol):
+            return current_market
+        return allowed[0]
 
     def _next_review_seconds(
         self,
@@ -3602,7 +4037,12 @@ class GuFaQuantPro:
                 continue
             try:
                 plan = self.gateway.plan_rebalance(
-                    snapshot, symbol, decision.target_allocation, decision.reason
+                    snapshot,
+                    symbol,
+                    decision.target_allocation,
+                    decision.reason,
+                    market=decision.market,
+                    leverage=decision.leverage,
                 )
                 if plan:
                     plans.append(plan)
@@ -3856,16 +4296,23 @@ class GuFaQuantPro:
         if not isinstance(health, dict):
             return
         try:
-            tickers = self.gateway.client.fetch_tickers(targets)
+            # 状态键可能是 swap:XXX/USDT（合约持仓）；转成交易所符号拉价，
+            # 再把价格映射回状态键（spot 裸符号、swap 带前缀）。
+            exchange_targets: Dict[str, str] = {}
+            for sym in targets:
+                market, base = split_position_key(sym)
+                exchange_targets[self.gateway.exchange_symbol(market, base)] = sym
+            tickers = self.gateway.client.fetch_tickers(list(exchange_targets))
             prices: Dict[str, float] = {}
             changes: Dict[str, float] = {}
-            for sym, ticker in (tickers or {}).items():
+            for ex_sym, ticker in (tickers or {}).items():
+                state_key = exchange_targets.get(str(ex_sym), str(ex_sym))
                 price = finite(ticker.get("last") or ticker.get("close"))
                 if price > 0:
-                    prices[str(sym)] = price
+                    prices[state_key] = price
                     pct = finite(ticker.get("percentage"))
                     if -100 <= pct <= 1000:
-                        changes[str(sym)] = pct
+                        changes[state_key] = pct
             if not prices:
                 return
             snap = self.gateway.account_snapshot(prices)
