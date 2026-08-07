@@ -1063,6 +1063,63 @@ def test_ai_split_config_roundtrip() -> None:
     assert cfg2.split_readings is False
 
 
+def test_ai_reasoning_effort_config() -> None:
+    # 合法值通过
+    for value in ("", "low", "medium", "high", "xhigh", "max"):
+        cfg = g.AIConfig.from_dict({"enabled": True, "reasoning_effort": value})
+        cfg.validate()
+        assert cfg.reasoning_effort == value
+    # 大小写归一
+    cfg = g.AIConfig.from_dict({"enabled": True, "reasoning_effort": "LOW"})
+    cfg.validate()
+    assert cfg.reasoning_effort == "low"
+    # 非法值拒绝
+    bad = g.AIConfig.from_dict({"enabled": True, "reasoning_effort": "minimal"})
+    with pytest.raises(g.ConfigError):
+        bad.validate()
+
+
+def test_ai_reasoning_effort_passed_to_api() -> None:
+    captured: Dict[str, Any] = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        content = json.dumps(
+            {
+                "action": "HOLD",
+                "target_level": "UNCHANGED",
+                "confidence": 0.5,
+                "summary": "ok",
+                "readings": {name: {"bias": "neutral", "confidence": 0.5, "reading": "x"}
+                             for name in g.STRATEGY_NAMES},
+                "conflicts": [],
+                "risk_notes": [],
+                "next_review_minutes": 60,
+            },
+            ensure_ascii=False,
+        )
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    # 显式 low
+    cfg = g.AIConfig(enabled=True, model="deepseek-v4-flash-0731", reasoning_effort="low")
+    advisor = object.__new__(g.AIAdvisor)
+    advisor.config = cfg
+    advisor.log = logging.getLogger("test.ai")
+    advisor.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+    advisor._completion_content([{"role": "user", "content": "hi"}])
+    assert captured.get("reasoning_effort") == "low"
+
+    # 空 = 不传
+    captured.clear()
+    cfg2 = g.AIConfig(enabled=True, model="deepseek-v4-flash-0731", reasoning_effort="")
+    advisor2 = object.__new__(g.AIAdvisor)
+    advisor2.config = cfg2
+    advisor2.log = logging.getLogger("test.ai")
+    advisor2.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+    advisor2._completion_content([{"role": "user", "content": "hi"}])
+    assert "reasoning_effort" not in captured
+
+
 def test_ai_explain_only_retains_rule_target() -> None:
     controller = make_controller_for_bounds(mode="explain_only")
     decision = g.AIDecision(

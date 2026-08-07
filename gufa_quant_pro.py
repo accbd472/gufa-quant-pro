@@ -827,6 +827,10 @@ class AIConfig:
     minimum_allow_confidence: float = 0.60
     decision_mode: str = "bounded"
     max_output_tokens: int = 1200
+    # 思考档位（reasoning 模型专用，如 deepseek-v4-flash）：low/medium/high/xhigh/max。
+    # 空字符串 = 不传该参数（默认档位，通常为 medium）。
+    # flash 等模型 medium 思考会耗尽输出预算导致空正文，设 low 可显著降低该概率。
+    reasoning_effort: str = ""
     # 拆分模式：十项古法各发一次小请求（每次输出 ~100-300 token），再做一次综合请求。
     # 对 reasoning 型模型（如 deepseek-v4-flash）可靠，避免单次大请求输出被思考预算耗尽返回空正文。
     split_readings: bool = False
@@ -861,6 +865,9 @@ class AIConfig:
         self.decision_mode = self.decision_mode.strip().lower()
         if self.decision_mode not in {"bounded", "explain_only"}:
             raise ConfigError("ai.decision_mode 必须是 bounded 或 explain_only")
+        self.reasoning_effort = self.reasoning_effort.strip().lower()
+        if self.reasoning_effort not in {"", "low", "medium", "high", "xhigh", "max"}:
+            raise ConfigError("ai.reasoning_effort 必须是 low/medium/high/xhigh/max 之一（或留空）")
         if self.enabled and not self.model:
             raise ConfigError("启用 AI 时 ai.model 不能为空")
 
@@ -2276,14 +2283,19 @@ class AIAdvisor:
         return AIRelayError(message, status=status, detail=detail)
 
     def _completion_content(self, messages: Sequence[Mapping[str, str]]) -> str:
+        kwargs: Dict[str, Any] = {
+            "model": self.config.model,
+            "messages": list(messages),
+            "temperature": 0,
+            "max_tokens": self.config.max_output_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if self.config.reasoning_effort:
+            # 思考档位：low 可显著降低 reasoning 模型（如 deepseek-v4-flash）
+            # 把输出预算耗尽在思考上导致空正文的概率。
+            kwargs["reasoning_effort"] = self.config.reasoning_effort
         try:
-            response = self.client.chat.completions.create(
-                model=self.config.model,
-                messages=list(messages),
-                temperature=0,
-                max_tokens=self.config.max_output_tokens,
-                response_format={"type": "json_object"},
-            )
+            response = self.client.chat.completions.create(**kwargs)
         except Exception as exc:  # noqa: BLE001 - SDK/网络/中转站错误统一转成可读信息
             raise self._relay_error(exc) from exc
         try:
