@@ -398,6 +398,33 @@ def test_daily_selection_dead_symbols_excluded_not_fail_closed(tmp_path: Path) -
     assert len(calls) == 3
 
 
+def test_daily_selection_bad_data_excluded_not_fail_closed(tmp_path: Path) -> None:
+    """行情数据异常（如单根 K 线涨跌超 50%）视为死币当日剔除，不 fail-closed 全盘。"""
+    scores = {
+        "BTC/USDT": 0.61,
+        "ETH/USDT": 0.82,
+        "ACE/USDT": 0.99,  # 数据异常：即使古法分数最高也不入选，且不拖垮当日初选
+    }
+    controller, _ = make_selection_controller(
+        tmp_path, scores, dead_symbols=("ACE/USDT",)
+    )
+    # 把死币报错模拟成真实场景的「涨跌超过 50%」
+    controller.gateway.fetch_ohlcv = lambda symbol, timeframe=None, ohlcv_limit=None: (
+        (_ for _ in ()).throw(
+            g.SafetyError("ACE/USDT 最新闭合 K 线涨跌超过 50%，疑似数据异常，拒绝交易")
+        )
+        if symbol == "ACE/USDT"
+        else symbol
+    )
+
+    result = controller._daily_selection()
+    assert result.complete is True               # 数据异常不 fail-closed
+    assert "ACE/USDT" in result.dead
+    assert "疑似数据异常" in result.dead["ACE/USDT"]
+    assert result.selected_symbols == ["ETH/USDT", "BTC/USDT"]
+    assert "ACE/USDT" not in result.candidates
+
+
 def test_daily_selection_dead_symbols_reprobe_next_day(tmp_path: Path) -> None:
     """次日自动重新探测死币：即使仍无行情，也会重新探测而非永久缓存。"""
     scores = {"BTC/USDT": 0.61, "CC/USDT": 0.99}

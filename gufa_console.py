@@ -1221,6 +1221,8 @@ function refresh(){
     document.getElementById('btnPause').disabled = s.paused;
     document.getElementById('btnResume').disabled = !s.paused;
   }).catch(e=>{});
+  // 日志面板激活时同步刷新日志，避免页面停留在旧日志上造成「进程卡住」的错觉
+  if(document.querySelector('.tab[data-panel="log"]').classList.contains('active')) loadLog();
 }
 function card(k,v){ return `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`; }
 
