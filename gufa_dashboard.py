@@ -125,6 +125,15 @@ HTML = r"""<!DOCTYPE html>
   .logbox .SELL { color: var(--rd); font-weight: 700; }
 
   /* ---------- 决策灯 ---------- */
+  .quotes { display: flex; flex-direction: column; gap: 3px; overflow-y: auto;
+    border: 1px solid rgba(0,240,255,.15); border-radius: 6px; padding: 4px 8px; margin-bottom: 6px; }
+  .quote { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+  .quote .sym { width: 76px; color: var(--cy); white-space: nowrap; }
+  .quote .qp { flex: 1; color: #e8f6ff; text-align: right; }
+  .quote .qch { width: 62px; text-align: right; }
+  .quote .qch.up { color: var(--gr); }
+  .quote .qch.down { color: var(--rd); }
+  .quote .qv { width: 84px; text-align: right; color: #8fb4d8; }
   .verdicts { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
   .verdict { display: flex; align-items: center; gap: 8px; font-size: 12px; }
   .verdict .sym { width: 88px; color: var(--cy); }
@@ -198,7 +207,8 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <!-- 右下：决策 -->
     <div class="card" style="grid-column:2; grid-row:2">
-      <h3>DECISIONS // AI 聚合决策</h3>
+      <h3>DECISIONS // AI 聚合决策 <span style="color:#5f7fa0;font-size:10px" id="liveTs"></span></h3>
+      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:52px; overflow-y:auto"><div class="empty">无持仓</div></div>
       <div class="verdicts" id="verdicts"><div class="empty">等待决策…</div></div>
       <h3 style="margin-top:6px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
       <div class="aisteps" id="aisteps"><div class="empty">—</div></div>
@@ -331,6 +341,19 @@ function render(d){
   $("dead").innerHTML = d.dead && Object.keys(d.dead).length
     ? Object.entries(d.dead).map(([k,v])=>`<span>✕ ${k.replace('/USDT','')}: ${v}</span>&nbsp;&nbsp;`).join("") : "<span style='color:#4a6a8a'>无剔除</span>";
   // 决策
+  if (d.quotes && Object.keys(d.quotes).length){
+    if (d.live_updated_at) $("liveTs").textContent = "// " + d.live_updated_at.slice(11,19) + " 实时价";
+    const qs = Object.entries(d.quotes).map(([sym,q])=>{
+      const pct = q.change_pct!=null ? q.change_pct : 0;
+      const cls = pct>0.0001 ? "up" : (pct<-0.0001 ? "down" : "");
+      const arrow = pct>0.0001 ? "▲" : (pct<-0.0001 ? "▼" : "•");
+      return `<div class="quote"><span class="sym">${sym.replace('/USDT','')}</span>
+        <span class="qp">${Number(q.price).toPrecision(6)}</span>
+        <span class="qch ${cls}">${arrow}${Math.abs(pct).toFixed(2)}%</span>
+        <span class="qv">${Number(q.value).toFixed(2)}U</span></div>`;
+    }).join("");
+    $("liveQuotes").innerHTML = qs;
+  } else { $("liveQuotes").innerHTML = '<div class="empty">无持仓</div>'; }
   if (d.verdicts && d.verdicts.length){
     const vs = d.verdicts.map(v=>`<div class="verdict"><span class="sym">${v.sym.replace('/USDT','')}</span>
       <span class="vbadge ${v.action}">${v.action}</span>
@@ -626,6 +649,8 @@ class Snapshot:
             "cycle_seconds": health.get("cycle_seconds"),
             "next_review_seconds": health.get("next_review_seconds"),
             "fills": health.get("fills"),
+            "quotes": health.get("quotes") or {},
+            "live_updated_at": health.get("live_updated_at"),
             "candidates": len((health.get("daily_selection") or {}).get("candidates") or [])
                           or len(state.get("daily_selection_candidates") or []),
             "selection_date": state.get("daily_selection_date"),

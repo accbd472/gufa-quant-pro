@@ -3709,6 +3709,19 @@ class GuFaQuantPro:
             "next_review_seconds": next_review_seconds,
             "cycle_seconds": round(duration, 3),
         }
+        # 周期报告写盘时保留等待期的实时行情字段（quotes/live_updated_at），
+        # 避免周期完成瞬间把大屏的实时价清空。
+        try:
+            prev_health = json.loads(
+                (self.state_dir / self.config.runtime.health_file).read_text(encoding="utf-8")
+            )
+            if isinstance(prev_health, dict):
+                if prev_health.get("quotes"):
+                    report["quotes"] = prev_health["quotes"]
+                if prev_health.get("live_updated_at"):
+                    report["live_updated_at"] = prev_health["live_updated_at"]
+        except Exception:
+            pass  # 读不到旧 health 就不合并，实时字段由等待期下一次刷新补上
         atomic_write_json(self.state_dir / self.config.runtime.health_file, report, mode=0o644)
         # 权益曲线历史（追加式，供 stats 命令与外部监控使用）
         append_jsonl(self.state_dir / "equity.jsonl", {
@@ -3791,8 +3804,94 @@ class GuFaQuantPro:
                 wait_seconds = int(
                     report.get("next_review_seconds") or self.config.runtime.poll_interval_seconds
                 )
-            self.stop_event.wait(wait_seconds)
+            # 等待期间每 poll_interval 轻量刷新行情/权益（不调用 AI、不排盘），
+            # 让大屏/监控数据实时更新，避免复查间隔内数据冻结。
+            self._wait_until_review(wait_seconds)
         self.log.warning("服务已安全停止")
+
+    def _wait_until_review(self, wait_seconds: int) -> None:
+        """周期间等待：每 poll_interval_seconds 轻量刷新一次行情/权益。
+
+        只更新 health.json 的 equity/quote_free/quotes/live_updated_at 与
+        equity.jsonl 实时点；不调用 AI、不排盘、不决策、不改变复查节奏。
+        """
+        deadline = time.monotonic() + max(0, wait_seconds)
+        interval = max(10, self.config.runtime.poll_interval_seconds)
+        next_tick = time.monotonic()
+        while not self.stop_event.is_set():
+            now = time.monotonic()
+            if now >= deadline:
+                return
+            if now >= next_tick:
+                next_tick = now + interval
+                try:
+                    self._refresh_live_quotes()
+                except Exception as exc:  # noqa: BLE001 轻量刷新失败不影响主流程
+                    self.log.debug("轻量行情刷新失败（忽略，下次再试）: %s", exc)
+            self.stop_event.wait(min(interval, max(0.1, deadline - now)))
+
+    def _refresh_live_quotes(self) -> None:
+        """拉取持仓/选中标的实时价格，更新 health.json 实时字段并追加实时权益点。
+
+        只写 equity/quote_free/quotes/live_updated_at，保留周期报告其余字段；
+        任一步失败都放弃本次刷新，绝不让实时数据覆盖或破坏周期报告。
+        """
+        state = self.store.state
+        health_path = self.state_dir / self.config.runtime.health_file
+        targets: List[str] = []
+        for sym in state.positions:
+            if sym not in targets:
+                targets.append(sym)
+        for sym in (state.daily_selected_symbols or [])[:5]:
+            if sym not in targets:
+                targets.append(sym)
+        if not targets:
+            return
+        health: Dict[str, Any] = {}
+        try:
+            if health_path.exists():
+                health = json.loads(health_path.read_text(encoding="utf-8"))
+        except Exception:
+            return  # health 不可读则不动，避免覆盖周期报告
+        if not isinstance(health, dict):
+            return
+        try:
+            tickers = self.gateway.client.fetch_tickers(targets)
+            prices: Dict[str, float] = {}
+            changes: Dict[str, float] = {}
+            for sym, ticker in (tickers or {}).items():
+                price = finite(ticker.get("last") or ticker.get("close"))
+                if price > 0:
+                    prices[str(sym)] = price
+                    pct = finite(ticker.get("percentage"))
+                    if -100 <= pct <= 1000:
+                        changes[str(sym)] = pct
+            if not prices:
+                return
+            snap = self.gateway.account_snapshot(prices)
+        except Exception as exc:
+            self.log.warning("实时行情刷新失败: %s", exc)
+            return
+        health["equity"] = round(snap.equity, 6)
+        health["quote_free"] = round(snap.quote_free, 6)
+        health["quotes"] = {
+            sym: {
+                "price": round(pos.price, 10),
+                "value": round(pos.quote_value, 6),
+                "change_pct": round(changes.get(sym, 0.0), 4),
+            }
+            for sym, pos in snap.positions.items()
+        }
+        health["live_updated_at"] = iso_now()
+        try:
+            atomic_write_json(health_path, health, mode=0o644)
+            append_jsonl(self.state_dir / "equity.jsonl", {
+                "ts": iso_now(),
+                "equity": round(snap.equity, 6),
+                "live": True,
+            })
+        except Exception as exc:
+            self.log.warning("实时行情写入失败: %s", exc)
 
 
 # =============================================================================
@@ -4138,9 +4237,15 @@ def cmd_stats(state_dir: Path, health_file: str) -> int:
     """汇总权益曲线与成交审计（只读，供运维与回测观察）。"""
     equity_rows = _read_jsonl(state_dir / "equity.jsonl")
     audit_rows = _read_jsonl(state_dir / "orders.audit.jsonl")
-    summary: Dict[str, Any] = {"cycles": len(equity_rows)}
-    if equity_rows:
-        first, last = equity_rows[0], equity_rows[-1]
+    # 8.6.3 起 equity.jsonl 含周期点与实时点（live=true），
+    # 统计语义保持"周期级"：收益/回撤只看周期点。
+    cycle_rows = [row for row in equity_rows if not row.get("live")]
+    summary: Dict[str, Any] = {"cycles": len(cycle_rows)}
+    live_count = len(equity_rows) - len(cycle_rows)
+    if live_count:
+        summary["live_quote_points"] = live_count
+    if cycle_rows:
+        first, last = cycle_rows[0], cycle_rows[-1]
         summary["period"] = {"first": first.get("ts"), "last": last.get("ts")}
         eq_first = first.get("equity")
         eq_last = last.get("equity")
@@ -4149,7 +4254,7 @@ def cmd_stats(state_dir: Path, health_file: str) -> int:
             summary["return_pct"] = round((eq_last / eq_first - 1) * 100, 4)
         peak = float("-inf")
         max_dd = 0.0
-        for row in equity_rows:
+        for row in cycle_rows:
             eq = row.get("equity")
             if not isinstance(eq, (int, float)) or eq <= 0:
                 continue
