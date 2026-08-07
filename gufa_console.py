@@ -46,7 +46,8 @@ _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # 允许通过 Web 修改的非敏感配置字段（白名单，防越权写任意字段）
 _ALLOWED_CONFIG: Dict[str, List[str]] = {
     "exchange": ["id", "sandbox", "market_type", "timeout_ms", "max_retries",
-                 "retry_base_seconds", "recv_window_ms", "client_order_id_param", "proxy_url"],
+                 "retry_base_seconds", "recv_window_ms", "client_order_id_param",
+                 "proxy_url", "proxy_list"],
     "runtime": ["symbols", "quote_currency", "timeframe", "ohlcv_limit",
                 "poll_interval_seconds", "closed_candle_only", "max_candle_lag_seconds",
                 "log_level", "log_max_bytes", "log_backup_count", "webhook_url"],
@@ -487,6 +488,7 @@ class ConsoleServer(ThreadingHTTPServer):
                 "sandbox": cfg.exchange.sandbox,
                 "market_type": cfg.exchange.market_type,
                 "proxy_url": cfg.exchange.proxy_url,
+                "proxy_list": list(cfg.exchange.proxy_list),
                 "proxy_set": bool(cfg.exchange.proxy_url),
             }
             payload["ai"] = {
@@ -1117,7 +1119,8 @@ input[type=checkbox]{width:auto}
     <div class="form-row"><label>API Key</label><input id="f_ex_key" autocomplete="off" placeholder="留空则保留已保存值"></div>
     <div class="form-row"><label>API Secret</label><input id="f_ex_secret" type="password" autocomplete="off" placeholder="留空则保留已保存值"></div>
     <div class="form-row"><label>Passphrase（OKX 需要）</label><input id="f_ex_pass" type="password" autocomplete="off" placeholder="留空则保留已保存值"></div>
-    <div class="form-row"><label>代理 proxy_url（国内访问 OKX 需要，如 http://127.0.0.1:7890）</label><input id="f_proxy" placeholder="http://127.0.0.1:7890，不需要可留空"></div>
+    <div class="form-row"><label>代理 proxy_url（首选，国内访问 OKX 需要，如 http://127.0.0.1:7890）</label><input id="f_proxy" placeholder="http://127.0.0.1:7890，不需要可留空"></div>
+    <div class="form-row"><label>代理池 proxy_list（自动切换：逗号分隔多个代理，当前失效自动换下一个）</label><input id="f_proxy_list" placeholder="http://127.0.0.1:7890,http://127.0.0.1:7891,http://127.0.0.1:7892"></div>
     <button class="primary" onclick="saveStep1()">保存交易所设置</button>
   </div>
 
@@ -1293,6 +1296,7 @@ function loadConfig(){
     document.getElementById('f_sandbox').checked = c.exchange.sandbox;
     document.getElementById('f_ex_id').value = c.exchange.id;
     document.getElementById('f_proxy').value = c.exchange.proxy_url;
+    document.getElementById('f_proxy_list').value = (c.exchange.proxy_list||[]).join(',');
     document.getElementById('f_ai_enabled').checked = c.ai.enabled;
     document.getElementById('f_ai_split').checked = !!c.ai.split_readings;
     document.getElementById('f_ai_effort').value = c.ai.reasoning_effort||'';
@@ -1344,7 +1348,7 @@ function saveStep1(){
   const cred={}; if(document.getElementById('f_ex_key').value.trim()) cred.exchange_api_key=document.getElementById('f_ex_key').value.trim();
   if(document.getElementById('f_ex_secret').value.trim()) cred.exchange_secret=document.getElementById('f_ex_secret').value.trim();
   if(document.getElementById('f_ex_pass').value.trim()) cred.exchange_passphrase=document.getElementById('f_ex_pass').value.trim();
-  const cfg={exchange:{id:document.getElementById('f_ex_id').value.trim()||'okx', sandbox:document.getElementById('f_sandbox').checked, proxy_url:document.getElementById('f_proxy').value.trim()}};
+  const cfg={exchange:{id:document.getElementById('f_ex_id').value.trim()||'okx', sandbox:document.getElementById('f_sandbox').checked, proxy_url:document.getElementById('f_proxy').value.trim(), proxy_list:document.getElementById('f_proxy_list').value.split(',').map(s=>s.trim()).filter(Boolean)}};
   Promise.all([
     api('/api/config',{method:'POST',body:JSON.stringify(cfg)}),
     Object.keys(cred).length?api('/api/credentials',{method:'POST',body:JSON.stringify(cred)}):Promise.resolve({ok:true})

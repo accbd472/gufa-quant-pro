@@ -508,7 +508,8 @@ class ExchangeConfig:
     retry_base_seconds: float = 1.0
     recv_window_ms: int = 10000
     client_order_id_param: str = "clientOrderId"
-    proxy_url: str = ""  # 可选：仅本应用请求使用的代理（ccxt proxies），如 http://127.0.0.1:7890；留空不走代理
+    proxy_url: str = ""  # 首选代理：仅本应用请求使用的代理（ccxt proxies），如 http://127.0.0.1:7890；留空不走代理
+    proxy_list: Tuple[str, ...] = ()  # 代理池（自动切换）：JSON 数组或逗号分隔字符串；当前代理失效时自动轮换到下一个可用代理
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ExchangeConfig":
@@ -526,9 +527,29 @@ class ExchangeConfig:
             "recv_window_ms": require_json_int,
             "client_order_id_param": require_json_string,
             "proxy_url": require_json_string,
+            "proxy_list": cls._parse_proxy_list,
         }
         values = {key: parsers[key](value, f"exchange.{key}") for key, value in data.items()}
         return cls(**values)
+
+    @staticmethod
+    def _parse_proxy_list(value: Any, path: str) -> Tuple[str, ...]:
+        """代理池：接受 JSON 数组或逗号分隔字符串；去重保序。"""
+        if isinstance(value, str):
+            items = [item.strip() for item in value.split(",") if item.strip()]
+        else:
+            items = [require_json_string(item, path) for item in require_json_array(value, path)]
+        return tuple(dict.fromkeys(items))
+
+    def effective_proxies(self) -> Tuple[str, ...]:
+        """当前生效的代理池：proxy_url 优先，proxy_list 追加去重。"""
+        items: List[str] = []
+        if self.proxy_url:
+            items.append(self.proxy_url)
+        for proxy in self.proxy_list:
+            if proxy and proxy not in items:
+                items.append(proxy)
+        return tuple(items)
 
     def validate(self) -> None:
         self.id = self.id.strip().lower()
@@ -548,6 +569,18 @@ class ExchangeConfig:
             self.proxy_url.startswith("http://") or self.proxy_url.startswith("https://")
         ):
             raise ConfigError("exchange.proxy_url 必须以 http:// 或 https:// 开头（如 http://127.0.0.1:7890）")
+        cleaned: List[str] = []
+        for proxy in self.proxy_list:
+            proxy = proxy.strip()
+            if not proxy:
+                continue
+            if not (proxy.startswith("http://") or proxy.startswith("https://")):
+                raise ConfigError(
+                    f"exchange.proxy_list 中的代理必须以 http:// 或 https:// 开头: {proxy!r}"
+                )
+            if proxy not in cleaned:
+                cleaned.append(proxy)
+        self.proxy_list = tuple(cleaned)
 
 
 @dataclass
@@ -1571,6 +1604,11 @@ class ExchangeGateway:
         self.credentials = credentials
         self.client: Any = None
         self.markets: Dict[str, Any] = {}
+        # 多代理自动切换：代理池 + 当前索引 + 冷却期（网络错误后暂时跳过，避免反复打坏代理）
+        self._proxies: Tuple[str, ...] = config.exchange.effective_proxies()
+        self._proxy_index: int = 0
+        self._proxy_cooldown: Dict[str, float] = {}
+        self._proxy_switches: int = 0
         self._connect()
 
     def _connect(self) -> None:
@@ -1611,10 +1649,93 @@ class ExchangeGateway:
             if not hasattr(self.client, "set_sandbox_mode"):
                 raise ConfigError(f"{exchange_id} 的 CCXT 适配器不支持 set_sandbox_mode")
             self.client.set_sandbox_mode(True)
-        self.markets = self._safe_call("load_markets", self.client.load_markets)
+        self.markets = self._safe_call("load_markets", lambda: self.client.load_markets())
         self._validate_markets()
         mode = "EXCHANGE-SANDBOX" if self.exchange_cfg.sandbox else "EXCHANGE-PRODUCTION"
         self.log.warning("交易所已连接: %s | mode=%s | market=spot", exchange_id.upper(), mode)
+
+    def _current_proxy(self) -> str:
+        """当前生效代理（空串 = 直连）。"""
+        if not self._proxies:
+            return ""
+        return self._proxies[self._proxy_index % len(self._proxies)]
+
+    def _build_client(self, proxy_url: str) -> Any:
+        """按指定代理构建 ccxt 客户端（不含 load_markets，供初始连接与代理切换共用）。"""
+        exchange_id = self.exchange_cfg.id
+        if not hasattr(ccxt, exchange_id):
+            raise ConfigError(f"CCXT 不支持交易所: {exchange_id}")
+        exchange_class = getattr(ccxt, exchange_id)
+        params: Dict[str, Any] = {
+            "enableRateLimit": True,
+            "timeout": self.exchange_cfg.timeout_ms,
+            "options": {
+                "defaultType": "spot",
+                "adjustForTimeDifference": True,
+                "recvWindow": self.exchange_cfg.recv_window_ms,
+            },
+        }
+        if proxy_url:
+            # 仅本应用请求走代理，不影响系统/其他进程网络（ccxt 原生 proxies 支持）
+            params["proxies"] = {"http": proxy_url, "https": proxy_url}
+        api_key = secret_from_env(
+            self.exchange_cfg.api_key_env, required=True,
+            credentials=self.credentials, purpose="交易所 API",
+        )
+        secret = secret_from_env(
+            self.exchange_cfg.secret_env, required=True,
+            credentials=self.credentials, purpose="交易所 API",
+        )
+        password = secret_from_env(
+            self.exchange_cfg.password_env, required=False,
+            credentials=self.credentials, purpose="交易所 API",
+        )
+        params["apiKey"] = api_key
+        params["secret"] = secret
+        if password:
+            params["password"] = password
+        client = exchange_class(params)
+        if self.exchange_cfg.sandbox:
+            if not hasattr(client, "set_sandbox_mode"):
+                raise ConfigError(f"{exchange_id} 的 CCXT 适配器不支持 set_sandbox_mode")
+            client.set_sandbox_mode(True)
+        return client
+
+    def _try_switch_proxy(self, name: str, exc: BaseException) -> bool:
+        """网络错误后自动切换代理：当前代理进冷却，轮换到下一个可用代理重建客户端。
+
+        返回 True 表示已切换到可用代理（调用方应继续重试）；False 表示无可用代理。
+        只在读取/行情路径调用（_safe_call）；下单路径不走 _safe_call，天然不会中途切代理。
+        """
+        if len(getattr(self, "_proxies", ()) or ()) <= 1:
+            return False
+        now = time.time()
+        current = self._current_proxy()
+        if current:
+            self._proxy_cooldown[current] = now + 300.0  # 冷却 5 分钟，避免反复打坏同一代理
+            self.log.warning("代理 %s 不可用（%s），尝试自动切换", current, str(exc)[:160])
+        retry_types = self._network_error_types()
+        for _ in range(len(self._proxies)):
+            self._proxy_index = (self._proxy_index + 1) % len(self._proxies)
+            candidate = self._current_proxy()
+            if candidate and self._proxy_cooldown.get(candidate, 0.0) > now:
+                continue  # 该代理仍在冷却期，跳过
+            try:
+                self.client = self._build_client(candidate)
+                self.markets = self.client.load_markets()
+                self._validate_markets()
+                self._proxy_switches += 1
+                via = f" -> {candidate}" if candidate else " -> 直连"
+                self.log.warning("已自动切换代理%s（累计 %d 次），继续 %s", via, self._proxy_switches, name)
+                return True
+            except retry_types as switch_exc:
+                if candidate:
+                    self._proxy_cooldown[candidate] = now + 300.0
+                self.log.warning("代理 %s 也不可用（%s），继续轮换", candidate or "直连", str(switch_exc)[:120])
+                continue
+            except Exception:
+                return False  # 配置/逻辑错误不属网络问题，不再轮换
+        return False
 
     def _validate_markets(self) -> None:
         for symbol in self.runtime.symbols:
@@ -1650,18 +1771,28 @@ class ExchangeGateway:
     def _safe_call(self, name: str, function: Callable[[], Any]) -> Any:
         retry_types = self._network_error_types()
         attempts = self.exchange_cfg.max_retries + 1
-        for attempt in range(attempts):
-            try:
-                return function()
-            except retry_types as exc:
-                if attempt >= attempts - 1:
+        # 每个代理至多重试一轮；多代理时一轮耗尽自动切换下一个可用代理继续
+        proxies = getattr(self, "_proxies", ()) or ()
+        rounds = max(1, len(proxies))
+        last_exc: Optional[BaseException] = None
+        for _ in range(rounds):
+            for attempt in range(attempts):
+                try:
+                    return function()
+                except retry_types as exc:
+                    last_exc = exc
+                    if attempt >= attempts - 1:
+                        break
+                    delay = self.exchange_cfg.retry_base_seconds * (2 ** attempt) + random.random() * 0.4
+                    self.log.warning("%s 网络错误，%.2fs 后重试 (%d/%d): %s", name, delay, attempt + 1, attempts, exc)
+                    time.sleep(delay)
+                except Exception:
                     raise
-                delay = self.exchange_cfg.retry_base_seconds * (2 ** attempt) + random.random() * 0.4
-                self.log.warning("%s 网络错误，%.2fs 后重试 (%d/%d): %s", name, delay, attempt + 1, attempts, exc)
-                time.sleep(delay)
-            except Exception:
-                raise
-        raise RuntimeError(f"unreachable safe_call: {name}")
+            # 当前代理重试耗尽：尝试自动切换代理后继续重试
+            if last_exc is not None and self._try_switch_proxy(name, last_exc):
+                continue
+            raise last_exc if last_exc is not None else RuntimeError(f"unreachable safe_call: {name}")
+        raise last_exc if last_exc is not None else RuntimeError(f"unreachable safe_call: {name}")
 
     def fetch_ohlcv(
         self,
@@ -3917,8 +4048,8 @@ def cmd_export_ohlcv(
         "enableRateLimit": True,
         "timeout": config.exchange.timeout_ms,
         "options": {"defaultType": "spot"},
-        **({"proxies": {"http": config.exchange.proxy_url, "https": config.exchange.proxy_url}}
-           if config.exchange.proxy_url else {}),
+        **({"proxies": {"http": config.exchange.effective_proxies()[0], "https": config.exchange.effective_proxies()[0]}}
+           if config.exchange.effective_proxies() else {}),
     })
     rows: List[List[Any]] = []
     for symbol in symbols:
@@ -4133,8 +4264,8 @@ def cmd_backtest_paipan(
             "enableRateLimit": True,
             "timeout": config.exchange.timeout_ms,
             "options": {"defaultType": "spot"},
-            **({"proxies": {"http": config.exchange.proxy_url, "https": config.exchange.proxy_url}}
-               if config.exchange.proxy_url else {}),
+            **({"proxies": {"http": config.exchange.effective_proxies()[0], "https": config.exchange.effective_proxies()[0]}}
+               if config.exchange.effective_proxies() else {}),
         })
         limit = min(bars, 300)  # OKX 单次日线上限 300
         for symbol in symbols:

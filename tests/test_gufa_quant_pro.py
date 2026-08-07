@@ -118,6 +118,119 @@ def test_exchange_proxy_url_wired_to_ccxt(tmp_path: Path, monkeypatch) -> None:
     assert captured["sandbox"] is True
 
 
+def test_exchange_proxy_list_parsing_and_merge(tmp_path: Path) -> None:
+    """proxy_list 支持逗号分隔/数组，去重保序；effective_proxies 合并 proxy_url 优先。"""
+    cfg = load_default(
+        tmp_path,
+        lambda p: p["exchange"].__setitem__(
+            "proxy_list", "http://127.0.0.1:7891, http://127.0.0.1:7892,http://127.0.0.1:7891"
+        ),
+    )
+    assert cfg.exchange.proxy_list == (
+        "http://127.0.0.1:7891", "http://127.0.0.1:7892",
+    )
+    # 数组形式
+    cfg2 = load_default(
+        tmp_path,
+        lambda p: p["exchange"].__setitem__(
+            "proxy_list", ["http://127.0.0.1:7891", "http://127.0.0.1:7892"]
+        ),
+    )
+    assert cfg2.exchange.proxy_list == ("http://127.0.0.1:7891", "http://127.0.0.1:7892")
+    # 非法格式报错
+    with pytest.raises(g.ConfigError, match="proxy_list"):
+        load_default(
+            tmp_path,
+            lambda p: p["exchange"].__setitem__("proxy_list", "socks5://127.0.0.1:1080"),
+        )
+    # effective_proxies：proxy_url 优先 + proxy_list 去重追加
+    cfg3 = load_default(
+        tmp_path,
+        lambda p: (
+            p["exchange"].__setitem__("proxy_url", "http://127.0.0.1:7890"),
+            p["exchange"].__setitem__("proxy_list", ["http://127.0.0.1:7890", "http://127.0.0.1:7891"]),
+        ),
+    )
+    assert cfg3.exchange.effective_proxies() == (
+        "http://127.0.0.1:7890", "http://127.0.0.1:7891",
+    )
+
+
+def test_gateway_proxy_auto_switch_on_network_error(monkeypatch) -> None:
+    """多代理时：当前代理网络错误重试耗尽后自动切换下一个可用代理，并继续成功。"""
+    import ccxt as ccxt_mod
+
+    gw = object.__new__(g.ExchangeGateway)
+    gw.exchange_cfg = SimpleNamespace(
+        id="okx", timeout_ms=15000, max_retries=1, retry_base_seconds=0.01,
+        sandbox=True, api_key_env="K", secret_env="S", password_env="P",
+    )
+    gw.risk = None
+    gw.runtime = SimpleNamespace(symbols=["BTC/USDT"])
+    gw.state_store = None
+    gw.log = logging.getLogger("test.proxy.switch")
+    gw._proxies = ("http://127.0.0.1:1", "http://127.0.0.1:2")
+    gw._proxy_index = 0
+    gw._proxy_cooldown = {}
+    gw._proxy_switches = 0
+    gw.markets = {}
+    gw.credentials = None
+
+    class FakeClient:
+        def __init__(self, proxy: str) -> None:
+            self.proxy = proxy
+
+        def load_markets(self) -> dict:
+            if self.proxy == "http://127.0.0.1:1":
+                raise ccxt_mod.NetworkError("bad proxy")
+            return {"BTC/USDT": {"spot": True, "active": True, "quote": "USDT"}}
+
+    gw._build_client = lambda proxy: FakeClient(proxy)  # type: ignore[method-assign]
+    gw._validate_markets = lambda: None  # type: ignore[method-assign]
+    gw.client = gw._build_client("http://127.0.0.1:1")
+
+    result = gw._safe_call("probe", lambda: gw.client.load_markets())
+    assert result["BTC/USDT"]["spot"] is True
+    assert gw._proxy_switches == 1
+    assert gw._current_proxy() == "http://127.0.0.1:2"
+    # 坏代理已进冷却
+    assert gw._proxy_cooldown.get("http://127.0.0.1:1", 0.0) > 0.0
+
+
+def test_gateway_proxy_all_fail_raises(monkeypatch) -> None:
+    """所有代理都失败时抛最后一个网络错误，不做无意义轮换。"""
+    import ccxt as ccxt_mod
+
+    gw = object.__new__(g.ExchangeGateway)
+    gw.exchange_cfg = SimpleNamespace(
+        id="okx", timeout_ms=15000, max_retries=1, retry_base_seconds=0.01,
+        sandbox=True, api_key_env="K", secret_env="S", password_env="P",
+    )
+    gw.risk = None
+    gw.runtime = SimpleNamespace(symbols=["BTC/USDT"])
+    gw.state_store = None
+    gw.log = logging.getLogger("test.proxy.allfail")
+    gw._proxies = ("http://127.0.0.1:1", "http://127.0.0.1:2")
+    gw._proxy_index = 0
+    gw._proxy_cooldown = {}
+    gw._proxy_switches = 0
+    gw.markets = {}
+    gw.credentials = None
+
+    class FakeClient:
+        def load_markets(self) -> dict:
+            raise ccxt_mod.NetworkError("all down")
+
+    gw._build_client = lambda proxy: FakeClient()  # type: ignore[method-assign]
+    gw._validate_markets = lambda: None  # type: ignore[method-assign]
+    gw.client = FakeClient()
+
+    with pytest.raises(ccxt_mod.NetworkError):
+        gw._safe_call("probe", lambda: gw.client.load_markets())
+    # 两个代理都试过并冷却
+    assert set(gw._proxy_cooldown.keys()) == {"http://127.0.0.1:1", "http://127.0.0.1:2"}
+
+
 def test_config_json_tolerates_utf8_bom(tmp_path: Path) -> None:
     payload = g.default_config_dict()
     payload["runtime"]["state_dir"] = str(tmp_path / "runtime")
