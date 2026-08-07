@@ -286,7 +286,7 @@ function drawRadar(){
 }
 
 /* ---------- 渲染 ---------- */
-function setLed(id, cls, txt){ const l=$(id); l.className="led "+(cls||""); $(id.replace("led","")+"Txt").textContent=txt; }
+function setLed(id, cls, txt){ const l=$(id); if(!l) return; l.className="led "+(cls||""); const t=$(id.slice(3).toLowerCase()+"Txt"); if(t) t.textContent=txt; }
 
 function render(d){
   // 状态灯
