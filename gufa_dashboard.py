@@ -1,0 +1,631 @@
+# -*- coding: utf-8 -*-
+"""
+GuFaQuant-Pro 科幻实时监控大屏（独立服务，端口 8601）
+====================================================
+- 读取 runtime/ 下 state.json / health.json / equity.jsonl / orders.audit.jsonl / gufa_quant.jsonl
+- SSE 实时推送，前端暗黑霓虹科幻风，无任何外部 CDN 依赖（离线可用）
+- 用法: python gufa_dashboard.py --config config.json [--port 8601] [--host 127.0.0.1]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+APP_NAME = "GuFaQuant-DASHBOARD"
+POLL_INTERVAL = 2.0          # SSE 推送间隔（秒）
+EQUITY_MAX_POINTS = 720      # 权益曲线最大点数（2s 采样 → 24h）
+LOG_TAIL = 120               # 日志尾部行数
+
+HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GUFA QUANT PROTOCOL // 实时监控</title>
+<style>
+  :root {
+    --cy: #00f0ff; --pu: #a855f7; --gr: #34ffb0; --rd: #ff3b6b; --am: #ffd166;
+    --bg: #05070f; --panel: rgba(10, 18, 34, .72); --line: rgba(0, 240, 255, .25);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 700px at 75% -10%, rgba(168, 85, 247, .14), transparent 60%),
+      radial-gradient(900px 600px at 10% 110%, rgba(0, 240, 255, .10), transparent 60%),
+      var(--bg);
+    color: #d7e6ff; font-family: "Consolas", "JetBrains Mono", "Microsoft YaHei", monospace;
+    overflow: hidden;
+  }
+  /* 网格 */
+  .grid { position: fixed; inset: 0; pointer-events: none; opacity: .55;
+    background-image:
+      linear-gradient(rgba(0,240,255,.05) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,240,255,.05) 1px, transparent 1px);
+    background-size: 42px 42px; z-index: 0; }
+  /* 扫描线 */
+  .scan { position: fixed; left: 0; right: 0; height: 140px; z-index: 1; pointer-events: none;
+    background: linear-gradient(180deg, transparent, rgba(0,240,255,.05), transparent);
+    animation: scan 7s linear infinite; }
+  @keyframes scan { 0% { top: -160px; } 100% { top: 110%; } }
+  /* 粒子 */
+  #stars { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+  #app { position: relative; z-index: 2; height: 100vh; display: flex; flex-direction: column; padding: 14px 18px 10px; gap: 10px; }
+
+  /* ---------- 顶栏 ---------- */
+  header { display: flex; align-items: center; gap: 16px; padding: 8px 16px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 0 24px rgba(0,240,255,.08) inset, 0 0 18px rgba(0,240,255,.06); }
+  .logo { font-size: 20px; font-weight: 700; letter-spacing: 3px; color: var(--cy);
+    text-shadow: 0 0 12px rgba(0,240,255,.8); white-space: nowrap; }
+  .logo small { font-size: 11px; color: var(--pu); letter-spacing: 2px; display: block; margin-top: 2px;
+    text-shadow: 0 0 8px rgba(168,85,247,.8); }
+  .st { display: flex; align-items: center; gap: 8px; font-size: 12px; letter-spacing: 1px; }
+  .led { width: 10px; height: 10px; border-radius: 50%; background: var(--am);
+    box-shadow: 0 0 10px var(--am); animation: pulse 1.6s infinite; }
+  .led.ok { background: var(--gr); box-shadow: 0 0 12px var(--gr); }
+  .led.bad { background: var(--rd); box-shadow: 0 0 12px var(--rd); animation: pulse .6s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .sp { flex: 1; }
+  .clock { font-size: 14px; color: var(--cy); letter-spacing: 2px; text-shadow: 0 0 8px rgba(0,240,255,.6); }
+  .tag { font-size: 11px; padding: 3px 9px; border-radius: 20px; border: 1px solid var(--line); color: var(--am); }
+  .tag.sb { color: var(--pu); border-color: rgba(168,85,247,.5); }
+
+  /* ---------- 布局 ---------- */
+  main { flex: 1; display: grid; grid-template-columns: 1.55fr 1fr; grid-template-rows: 1.15fr .85fr 1fr; gap: 10px; min-height: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    display: flex; flex-direction: column; min-height: 0; position: relative; overflow: hidden;
+    backdrop-filter: blur(6px); }
+  .card::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--cy), transparent); opacity: .6; }
+  .card h3 { font-size: 11px; letter-spacing: 2px; color: var(--pu); margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .card h3::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, var(--line), transparent); }
+  .chart { flex: 1; min-height: 0; }
+  canvas { width: 100%; height: 100%; display: block; }
+
+  /* ---------- 指标卡 ---------- */
+  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .m { text-align: center; padding: 6px 4px; border: 1px solid var(--line); border-radius: 8px;
+    background: rgba(0, 20, 40, .4); }
+  .m .v { font-size: 19px; color: var(--cy); text-shadow: 0 0 10px rgba(0,240,255,.5); letter-spacing: 1px; }
+  .m .l { font-size: 10px; color: #8fb4d8; margin-top: 3px; letter-spacing: 1px; }
+  .m .v.green { color: var(--gr); text-shadow: 0 0 10px rgba(52,255,176,.5); }
+  .m .v.red { color: var(--rd); text-shadow: 0 0 10px rgba(255,59,107,.5); }
+  .m .v.amber { color: var(--am); }
+
+  /* ---------- 选股分数条 ---------- */
+  .picks { flex: 1; display: flex; flex-direction: column; gap: 7px; overflow-y: auto; }
+  .pick { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+  .pick .sym { width: 92px; color: var(--cy); letter-spacing: 1px; white-space: nowrap; }
+  .pick .bar { flex: 1; height: 12px; background: rgba(0,240,255,.08); border: 1px solid rgba(0,240,255,.2); border-radius: 4px; position: relative; overflow: hidden; }
+  .pick .fill { height: 100%; background: linear-gradient(90deg, rgba(0,240,255,.25), var(--cy));
+    box-shadow: 0 0 8px rgba(0,240,255,.6); transition: width .8s ease; }
+  .pick .sc { width: 46px; text-align: right; color: var(--gr); }
+  .pick .st2 { width: 64px; text-align: right; font-size: 10px; color: #8fb4d8; }
+  .dead { color: var(--rd); font-size: 11px; opacity: .85; }
+  .dead b { color: var(--rd); }
+
+  /* ---------- 日志 ---------- */
+  .logbox { flex: 1; overflow-y: auto; font-size: 11px; line-height: 1.55; }
+  .logbox .t { color: #5f7fa0; }
+  .logbox .WARNING { color: var(--am); }
+  .logbox .ERROR { color: var(--rd); }
+  .logbox .INFO { color: #9fd0ff; }
+  .logbox .BUY { color: var(--gr); font-weight: 700; }
+  .logbox .SELL { color: var(--rd); font-weight: 700; }
+
+  /* ---------- 决策灯 ---------- */
+  .verdicts { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
+  .verdict { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .verdict .sym { width: 88px; color: var(--cy); }
+  .vbadge { padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+  .vbadge.BUY { background: rgba(52,255,176,.12); color: var(--gr); border: 1px solid rgba(52,255,176,.5); }
+  .vbadge.SELL { background: rgba(255,59,107,.12); color: var(--rd); border: 1px solid rgba(255,59,107,.5); }
+  .vbadge.HOLD { background: rgba(255,209,102,.10); color: var(--am); border: 1px solid rgba(255,209,102,.4); }
+  .verdict .cf { flex: 1; font-size: 10px; color: #8fb4d8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .verdict .cn { font-size: 11px; color: var(--pu); }
+
+  .empty { color: #4a6a8a; font-size: 12px; text-align: center; padding: 12px 0; }
+  footer { font-size: 10px; color: #3d5a78; text-align: center; letter-spacing: 2px; }
+  ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-thumb { background: rgba(0,240,255,.25); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="grid"></div><div class="scan"></div><canvas id="stars"></canvas>
+<div id="app">
+  <header>
+    <div class="logo">GUFA QUANT <small>PROTOCOL // 古法量化决策中枢</small></div>
+    <div class="st">SYSTEM <span class="led" id="ledSys"></span><span id="sysTxt">BOOT</span></div>
+    <div class="st">NET <span class="led" id="ledNet"></span><span id="netTxt">--</span></div>
+    <div class="st">AI <span class="led" id="ledAI"></span><span id="aiTxt">--</span></div>
+    <div class="sp"></div>
+    <span class="tag" id="tagMode">--</span>
+    <span class="tag sb" id="tagSandbox">--</span>
+    <div class="clock" id="clock">--:--:--</div>
+  </header>
+
+  <main>
+    <!-- 左上：权益曲线 -->
+    <div class="card" style="grid-column:1; grid-row:1">
+      <h3>EQUITY // 权益曲线</h3>
+      <div class="chart"><canvas id="eqChart"></canvas></div>
+    </div>
+    <!-- 右上：指标 -->
+    <div class="card" style="grid-column:2; grid-row:1">
+      <h3>TELEMETRY // 遥测</h3>
+      <div class="metrics">
+        <div class="m"><div class="v" id="mEquity">--</div><div class="l">权益 USDT</div></div>
+        <div class="m"><div class="v green" id="mPeak">--</div><div class="l">峰值 USDT</div></div>
+        <div class="m"><div class="v amber" id="mTrades">--</div><div class="l">今日成交</div></div>
+        <div class="m"><div class="v" id="mCycle">--</div><div class="l">周期 s</div></div>
+      </div>
+      <div class="metrics" style="margin-top:8px">
+        <div class="m"><div class="v green" id="mFills">--</div><div class="l">持仓数</div></div>
+        <div class="m"><div class="v" id="mReview">--</div><div class="l">下次复查</div></div>
+        <div class="m"><div class="v" id="mCand">--</div><div class="l">候选池</div></div>
+        <div class="m"><div class="v" id="mDayStart">--</div><div class="l">日初权益</div></div>
+      </div>
+      <div style="flex:1"></div>
+      <!-- 雷达图：十项古法 -->
+      <h3 style="margin-top:6px">ANCIENT METHODS // 十项古法信号</h3>
+      <div class="chart" style="height:46%"><canvas id="radar"></canvas></div>
+    </div>
+    <!-- 左下：选股 -->
+    <div class="card" style="grid-column:1; grid-row:2">
+      <h3>SELECTION // 每日古法初选 <span style="color:#5f7fa0;font-size:10px" id="selDate"></span></h3>
+      <div class="picks" id="picks"><div class="empty">等待初选数据…</div></div>
+      <h3 style="margin-top:6px">EXCLUDED // 当日剔除</h3>
+      <div class="dead" id="dead" style="font-size:10px; max-height:44px; overflow-y:auto"></div>
+    </div>
+    <!-- 右下：决策 -->
+    <div class="card" style="grid-column:2; grid-row:2">
+      <h3>DECISIONS // AI 聚合决策</h3>
+      <div class="verdicts" id="verdicts"><div class="empty">等待决策…</div></div>
+    </div>
+    <!-- 底部通栏：日志 -->
+    <div class="card" style="grid-column:1 / span 2; grid-row:3">
+      <h3>STREAM // 实时日志</h3>
+      <div class="logbox" id="log"></div>
+    </div>
+  </main>
+  <footer>GUFA QUANT PROTOCOL v1.0 // 数据源: runtime/state+health+equity // SSE 实时推送</footer>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+let eqHist = [], radarNames = [], radarVals = [];
+
+/* ---------- 星空粒子 ---------- */
+(function stars(){
+  const c = $("stars"), ctx = c.getContext("2d");
+  let W, H, pts = [];
+  function resize(){ W = c.width = innerWidth; H = c.height = innerHeight; }
+  function init(){ resize(); pts = Array.from({length: 90}, () => ({x: Math.random()*W, y: Math.random()*H, r: Math.random()*1.3+.3, v: Math.random()*.25+.05})); }
+  function draw(){
+    ctx.clearRect(0,0,W,H);
+    for (const p of pts){
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7);
+      ctx.fillStyle = "rgba(140,220,255,"+(.25+Math.random()*.35)+")"; ctx.fill();
+      p.y -= p.v; if (p.y < -4){ p.y = H+4; p.x = Math.random()*W; }
+    }
+    requestAnimationFrame(draw);
+  }
+  addEventListener("resize", init); init(); draw();
+})();
+
+/* ---------- 权益曲线 ---------- */
+function drawEq(){
+  const c = $("eqChart"), ctx = c.getContext("2d");
+  const W = c.width = c.clientWidth, H = c.height = c.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  // 网格
+  ctx.strokeStyle = "rgba(0,240,255,.08)"; ctx.lineWidth = 1;
+  for (let i=1;i<6;i++){ const y=H*i/6; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+  for (let i=1;i<12;i++){ const x=W*i/12; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+  if (!eqHist.length){ ctx.fillStyle="#4a6a8a"; ctx.font="12px Consolas"; ctx.fillText("NO DATA", W/2-28, H/2); return; }
+  let min=Infinity, max=-Infinity;
+  for (const p of eqHist){ if(p<min)min=p; if(p>max)max=p; }
+  if (max-min < 1e-9){ max+=1; min-=1; }
+  const pad = 8;
+  const X = i => pad + (W-2*pad) * i / Math.max(1, eqHist.length-1);
+  const Y = v => pad + (H-2*pad) * (1 - (v-min)/(max-min));
+  // 面积渐变
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, "rgba(0,240,255,.32)"); g.addColorStop(1, "rgba(0,240,255,0)");
+  ctx.beginPath();
+  eqHist.forEach((v,i)=> i? ctx.lineTo(X(i),Y(v)) : ctx.moveTo(X(i),Y(v)));
+  ctx.lineTo(X(eqHist.length-1), H); ctx.lineTo(X(0), H); ctx.closePath(); ctx.fillStyle = g; ctx.fill();
+  // 线
+  ctx.beginPath();
+  eqHist.forEach((v,i)=> i? ctx.lineTo(X(i),Y(v)) : ctx.moveTo(X(i),Y(v)));
+  ctx.strokeStyle = "#00f0ff"; ctx.lineWidth = 1.6; ctx.shadowColor = "#00f0ff"; ctx.shadowBlur = 8; ctx.stroke();
+  ctx.shadowBlur = 0;
+  // 端点
+  const lx=X(eqHist.length-1), ly=Y(eqHist[eqHist.length-1]);
+  ctx.beginPath(); ctx.arc(lx, ly, 3, 0, 7); ctx.fillStyle = "#fff"; ctx.shadowColor="#00f0ff"; ctx.shadowBlur=12; ctx.fill();
+  ctx.font = "10px Consolas"; ctx.fillStyle = "rgba(0,240,255,.8)";
+  ctx.fillText(max.toFixed(1), 4, 12); ctx.fillText(min.toFixed(1), 4, H-4);
+}
+
+/* ---------- 雷达图 ---------- */
+function drawRadar(){
+  const c = $("radar"), ctx = c.getContext("2d");
+  const W = c.width = c.clientWidth, H = c.height = c.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  const N = radarNames.length, cx = W/2, cy = H/2, R = Math.min(W,H)/2 - 26;
+  if (!N) { ctx.fillStyle="#4a6a8a"; ctx.font="12px Consolas"; ctx.fillText("NO SIGNAL", cx-34, cy); return; }
+  const ang = i => -Math.PI/2 + i*2*Math.PI/N;
+  // 网格环
+  for (let ring=1; ring<=4; ring++){
+    ctx.beginPath();
+    for (let i=0;i<=N;i++){ const a=ang(i%N); const r=R*ring/4; i? ctx.lineTo(cx+r*Math.cos(a), cy+r*Math.sin(a)) : ctx.moveTo(cx+r*Math.cos(a), cy+r*Math.sin(a)); }
+    ctx.strokeStyle = "rgba(0,240,255,.10)"; ctx.stroke();
+  }
+  // 轴线
+  for (let i=0;i<N;i++){ const a=ang(i); ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+R*Math.cos(a), cy+R*Math.sin(a)); ctx.strokeStyle="rgba(0,240,255,.10)"; ctx.stroke(); }
+  // 数值面
+  ctx.beginPath();
+  for (let i=0;i<=N;i++){ const a=ang(i%N); const v=Math.max(0,Math.min(1,radarVals[i%N]||0)); const r=R*v; i? ctx.lineTo(cx+r*Math.cos(a), cy+r*Math.sin(a)) : ctx.moveTo(cx+r*Math.cos(a), cy+r*Math.sin(a)); }
+  ctx.closePath();
+  const g = ctx.createRadialGradient(cx,cy,10,cx,cy,R);
+  g.addColorStop(0,"rgba(168,85,247,.55)"); g.addColorStop(1,"rgba(0,240,255,.15)");
+  ctx.fillStyle = g; ctx.fill();
+  ctx.strokeStyle = "#a855f7"; ctx.lineWidth = 1.4; ctx.shadowColor="#a855f7"; ctx.shadowBlur=10; ctx.stroke(); ctx.shadowBlur=0;
+  // 标签
+  ctx.font = "10px Consolas"; ctx.fillStyle = "#9fd0ff"; ctx.textAlign = "center";
+  for (let i=0;i<N;i++){ const a=ang(i); const tx=cx+(R+14)*Math.cos(a), ty=cy+(R+14)*Math.sin(a);
+    ctx.fillText(radarNames[i], tx, ty+3); }
+}
+
+/* ---------- 渲染 ---------- */
+function setLed(id, cls, txt){ const l=$(id); l.className="led "+(cls||""); $(id.replace("led","")+"Txt").textContent=txt; }
+
+function render(d){
+  // 状态灯
+  setLed("ledSys", d.status==="ok"?"ok":(d.status==="degraded"?"":"bad"), (d.status||"?").toUpperCase());
+  setLed("ledNet", d.net_ok?"ok":"bad", d.net_ok?"LINK":"DOWN");
+  setLed("ledAI", d.ai_ok?"ok":(d.ai_busy?"":"bad"), d.ai_ok?"READY":(d.ai_busy?"BUSY":"DOWN"));
+  $("tagMode").textContent = d.mode||"--";
+  $("tagSandbox").textContent = d.sandbox ? "SANDBOX" : "PRODUCTION";
+  // 遥测
+  if (d.equity!=null){ $("mEquity").textContent = d.equity.toFixed(2); }
+  $("mPeak").textContent = d.peak!=null ? d.peak.toFixed(2) : "--";
+  $("mTrades").textContent = d.trades_today!=null ? d.trades_today : "--";
+  $("mCycle").textContent = d.cycle_seconds!=null ? Math.round(d.cycle_seconds) : "--";
+  $("mFills").textContent = d.fills!=null ? d.fills : "--";
+  $("mReview").textContent = d.next_review_seconds!=null ? (d.next_review_seconds/60).toFixed(0)+"m" : "--";
+  $("mCand").textContent = d.candidates!=null ? d.candidates : "--";
+  $("mDayStart").textContent = d.day_start!=null ? d.day_start.toFixed(2) : "--";
+  // 选股
+  if (d.selection_date) $("selDate").textContent = "// " + d.selection_date;
+  if (d.picks && d.picks.length){
+    const picks = d.picks.map(p=>`<div class="pick"><span class="sym">${p.sym.replace('/USDT','')}</span>
+      <div class="bar"><div class="fill" style="width:${(p.score*100).toFixed(1)}%"></div></div>
+      <span class="sc">${p.score.toFixed(3)}</span><span class="st2">${p.action||''}</span></div>`).join("");
+    $("picks").innerHTML = picks;
+  }
+  $("dead").innerHTML = d.dead && Object.keys(d.dead).length
+    ? Object.entries(d.dead).map(([k,v])=>`<span>✕ ${k.replace('/USDT','')}: ${v}</span>&nbsp;&nbsp;`).join("") : "<span style='color:#4a6a8a'>无剔除</span>";
+  // 决策
+  if (d.verdicts && d.verdicts.length){
+    const vs = d.verdicts.map(v=>`<div class="verdict"><span class="sym">${v.sym.replace('/USDT','')}</span>
+      <span class="vbadge ${v.action}">${v.action}</span>
+      <span class="cn">${v.confidence!=null?v.confidence.toFixed(2):"--"}</span>
+      <span class="cf">${v.conflicts||""}</span></div>`).join("");
+    $("verdicts").innerHTML = vs;
+  } else if (d.verdicts && d.verdicts.length===0) { $("verdicts").innerHTML = '<div class="empty">无持仓/无新决策</div>'; }
+  // 权益曲线
+  if (d.equity_hist) eqHist = d.equity_hist;
+  drawEq();
+  // 雷达
+  if (d.radar){ radarNames = d.radar.names; radarVals = d.radar.values; drawRadar(); }
+  // 日志
+  if (d.logs){ $("log").innerHTML = d.logs; }
+}
+
+/* ---------- 时钟 ---------- */
+setInterval(()=>{ const t=new Date(); const p=n=>String(n).padStart(2,"0");
+  $("clock").textContent = p(t.getHours())+":"+p(t.getMinutes())+":"+p(t.getSeconds()); }, 1000);
+
+/* ---------- 数据流 ---------- */
+fetch("/api/state").then(r=>r.json()).then(render).catch(()=>{});
+const es = new EventSource("/api/stream");
+es.onmessage = e => { try { render(JSON.parse(e.data)); } catch(_){} };
+es.onerror = () => setLed("ledSys", "bad", "LOST");
+</script>
+</body>
+</html>
+"""
+
+
+def _load_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _tail(path: Path, n: int) -> List[str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        return lines[-n:]
+    except Exception:
+        return []
+
+
+class Snapshot:
+    def __init__(self, state_dir: Path):
+        self.state_dir = Path(state_dir)
+        self.state_path = self.state_dir / "state.json"
+        self.health_path = self.state_dir / "health.json"
+        self.equity_path = self.state_dir / "equity.jsonl"
+        self.orders_path = self.state_dir / "orders.audit.jsonl"
+        self.log_path = self.state_dir / "gufa_quant.jsonl"
+        self._log_cache: List[str] = []
+        self._log_size = -1
+        self._equity_cache: List[float] = []
+        self._equity_size = -1
+
+    # ---------- 带缓存的增量读取 ----------
+    def _read_equity(self) -> List[float]:
+        size = self.equity_path.stat().st_size if self.equity_path.exists() else -1
+        if size == self._equity_size and self._equity_cache:
+            return self._equity_cache
+        out: List[float] = []
+        try:
+            for line in self.equity_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    out.append(float(json.loads(line).get("equity", 0.0)))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        out = out[-EQUITY_MAX_POINTS:]
+        self._equity_cache = out
+        self._equity_size = size
+        return out
+
+    def _read_logs_html(self) -> str:
+        size = self.log_path.stat().st_size if self.log_path.exists() else -1
+        if size == self._log_size and self._log_cache:
+            return "".join(self._log_cache)
+        rows: List[str] = []
+        for line in _tail(self.log_path, LOG_TAIL):
+            try:
+                j = json.loads(line)
+                ts = str(j.get("ts", ""))[11:19]
+                lvl = str(j.get("level", ""))
+                msg = str(j.get("message", ""))
+                if len(msg) > 150:
+                    msg = msg[:150] + "…"
+                cls = lvl if lvl in ("INFO", "WARNING", "ERROR") else ""
+                if "BUY" in msg or "买入" in msg: cls = "BUY"
+                if "SELL" in msg or "卖出" in msg: cls = "SELL"
+                rows.append(f'<div><span class="t">[{ts}]</span> <span class="{cls}">{msg}</span></div>')
+            except Exception:
+                continue
+        self._log_cache = rows
+        self._log_size = size
+        return "".join(rows)
+
+    # ---------- 聚合快照 ----------
+    def build(self) -> Dict[str, Any]:
+        state = _load_json(self.state_path) or {}
+        health = _load_json(self.health_path) or {}
+        equity_hist = self._read_equity()
+
+        # 网络状态：按时间戳判断——最新的成功事件(连接/周期完成/启动) vs 最新网络错误
+        net_ok = True
+        last_err_ts: Optional[str] = None
+        last_ok_ts: Optional[str] = None
+        for line in reversed(_tail(self.log_path, 40)):
+            try:
+                j = json.loads(line)
+                ts = str(j.get("ts", ""))
+                msg = str(j.get("message", ""))
+            except Exception:
+                continue
+            if "load_markets 网络错误" in msg or "NetworkError" in msg:
+                if last_err_ts is None:
+                    last_err_ts = ts
+            elif ("交易所已连接" in msg or "周期完成" in msg or "启动" in msg) and last_ok_ts is None:
+                last_ok_ts = ts
+            if last_err_ts is not None and last_ok_ts is not None:
+                break
+        if last_err_ts and last_ok_ts:
+            net_ok = last_ok_ts > last_err_ts
+        elif last_err_ts:
+            net_ok = False
+        ai_ok = True
+        ai_busy = False
+        logs = _tail(self.log_path, 40)
+        for line in reversed(logs):
+            if "AI 拆分聚合决策失败" in line or "AI 十项古法解读失败" in line:
+                ai_ok = False
+                break
+            if "AI 拆分解读" in line and "失败" not in line:
+                ai_busy = True
+                break
+
+        # 选股
+        scores: Dict[str, float] = state.get("daily_selection_scores") or {}
+        picks = []
+        for sym in (state.get("daily_selected_symbols") or [])[:12]:
+            sc = scores.get(sym, 0.0)
+            picks.append({"sym": sym, "score": sc, "action": self._action_for(sc)})
+        picks.sort(key=lambda p: p["score"], reverse=True)
+
+        dead = state.get("daily_selection_dead") or {}
+
+        # 决策（health.decisions: {sym: {ai: {...}}})
+        verdicts = []
+        decisions = health.get("decisions") or {}
+        for sym, info in decisions.items():
+            ai = info.get("ai") or {}
+            verdicts.append({
+                "sym": sym,
+                "action": ai.get("action", "?"),
+                "confidence": ai.get("confidence"),
+                "conflicts": (ai.get("conflicts") or [""])[0] if ai.get("conflicts") else "",
+            })
+        verdicts.sort(key=lambda v: v["sym"])
+
+        # 雷达：取最后一个决策的 readings（十项）
+        radar_names: List[str] = []
+        radar_values: List[float] = []
+        last_readings = None
+        for sym, info in reversed(list(decisions.items())):
+            readings = info.get("readings") or info.get("ai", {}).get("readings")
+            if isinstance(readings, dict) and readings:
+                last_readings = readings
+                break
+        if isinstance(last_readings, dict):
+            for name, rd in list(last_readings.items())[:10]:
+                radar_names.append(str(name))
+                try:
+                    radar_values.append(float(rd.get("confidence", 0.0)))
+                except Exception:
+                    radar_values.append(0.0)
+
+        # 订单审计尾部（最近 3 条）
+        orders = []
+        for line in _tail(self.orders_path, 3):
+            try:
+                o = json.loads(line)
+                plan = o.get("plan") or {}
+                orders.append({
+                    "event": o.get("event", ""),
+                    "sym": plan.get("symbol", ""),
+                    "side": plan.get("side", ""),
+                    "ts": str(o.get("ts", ""))[11:19],
+                })
+            except Exception:
+                continue
+
+        return {
+            "ts": time.time(),
+            "status": health.get("status") or state.get("halted_reason") and "halted" or "unknown",
+            "mode": health.get("mode", ""),
+            "sandbox": health.get("sandbox", True),
+            "equity": health.get("equity"),
+            "peak": state.get("peak_equity"),
+            "day_start": state.get("day_start_equity"),
+            "trades_today": state.get("trades_today"),
+            "cycle_seconds": health.get("cycle_seconds"),
+            "next_review_seconds": health.get("next_review_seconds"),
+            "fills": health.get("fills"),
+            "candidates": len((health.get("daily_selection") or {}).get("candidates") or [])
+                          or len(state.get("daily_selection_candidates") or []),
+            "selection_date": state.get("daily_selection_date"),
+            "picks": picks,
+            "dead": dead,
+            "verdicts": verdicts,
+            "radar": {"names": radar_names, "values": radar_values},
+            "equity_hist": equity_hist,
+            "logs": self._read_logs_html(),
+            "orders": orders,
+            "net_ok": net_ok,
+            "ai_ok": ai_ok,
+            "ai_busy": ai_busy,
+        }
+
+    @staticmethod
+    def _action_for(score: float) -> str:
+        if score >= 0.55:
+            return "FULL"
+        if score >= 0.47:
+            return "HALF"
+        return "WATCH"
+
+
+class Handler(BaseHTTPRequestHandler):
+    snap: Snapshot = None  # type: ignore[assignment]
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            if path in ("/", "/index.html"):
+                self._send(200, HTML.encode("utf-8"), "text/html; charset=utf-8")
+            elif path == "/api/state":
+                self._send(200, json.dumps(self.snap.build()).encode("utf-8"), "application/json; charset=utf-8")
+            elif path == "/api/stream":
+                self._stream()
+            elif path == "/favicon.ico":
+                self._send(204, b"", "image/x-icon")
+            else:
+                self._send(404, b"not found", "text/plain")
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _stream(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        last_sig = ""
+        while True:
+            try:
+                data = self.snap.build()
+                sig = str(data.get("ts", 0))
+                if sig != last_sig or True:
+                    self.wfile.write(("data: " + json.dumps(data, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                    self.wfile.flush()
+                    last_sig = sig
+                time.sleep(POLL_INTERVAL)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception:
+                time.sleep(POLL_INTERVAL)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="GuFaQuant-Pro 科幻实时监控大屏")
+    ap.add_argument("--config", default="config.json", help="config.json 路径")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8601)
+    args = ap.parse_args()
+
+    cfg_path = Path(args.config).expanduser().resolve()
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[{APP_NAME}] 无法读取配置 {cfg_path}: {exc}", file=sys.stderr)
+        return 1
+    state_dir = Path(cfg.get("runtime", {}).get("state_dir") or "runtime").expanduser().resolve()
+    if not state_dir.exists():
+        print(f"[{APP_NAME}] state_dir 不存在: {state_dir}", file=sys.stderr)
+        return 1
+
+    Handler.snap = Snapshot(state_dir)
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"[{APP_NAME}] 科幻监控大屏已启动: http://{args.host}:{args.port}  (数据源: {state_dir})")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print(f"\n[{APP_NAME}] 已停止")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

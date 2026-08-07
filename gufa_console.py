@@ -1075,7 +1075,7 @@ input[type=checkbox]{width:auto}
 <div id="toast"></div>
 
 <h1>🦐 GuFaQuant 控制台</h1>
-<div class="sub" id="sub">连接中…</div>
+<div class="sub" id="sub">连接中… · <a href="http://127.0.0.1:8601" target="_blank" style="color:var(--acc);text-decoration:none;border-bottom:1px dashed var(--acc)">🛸 打开科幻实时大屏 (8601)</a></div>
 
 <div class="badges" id="badges"></div>
 
