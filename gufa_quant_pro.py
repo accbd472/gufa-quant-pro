@@ -2056,6 +2056,12 @@ class ExchangeGateway:
             # 传 marginMode=cross 让 ccxt 走杠杆分支：tdMode=cross 且不再附加 tgtCcy。
             # 实测（2026-08-07 demo）：加此参数下单成功，去掉必现 51000。
             params["marginMode"] = "cross"
+            # 3) cross 模式下 OKX 把市价买单的 sz 默认解释为 quote(USDT) 金额，
+            #    导致"计划买 89.4 AAVE"实际只买 89.4 USDT（成交缩水 ~90 倍）。
+            #    显式声明 tgtCcy=base_ccy，让 sz 按 base(AAVE) 数量解释。
+            #    实测：cross + tgtCcy=base_ccy + sz=2 -> 全额成交 2 AAVE（cost=178.46 USDT）；
+            #          不加 tgtCcy -> 只成交 2 USDT 等值。ccxt 第 261 行 extend 会把该参数透传。
+            params["tgtCcy"] = "base_ccy"
         state = self.state_store.state
         # Write-ahead intent：必须先落盘再发请求。进程若在请求期间崩溃，重启后会停机人工核对，
         # 绝不能把“未收到响应”当作“订单未提交”并自动重试。
