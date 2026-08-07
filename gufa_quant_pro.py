@@ -64,7 +64,7 @@ except ImportError as exc:  # pragma: no cover
     _PAIPAN_IMPORT_ERROR = exc
 
 APP_NAME = "GuFaQuant-Pro"
-APP_VERSION = "8.4.1"
+APP_VERSION = "8.7.0"
 CONFIG_VERSION = 3
 STATE_VERSION = 4
 CREDENTIALS_VERSION = 2
