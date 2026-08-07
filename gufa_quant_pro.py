@@ -2048,6 +2048,14 @@ class ExchangeGateway:
         params: Dict[str, Any] = {}
         if self.exchange_cfg.client_order_id_param:
             params[self.exchange_cfg.client_order_id_param] = client_id
+        if self.exchange_cfg.id == "okx" and self.exchange_cfg.market_type == "spot":
+            # OKX 跨币种保证金账户（acctLv=3，经 GET /api/v5/account/config 实测）只接受
+            # tdMode=cross 的现货单：
+            #   1) ccxt 4.5.71 对现货默认 tdMode=cash -> OKX 拒绝 51000 "Parameter tdMode error"
+            #   2) ccxt 自动附加 tgtCcy=base_ccy 在该账户模式下同样触发 51000
+            # 传 marginMode=cross 让 ccxt 走杠杆分支：tdMode=cross 且不再附加 tgtCcy。
+            # 实测（2026-08-07 demo）：加此参数下单成功，去掉必现 51000。
+            params["marginMode"] = "cross"
         state = self.state_store.state
         # Write-ahead intent：必须先落盘再发请求。进程若在请求期间崩溃，重启后会停机人工核对，
         # 绝不能把“未收到响应”当作“订单未提交”并自动重试。
