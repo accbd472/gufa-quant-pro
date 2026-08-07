@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -71,6 +72,8 @@ HTML = r"""<!DOCTYPE html>
   .led { width: 10px; height: 10px; border-radius: 50%; background: var(--am);
     box-shadow: 0 0 10px var(--am); animation: pulse 1.6s infinite; }
   .led.ok { background: var(--gr); box-shadow: 0 0 12px var(--gr); }
+  .led.warn { background: var(--am); box-shadow: 0 0 12px var(--am); }
+  .led.busy { background: var(--cy); box-shadow: 0 0 12px var(--cy); }
   .led.bad { background: var(--rd); box-shadow: 0 0 12px var(--rd); animation: pulse .6s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
   .sp { flex: 1; }
@@ -132,6 +135,15 @@ HTML = r"""<!DOCTYPE html>
   .verdict .cf { flex: 1; font-size: 10px; color: #8fb4d8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .verdict .cn { font-size: 11px; color: var(--pu); }
 
+  /* ---------- AI 十项解读步骤 ---------- */
+  .aisteps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin-top: 6px; }
+  .aistep { text-align: center; font-size: 10px; padding: 4px 2px; border-radius: 6px;
+    border: 1px solid var(--line); background: rgba(0,20,40,.35); color: #8fb4d8; letter-spacing: 1px; }
+  .aistep.ok { border-color: rgba(52,255,176,.45); color: var(--gr); box-shadow: 0 0 6px rgba(52,255,176,.15); }
+  .aistep.fallback { border-color: rgba(255,209,102,.45); color: var(--am); box-shadow: 0 0 6px rgba(255,209,102,.12); }
+  .aistep.fail { border-color: rgba(255,59,107,.5); color: var(--rd); box-shadow: 0 0 6px rgba(255,59,107,.15); }
+  .aistep .st { font-size: 11px; }
+
   .empty { color: #4a6a8a; font-size: 12px; text-align: center; padding: 12px 0; }
   footer { font-size: 10px; color: #3d5a78; text-align: center; letter-spacing: 2px; }
   ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-thumb { background: rgba(0,240,255,.25); border-radius: 3px; }
@@ -188,6 +200,8 @@ HTML = r"""<!DOCTYPE html>
     <div class="card" style="grid-column:2; grid-row:2">
       <h3>DECISIONS // AI 聚合决策</h3>
       <div class="verdicts" id="verdicts"><div class="empty">等待决策…</div></div>
+      <h3 style="margin-top:6px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
+      <div class="aisteps" id="aisteps"><div class="empty">—</div></div>
     </div>
     <!-- 底部通栏：日志 -->
     <div class="card" style="grid-column:1 / span 2; grid-row:3">
@@ -292,7 +306,9 @@ function render(d){
   // 状态灯
   setLed("ledSys", d.status==="ok"?"ok":(d.status==="degraded"?"":"bad"), (d.status||"?").toUpperCase());
   setLed("ledNet", d.net_ok?"ok":"bad", d.net_ok?"LINK":"DOWN");
-  setLed("ledAI", d.ai_ok?"ok":(d.ai_busy?"":"bad"), d.ai_ok?"READY":(d.ai_busy?"BUSY":"DOWN"));
+  const aiCls = d.ai_status==="ready"?"ok":(d.ai_status==="degraded"?"warn":(d.ai_busy?"busy":"bad"));
+  const aiTxt = d.ai_status==="ready"?"READY":(d.ai_status==="degraded"?"DEGRADED":(d.ai_busy?"BUSY":"DOWN"));
+  setLed("ledAI", aiCls, aiTxt);
   $("tagMode").textContent = d.mode||"--";
   $("tagSandbox").textContent = d.sandbox ? "SANDBOX" : "PRODUCTION";
   // 遥测
@@ -322,6 +338,16 @@ function render(d){
       <span class="cf">${v.conflicts||""}</span></div>`).join("");
     $("verdicts").innerHTML = vs;
   } else if (d.verdicts && d.verdicts.length===0) { $("verdicts").innerHTML = '<div class="empty">无持仓/无新决策</div>'; }
+  // AI 十项解读步骤
+  if (d.ai_steps && d.ai_steps.length){
+    const nOk = d.ai_steps.filter(s=>s.status==="ok").length;
+    const nFb = d.ai_steps.filter(s=>s.status==="fallback").length;
+    $("aiStepSum").textContent = `// ${nOk}✓ ${nFb}⚠ 规则兜底` + (d.ai_agg_failed ? " · 聚合兜底" : "");
+    $("aisteps").innerHTML = d.ai_steps.map(s=>{
+      const mark = s.status==="ok"?"✓":(s.status==="fallback"?"⚠":"✗");
+      return `<div class="aistep ${s.status}"><span class="st">${mark}</span> ${s.name}</div>`;
+    }).join("");
+  }
   // 权益曲线
   if (d.equity_hist) eqHist = d.equity_hist;
   drawEq();
@@ -393,7 +419,70 @@ class Snapshot:
         self._equity_size = size
         return out
 
+    # ---------- AI 步骤解析（最近一个周期内） ----------
+    def _ai_steps_and_status(self, health: Dict[str, Any]) -> Dict[str, Any]:
+        """解析 AI 十项解读的每步状态。
+
+        以「最近周期完成之后」的日志为准（当前周期进行中的 AI 活动），
+        并结合 health.decisions 的 fallback 标志判断最近已完成周期的结果。
+        日志约定：AI 拆分解读只有失败才写日志（成功不打印）。
+        """
+        methods = ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]
+        failed: set[str] = set()
+        agg_failed = False
+        relay_error = False
+        lines = _tail(self.log_path, 200)
+        # 从尾部往前收集最近一个周期内的 AI 失败。
+        # 周期完成/失败日志是边界标记：跳过第一个（最近周期的结尾），
+        # 遇到第二个边界（最近周期的开头）才停止。
+        boundary_seen = 0
+        for line in reversed(lines):
+            try:
+                j = json.loads(line)
+                msg = str(j.get("message", ""))
+                lvl = str(j.get("level", ""))
+            except Exception:
+                continue
+            if "周期完成" in msg or "周期失败" in msg or "运行周期失败" in msg:
+                boundary_seen += 1
+                if boundary_seen >= 2:
+                    break
+                continue
+            if "AI 拆分解读「" in msg and "失败" in msg:
+                m = re.search(r"AI 拆分解读「([^」]+)」失败", msg)
+                if m:
+                    failed.add(m.group(1))
+            elif "AI 拆分聚合决策失败" in msg:
+                agg_failed = True
+            elif "AI 十项古法解读失败" in msg or ("AI 中转站错误" in msg and lvl == "ERROR"):
+                relay_error = True
+
+        # 结合 health.decisions 的 fallback 标志（最近已完成周期的结果）
+        decisions = (health.get("decisions") or {})
+        fb_syms = 0
+        total_syms = 0
+        for sym, info in decisions.items():
+            ai_info = info.get("ai") or {}
+            if ai_info.get("fallback"):
+                fb_syms += 1
+            total_syms += 1
+
+        steps = [{"name": n, "status": "fallback" if n in failed else "ok"} for n in methods]
+        if relay_error:
+            status = "down"
+        elif failed or agg_failed:
+            status = "degraded"
+        elif total_syms and fb_syms == total_syms:
+            status = "degraded"  # 最近周期所有决策都是规则兜底
+        elif fb_syms and fb_syms < total_syms:
+            status = "degraded"
+        else:
+            status = "ready"
+        return {"status": status, "steps": steps, "agg_failed": agg_failed, "failed": sorted(failed)}
+
     def _read_logs_html(self) -> str:
+        """只显示关键步骤摘要（不滚完整日志）：
+        周期完成/失败、AI 解读步骤、成交、初选、剔除、网络错误。"""
         size = self.log_path.stat().st_size if self.log_path.exists() else -1
         if size == self._log_size and self._log_cache:
             return "".join(self._log_cache)
@@ -404,17 +493,39 @@ class Snapshot:
                 ts = str(j.get("ts", ""))[11:19]
                 lvl = str(j.get("level", ""))
                 msg = str(j.get("message", ""))
-                if len(msg) > 150:
-                    msg = msg[:150] + "…"
-                cls = lvl if lvl in ("INFO", "WARNING", "ERROR") else ""
-                if "BUY" in msg or "买入" in msg: cls = "BUY"
-                if "SELL" in msg or "卖出" in msg: cls = "SELL"
-                rows.append(f'<div><span class="t">[{ts}]</span> <span class="{cls}">{msg}</span></div>')
             except Exception:
                 continue
+            if not self._is_key_event(msg):
+                continue
+            if len(msg) > 130:
+                msg = msg[:130] + "…"
+            cls = lvl if lvl in ("INFO", "WARNING", "ERROR") else ""
+            if "BUY" in msg or "买入" in msg:
+                cls = "BUY"
+            if "SELL" in msg or "卖出" in msg:
+                cls = "SELL"
+            rows.append(f'<div><span class="t">[{ts}]</span> <span class="{cls}">{msg}</span></div>')
+        rows = rows[-24:]
         self._log_cache = rows
         self._log_size = size
         return "".join(rows)
+
+    @staticmethod
+    def _is_key_event(msg: str) -> bool:
+        """判断是否关键步骤事件（过滤网络错误刷屏/普通 INFO）。"""
+        if any(k in msg for k in (
+            "周期完成", "周期失败", "运行周期失败", "交易所已连接",
+            "每日古法初选完成", "名字初筛", "无有效行情，当日剔除",
+            "AI 拆分解读", "AI 拆分聚合决策失败", "AI 十项古法解读失败",
+            "AI 聚合决策", "首次响应结构无效",
+            "BUY filled", "SELL filled", "买入", "卖出", "下单",
+            "订单", "成交", "仓位", "止损", "止盈",
+        )):
+            return True
+        # 网络错误合并显示：只保留每种错误最近 1 条
+        if "load_markets 网络错误" in msg or "NetworkError" in msg:
+            return True
+        return False
 
     # ---------- 聚合快照 ----------
     def build(self) -> Dict[str, Any]:
@@ -444,16 +555,9 @@ class Snapshot:
             net_ok = last_ok_ts > last_err_ts
         elif last_err_ts:
             net_ok = False
-        ai_ok = True
+        ai = self._ai_steps_and_status(health)
+        ai_ok = ai["status"] == "ready"
         ai_busy = False
-        logs = _tail(self.log_path, 40)
-        for line in reversed(logs):
-            if "AI 拆分聚合决策失败" in line or "AI 十项古法解读失败" in line:
-                ai_ok = False
-                break
-            if "AI 拆分解读" in line and "失败" not in line:
-                ai_busy = True
-                break
 
         # 选股
         scores: Dict[str, float] = state.get("daily_selection_scores") or {}
@@ -469,12 +573,12 @@ class Snapshot:
         verdicts = []
         decisions = health.get("decisions") or {}
         for sym, info in decisions.items():
-            ai = info.get("ai") or {}
+            ai_info = info.get("ai") or {}
             verdicts.append({
                 "sym": sym,
-                "action": ai.get("action", "?"),
-                "confidence": ai.get("confidence"),
-                "conflicts": (ai.get("conflicts") or [""])[0] if ai.get("conflicts") else "",
+                "action": ai_info.get("action", "?"),
+                "confidence": ai_info.get("confidence"),
+                "conflicts": (ai_info.get("conflicts") or [""])[0] if ai_info.get("conflicts") else "",
             })
         verdicts.sort(key=lambda v: v["sym"])
 
@@ -535,6 +639,9 @@ class Snapshot:
             "net_ok": net_ok,
             "ai_ok": ai_ok,
             "ai_busy": ai_busy,
+            "ai_status": ai["status"],
+            "ai_steps": ai["steps"],
+            "ai_agg_failed": ai["agg_failed"],
         }
 
     @staticmethod
