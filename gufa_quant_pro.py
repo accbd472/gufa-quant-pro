@@ -1904,6 +1904,7 @@ class ExchangeGateway:
         self.log = logger
         self.credentials = credentials
         self.client: Any = None
+        self.market_client: Any = None  # 实盘只读行情客户端（沙盒模式专用），_connect 里创建
         self.markets: Dict[str, Any] = {}
         # 多代理自动切换：代理池 + 当前索引 + 冷却期（网络错误后暂时跳过，避免反复打坏代理）
         self._proxies: Tuple[str, ...] = config.exchange.effective_proxies()
@@ -1968,6 +1969,17 @@ class ExchangeGateway:
             if not hasattr(self.client, "set_sandbox_mode"):
                 raise ConfigError(f"{exchange_id} 的 CCXT 适配器不支持 set_sandbox_mode")
             self.client.set_sandbox_mode(True)
+            # 沙盒模式的 demo-okx.com 返回模拟行情（部分币价格冻结/失真），
+            # 而行情评估与大屏实时价必须以真实市场为准。单独建一个实盘只读
+            # 行情客户端（公开行情接口无需 API key）：行情读取走它，交易/账户
+            # 仍走沙盒 self.client，互不干扰。
+            self.market_client = self._build_market_client(require_markets=True)
+            self.log.warning(
+                "行情源: 实盘公开行情(%s) | 交易源: EXCHANGE-SANDBOX",
+                self.market_client.hostname if hasattr(self.market_client, "hostname") else "okx",
+            )
+        else:
+            self.market_client = self.client
         self.markets = self._safe_call("load_markets", lambda: self.client.load_markets())
         self._validate_markets()
         mode = "EXCHANGE-SANDBOX" if self.exchange_cfg.sandbox else "EXCHANGE-PRODUCTION"
@@ -2023,6 +2035,31 @@ class ExchangeGateway:
             if not hasattr(client, "set_sandbox_mode"):
                 raise ConfigError(f"{exchange_id} 的 CCXT 适配器不支持 set_sandbox_mode")
             client.set_sandbox_mode(True)
+        return client
+
+    def _build_market_client(self, require_markets: bool = False) -> Any:
+        """实盘只读行情客户端：公开行情接口无需 API key，用于行情评估与大屏实时价。
+
+        沙盒 demo 环境的行情是模拟数据（部分币价格冻结/失真），交易/账户仍走
+        沙盒客户端，但 tickers / K 线 / 单币价一律以真实市场为准。
+        """
+        exchange_id = self.exchange_cfg.id
+        if not hasattr(ccxt, exchange_id):
+            raise ConfigError(f"CCXT 不支持交易所: {exchange_id}")
+        exchange_class = getattr(ccxt, exchange_id)
+        params: Dict[str, Any] = {
+            "enableRateLimit": True,
+            "timeout": self.exchange_cfg.timeout_ms,
+            "options": {
+                "defaultType": MARKET_SPOT,
+                "adjustForTimeDifference": True,
+            },
+        }
+        if self.exchange_cfg.proxy_url:
+            params["proxies"] = {"http": self.exchange_cfg.proxy_url, "https": self.exchange_cfg.proxy_url}
+        client = exchange_class(params)
+        if require_markets:
+            self._safe_call("load_markets", lambda: client.load_markets())
         return client
 
     def _try_switch_proxy(self, name: str, exc: BaseException) -> bool:
@@ -2150,14 +2187,14 @@ class ExchangeGateway:
         exchange_symbol = self.exchange_symbol(market, symbol)
         rows = self._safe_call(
             f"fetch_ohlcv:{exchange_symbol}:{requested_timeframe}",
-            lambda: self.client.fetch_ohlcv(exchange_symbol, requested_timeframe, limit=limit),
+            lambda: self.market_client.fetch_ohlcv(exchange_symbol, requested_timeframe, limit=limit),
         )
         if not rows:
             raise SafetyError(f"{symbol} {requested_timeframe} 返回空 K 线")
         df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        period_seconds = timeframe_seconds(self.client, requested_timeframe)
+        period_seconds = timeframe_seconds(self.market_client, requested_timeframe)
         period_ms = period_seconds * 1000
-        now_ms = int(self.client.milliseconds())
+        now_ms = int(self.market_client.milliseconds())
         if self.runtime.closed_candle_only:
             df = df[df["timestamp"] + period_ms <= now_ms]
         if df.empty:
@@ -2175,7 +2212,7 @@ class ExchangeGateway:
         exchange_symbol = self.exchange_symbol(market, symbol)
         ticker = self._safe_call(
             f"fetch_ticker:{exchange_symbol}",
-            lambda: self.client.fetch_ticker(exchange_symbol),
+            lambda: self.market_client.fetch_ticker(exchange_symbol),
         )
         price = finite(ticker.get("last") or ticker.get("close"))
         if price <= 0:
@@ -2191,7 +2228,7 @@ class ExchangeGateway:
         )
         tickers = self._safe_call(
             "fetch_tickers",
-            lambda: self.client.fetch_tickers(exchange_symbols),
+            lambda: self.market_client.fetch_tickers(exchange_symbols),
         )
         result: Dict[str, float] = {}
         for symbol, ticker in (tickers or {}).items():
@@ -2231,7 +2268,7 @@ class ExchangeGateway:
         if not target_map:
             return {}, {}
         tickers = self._safe_call(
-            "fetch_tickers", lambda: self.client.fetch_tickers(list(target_map)),
+            "fetch_tickers", lambda: self.market_client.fetch_tickers(list(target_map)),
         )
         prices: Dict[str, float] = {}
         changes: Dict[str, float] = {}
