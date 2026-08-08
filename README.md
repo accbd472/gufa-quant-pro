@@ -2,11 +2,14 @@
 
 默认安全的 CCXT 现货 + 永续合约、多标的、单向做多量化交易服务。8.0 起十大古法信号来自**真实排盘**（时家奇门、大六壬、太乙神数、周易卦辞、玄空飞星、子平八字、梅花易数、紫微斗数、京房八卦、四柱神煞），由代码按公开规则排盘，AI 作为**断卦师**解读完整盘面后转译为受约束的交易动作。排盘过程真实可复现，但**预测准确性不保证**，不构成投资建议。
 
+> ⚠️ **交易所兼容性声明：本项目仅实测过 OKX（现货 + 沙盒永续）。** 基于 CCXT 的其他交易所（Binance、Bybit、Bitget、Gate 等）未经验收，可能因市场符号、订单参数、限频策略差异无法直接运行；跨交易所使用需自行按「尚需按目标交易所验收」核对。
+
 ## 安全边界
 
 - 不提供本地纸面账户；余额、仓位、订单、成交和手续费全部以交易所 API 回报为准。
 - 默认 `exchange.sandbox=true`，应连接交易所 Sandbox/Testnet/Demo 模拟盘。
 - 当前支持 CCXT 现货（spot）与 OKX 永续合约（swap，仅 sandbox 可用；`allowed_markets` 含 swap 且非沙箱会直接报错），单向做多，杠杆上限 `risk.max_leverage`；不支持股票、做空。
+- **仅实测过 OKX**：`exchange.id` 只填过 `okx`；其余 CCXT 交易所未经任何测试，订单字段/市场/限频均可能不兼容，请勿在未验收前用于其他交易所。
 - 股票需要独立行情源和券商交易网关；不得把 AAPL、贵州茅台等股票代码放进 OKX `runtime.symbols`。
 - `once` 和 `run` 可能向交易所提交订单，即使当前使用的是交易所模拟盘。
 - AI 负责断卦与动作转译：`decision_mode=bounded` 时 BUY 不得突破规则仓位上限；`decision_mode=full` 时 AI 全权决定动作/仓位（无止损止盈、无账户熔断、无单币/总仓位上限），仍保留单笔金额上限、现金留存与订单状态硬停等交易所安全阀。
@@ -366,6 +369,6 @@ python gufa_quant_pro.py --config config.json adopt-positions \
 
 若出现 `ORDER_UNCERTAIN`：不要删除 `pending_orders` 后直接重启；应按 client order id、时间、交易对和方向查询交易所订单，核对成交、开放订单及余额，并备份 `state.json` 与 `orders.audit.jsonl` 后人工处理。CLI 不提供自动清理命令，这是有意的安全限制。
 
-## 尚需按目标交易所验收
+## 尚需按目标交易所验收（仅 OKX 实测过）
 
-上线前必须确认目标交易所的 sandbox URL、市场 symbol、最小数量/金额、手续费币种、market buy 参数、订单状态字段、client order id 参数、`fetch_order` 支持情况和限频策略。
+本项目只在 OKX 沙盒环境实测（现货 + 永续）。切换到其他交易所前，必须逐一确认目标交易所的：sandbox URL、市场 symbol、最小数量/金额、手续费币种、market buy 参数、订单状态字段、client order id 参数、`fetch_order` 支持情况、限频策略与合约市场规则（`gufa_quant_pro.py` 中 swap 路径按 OKX 永续语义实现，其他交易所需重写验收）。
