@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,6 +24,31 @@ APP_NAME = "GuFaQuant-DASHBOARD"
 POLL_INTERVAL = 2.0          # SSE 推送间隔（秒）
 EQUITY_MAX_POINTS = 720      # 权益曲线最大点数（2s 采样 → 24h）
 LOG_TAIL = 120               # 日志尾部行数
+
+# 大屏统一使用本地时区（Asia/Shanghai，固定 UTC+8，无夏令时）
+LOCAL_TZ = timezone(timedelta(hours=8))
+
+
+def _local_hhmmss(iso: str) -> str:
+    """ISO 时间字符串 → 本地(UTC+8) HH:MM:SS；解析失败则原样截取。"""
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(LOCAL_TZ).strftime("%H:%M:%S")
+    except Exception:
+        return iso[11:19] if len(iso) >= 19 else iso
+
+
+def _local_iso(iso: str) -> str:
+    """ISO 时间字符串 → 本地(UTC+8) ISO（保留完整格式，前端 slice 即可）；失败原样返回。"""
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(LOCAL_TZ).isoformat(timespec="seconds")
+    except Exception:
+        return iso
 
 HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -640,7 +666,7 @@ class Snapshot:
         for line in _tail(self.log_path, LOG_TAIL):
             try:
                 j = json.loads(line)
-                ts = str(j.get("ts", ""))[11:19]
+                ts = _local_hhmmss(str(j.get("ts", "")))
                 lvl = str(j.get("level", ""))
                 msg = str(j.get("message", ""))
             except Exception:
@@ -793,7 +819,7 @@ class Snapshot:
                     "event": o.get("event", ""),
                     "sym": plan.get("symbol", ""),
                     "side": plan.get("side", ""),
-                    "ts": str(o.get("ts", ""))[11:19],
+                    "ts": _local_hhmmss(str(o.get("ts", ""))),
                 })
             except Exception:
                 continue
@@ -812,7 +838,7 @@ class Snapshot:
             "fills": health.get("fills"),
             "position_count": len(state.get("positions") or {}),
             "quotes": health.get("quotes") or {},
-            "live_updated_at": health.get("live_updated_at"),
+            "live_updated_at": _local_iso(str(health.get("live_updated_at") or "")),
             "candidates": len((health.get("daily_selection") or {}).get("candidates") or [])
                           or len(state.get("daily_selection_candidates") or []),
             "selection_date": state.get("daily_selection_date"),
