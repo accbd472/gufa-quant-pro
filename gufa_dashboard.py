@@ -58,10 +58,10 @@ HTML = r"""<!DOCTYPE html>
   @keyframes scan { 0% { top: -160px; } 100% { top: 110%; } }
   /* 粒子 */
   #stars { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
-  #app { position: relative; z-index: 2; height: 100vh; display: flex; flex-direction: column; padding: 14px 18px 10px; gap: 10px; }
+  #app { position: relative; z-index: 2; height: 100vh; display: flex; flex-direction: column; padding: 10px 14px 6px; gap: 8px; }
 
   /* ---------- 顶栏 ---------- */
-  header { display: flex; align-items: center; gap: 16px; padding: 8px 16px;
+  header { display: flex; align-items: center; gap: 14px; padding: 6px 14px;
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
     box-shadow: 0 0 24px rgba(0,240,255,.08) inset, 0 0 18px rgba(0,240,255,.06); }
   .logo { font-size: 20px; font-weight: 700; letter-spacing: 3px; color: var(--cy);
@@ -82,23 +82,23 @@ HTML = r"""<!DOCTYPE html>
   .tag.sb { color: var(--pu); border-color: rgba(168,85,247,.5); }
 
   /* ---------- 布局 ---------- */
-  main { flex: 1; display: grid; grid-template-columns: 1.55fr 1fr; grid-template-rows: 1.15fr .85fr 1fr; gap: 10px; min-height: 0; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+  main { flex: 1; display: grid; grid-template-columns: 1.55fr 1fr; grid-template-rows: 1.05fr 1.1fr .85fr; gap: 8px; min-height: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
     display: flex; flex-direction: column; min-height: 0; position: relative; overflow: hidden;
     backdrop-filter: blur(6px); }
   .card::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
     background: linear-gradient(90deg, transparent, var(--cy), transparent); opacity: .6; }
-  .card h3 { font-size: 11px; letter-spacing: 2px; color: var(--pu); margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .card h3 { font-size: 10px; letter-spacing: 2px; color: var(--pu); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
   .card h3::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, var(--line), transparent); }
   .chart { flex: 1; min-height: 0; }
   canvas { width: 100%; height: 100%; display: block; }
 
   /* ---------- 指标卡 ---------- */
-  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-  .m { text-align: center; padding: 6px 4px; border: 1px solid var(--line); border-radius: 8px;
+  .metrics { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; }
+  .m { text-align: center; padding: 3px 2px; border: 1px solid var(--line); border-radius: 6px;
     background: rgba(0, 20, 40, .4); }
-  .m .v { font-size: 19px; color: var(--cy); text-shadow: 0 0 10px rgba(0,240,255,.5); letter-spacing: 1px; }
-  .m .l { font-size: 10px; color: #8fb4d8; margin-top: 3px; letter-spacing: 1px; }
+  .m .v { font-size: 15px; color: var(--cy); text-shadow: 0 0 10px rgba(0,240,255,.5); letter-spacing: 1px; }
+  .m .l { font-size: 9px; color: #8fb4d8; margin-top: 2px; letter-spacing: 1px; }
   .m .v.green { color: var(--gr); text-shadow: 0 0 10px rgba(52,255,176,.5); }
   .m .v.red { color: var(--rd); text-shadow: 0 0 10px rgba(255,59,107,.5); }
   .m .v.amber { color: var(--am); }
@@ -116,7 +116,7 @@ HTML = r"""<!DOCTYPE html>
   .dead b { color: var(--rd); }
 
   /* ---------- 日志 ---------- */
-  .logbox { flex: 1; overflow-y: auto; font-size: 11px; line-height: 1.55; }
+  .logbox { flex: 1; overflow-y: auto; font-size: 10px; line-height: 1.45; }
   .logbox .t { color: #5f7fa0; }
   .logbox .WARNING { color: var(--am); }
   .logbox .ERROR { color: var(--rd); }
@@ -125,8 +125,8 @@ HTML = r"""<!DOCTYPE html>
   .logbox .SELL { color: var(--rd); font-weight: 700; }
 
   /* ---------- 决策灯 ---------- */
-  .quotes { display: flex; flex-direction: column; gap: 3px; overflow-y: auto;
-    border: 1px solid rgba(0,240,255,.15); border-radius: 6px; padding: 4px 8px; margin-bottom: 6px; }
+  .quotes { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; flex: 0 0 auto;
+    border: 1px solid rgba(0,240,255,.15); border-radius: 6px; padding: 4px 8px; margin-bottom: 5px; }
   .quote { display: flex; align-items: center; gap: 8px; font-size: 11px; }
   .quote .sym { width: 76px; color: var(--cy); white-space: nowrap; }
   .quote .qp { flex: 1; color: #e8f6ff; text-align: right; }
@@ -134,8 +134,8 @@ HTML = r"""<!DOCTYPE html>
   .quote .qch.up { color: var(--gr); }
   .quote .qch.down { color: var(--rd); }
   .quote .qv { width: 84px; text-align: right; color: #8fb4d8; }
-  .verdicts { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
-  .verdict { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+  .verdicts { display: flex; flex-direction: column; gap: 5px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+  .verdict { display: flex; align-items: center; gap: 8px; font-size: 11px; }
   .verdict .sym { width: 88px; color: var(--cy); }
   .vbadge { padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
   .vbadge.BUY { background: rgba(52,255,176,.12); color: var(--gr); border: 1px solid rgba(52,255,176,.5); }
@@ -145,8 +145,8 @@ HTML = r"""<!DOCTYPE html>
   .verdict .cn { font-size: 11px; color: var(--pu); }
 
   /* ---------- AI 十项解读步骤 ---------- */
-  .aisteps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin-top: 6px; }
-  .aistep { text-align: center; font-size: 10px; padding: 4px 2px; border-radius: 6px;
+  .aisteps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin-top: 5px; flex-shrink: 0; }
+  .aistep { text-align: center; font-size: 10px; padding: 2px 1px; border-radius: 5px;
     border: 1px solid var(--line); background: rgba(0,20,40,.35); color: #8fb4d8; letter-spacing: 1px; }
   .aistep.ok { border-color: rgba(52,255,176,.45); color: var(--gr); box-shadow: 0 0 6px rgba(52,255,176,.15); }
   .aistep.fallback { border-color: rgba(255,209,102,.45); color: var(--am); box-shadow: 0 0 6px rgba(255,209,102,.12); }
@@ -154,7 +154,19 @@ HTML = r"""<!DOCTYPE html>
   .aistep .st { font-size: 11px; }
 
   .empty { color: #4a6a8a; font-size: 12px; text-align: center; padding: 12px 0; }
-  footer { font-size: 10px; color: #3d5a78; text-align: center; letter-spacing: 2px; }
+  footer { font-size: 9px; color: #3d5a78; text-align: center; letter-spacing: 2px; }
+  @media (max-width: 1300px){
+    .metrics { grid-template-columns: repeat(4, 1fr); }
+    .m .v { font-size: 13px; }
+  }
+  @media (max-height: 820px){
+    .logo { font-size: 16px; }
+    .logo small { font-size: 10px; }
+    .m .v { font-size: 12px; }
+    .quote { font-size: 10px; }
+    .aistep { font-size: 9px; }
+    .chart { min-height: 56px; }
+  }
   ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-thumb { background: rgba(0,240,255,.25); border-radius: 3px; }
 </style>
 </head>
@@ -182,21 +194,18 @@ HTML = r"""<!DOCTYPE html>
     <div class="card" style="grid-column:2; grid-row:1">
       <h3>TELEMETRY // 遥测</h3>
       <div class="metrics">
-        <div class="m"><div class="v" id="mEquity">--</div><div class="l">权益 USDT</div></div>
-        <div class="m"><div class="v green" id="mPeak">--</div><div class="l">峰值 USDT</div></div>
+        <div class="m"><div class="v" id="mEquity">--</div><div class="l">权益</div></div>
+        <div class="m"><div class="v green" id="mPeak">--</div><div class="l">峰值</div></div>
         <div class="m"><div class="v amber" id="mTrades">--</div><div class="l">今日成交</div></div>
-        <div class="m"><div class="v" id="mCycle">--</div><div class="l">周期 s</div></div>
+        <div class="m"><div class="v" id="mCycle">--</div><div class="l">周期s</div></div>
+        <div class="m"><div class="v green" id="mFills">--</div><div class="l">持仓</div></div>
+        <div class="m"><div class="v" id="mReview">--</div><div class="l">复查</div></div>
+        <div class="m"><div class="v" id="mCand">--</div><div class="l">候选</div></div>
+        <div class="m"><div class="v" id="mDayStart">--</div><div class="l">日初</div></div>
       </div>
-      <div class="metrics" style="margin-top:8px">
-        <div class="m"><div class="v green" id="mFills">--</div><div class="l">持仓数</div></div>
-        <div class="m"><div class="v" id="mReview">--</div><div class="l">下次复查</div></div>
-        <div class="m"><div class="v" id="mCand">--</div><div class="l">候选池</div></div>
-        <div class="m"><div class="v" id="mDayStart">--</div><div class="l">日初权益</div></div>
-      </div>
-      <div style="flex:1"></div>
       <!-- 雷达图：十项古法 -->
       <h3 style="margin-top:6px">ANCIENT METHODS // 十项古法信号</h3>
-      <div class="chart" style="height:46%"><canvas id="radar"></canvas></div>
+      <div class="chart" style="flex:1 1 auto; min-height:70px"><canvas id="radar"></canvas></div>
     </div>
     <!-- 左下：选股 -->
     <div class="card" style="grid-column:1; grid-row:2">
@@ -208,7 +217,7 @@ HTML = r"""<!DOCTYPE html>
     <!-- 右下：决策 -->
     <div class="card" style="grid-column:2; grid-row:2">
       <h3>DECISIONS // AI 聚合决策 <span style="color:#5f7fa0;font-size:10px" id="liveTs"></span></h3>
-      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:52px; overflow-y:auto"><div class="empty">无持仓</div></div>
+      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:40px; overflow-y:auto"><div class="empty">无持仓</div></div>
       <div class="verdicts" id="verdicts"><div class="empty">等待决策…</div></div>
       <h3 style="margin-top:6px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
       <div class="aisteps" id="aisteps"><div class="empty">—</div></div>

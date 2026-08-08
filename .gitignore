@@ -11,3 +11,7 @@ credentials*.json
 *.bak-*
 *.log
 unused-state.json
+
+# 助手工作记忆（含本机路径/事故记录），不入库
+MEMORY.md
+memory/

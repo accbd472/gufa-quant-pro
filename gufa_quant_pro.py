@@ -9,7 +9,10 @@ GuFaQuant-Pro 8.0
 - 仅支持现货、单向做多；不伪装成可跨交易所安全通用的合约系统。
 - 不提供本地纸面账户；默认连接交易所 Sandbox/Testnet/Demo API，所有成交均以交易所回报为准。
 - 8.0 起十大古法因子替换为真实排盘（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱），
-  AI 作为断卦师解读完整盘面并转译为 BUY/SELL/HOLD，目标仓位仍受规则上限与硬风控约束。
+  AI 作为断卦师解读完整盘面并转译为 BUY/SELL/HOLD；decision_mode=full 时 AI 全权决策：
+  动作与目标仓位自主，不启用保护性止损/止盈/移动止损，账户级熔断（日内亏损/回撤/成交
+  次数）与单币/总仓位/合约名义上限均放开；仅保留 ORDER_UNCERTAIN 硬停、max_order_quote
+  单笔上限与现金留存等交易所安全阀。
 - 排盘与断卦遵循公开规则（代码内披露），但预测准确性不保证；正式盘必须显式确认风险。
 """
 
@@ -989,8 +992,8 @@ class AIConfig:
         self.api_key_name = self.api_key_name.strip()
         self.base_url = self.base_url.strip()
         self.decision_mode = self.decision_mode.strip().lower()
-        if self.decision_mode not in {"bounded", "explain_only"}:
-            raise ConfigError("ai.decision_mode 必须是 bounded 或 explain_only")
+        if self.decision_mode not in {"bounded", "explain_only", "full"}:
+            raise ConfigError("ai.decision_mode 必须是 bounded / explain_only / full")
         self.reasoning_effort = self.reasoning_effort.strip().lower()
         if self.reasoning_effort not in {"", "low", "medium", "high", "xhigh", "max"}:
             raise ConfigError("ai.reasoning_effort 必须是 low/medium/high/xhigh/max 之一（或留空）")
@@ -2238,7 +2241,8 @@ class ExchangeGateway:
         reason: str,
     ) -> Optional[OrderPlan]:
         current_quote = position.quote_value
-        desired_quote = snapshot.equity * clamp(target_allocation, 0, self.risk.max_symbol_allocation)
+        allocation_cap = 1.0 if self.config.ai.decision_mode == "full" else self.risk.max_symbol_allocation
+        desired_quote = snapshot.equity * clamp(target_allocation, 0, allocation_cap)
         delta_quote = desired_quote - current_quote
         current_allocation = current_quote / snapshot.equity
         min_delta = max(self.risk.min_rebalance_quote, snapshot.equity * self.risk.min_rebalance_pct)
@@ -2291,7 +2295,8 @@ class ExchangeGateway:
             )
         contract_size = finite(market_info.get("contractSize"), 1.0)
         current_notional = position.notional  # long 为正
-        desired_notional = snapshot.equity * clamp(target_allocation, 0, self.risk.max_symbol_allocation)
+        allocation_cap = 1.0 if self.config.ai.decision_mode == "full" else self.risk.max_symbol_allocation
+        desired_notional = snapshot.equity * clamp(target_allocation, 0, allocation_cap)
         delta_notional = desired_notional - current_notional
         current_allocation = current_notional / snapshot.equity
         min_delta = max(self.risk.min_rebalance_quote, snapshot.equity * self.risk.min_rebalance_pct)
@@ -2303,12 +2308,18 @@ class ExchangeGateway:
             delta_notional = max(delta_notional, -current_notional)
             if abs(delta_notional) < min_delta:
                 return None
-        # 硬风控顶
-        notional_cap = snapshot.equity * self.risk.max_futures_notional_pct
+        # 硬风控顶（full 模式放开：AI 全权决定合约名义敞口与保证金占用）
+        if self.config.ai.decision_mode == "full":
+            notional_cap = snapshot.equity  # 名义敞口不设额外上限
+        else:
+            notional_cap = snapshot.equity * self.risk.max_futures_notional_pct
         if abs(delta_notional) > notional_cap + EPSILON:
             delta_notional = math.copysign(notional_cap, delta_notional)
         margin_required = abs(delta_notional) / leverage
-        if margin_required > snapshot.equity * self.risk.futures_margin_cap_pct + EPSILON:
+        if (
+            self.config.ai.decision_mode != "full"
+            and margin_required > snapshot.equity * self.risk.futures_margin_cap_pct + EPSILON
+        ):
             raise SafetyError(
                 f"{exchange_symbol} 合约保证金需求 {margin_required:.2f} USDT 超过上限 "
                 f"{snapshot.equity * self.risk.futures_margin_cap_pct:.2f} USDT "
@@ -3136,9 +3147,10 @@ class AIAdvisor:
             "紫微命宫主星、八字日主旺衰用神、风水飞星吉凶），识别多法共振与冲突，再转译为 "
             "BUY/SELL/HOLD，并按 market_context.allowed_markets 自主选择现货（spot）或合约（swap）表达仓位："
             "只有强烈看多且愿意承担更高波动时才选 swap 并给出 1..max_leverage 的杠杆；"
-            "方向不明、看空或盘面中性时选 spot。你不是自由下单主体：规则目标是仓位上限，"
-            "BUY 不得高于规则目标；SELL 可以降低风险；"
-            "保护性止损与组合风控始终优先。不得声称预知未来或保证收益，不得编造输入中没有的盘面数据。"
+            "方向不明、看空或盘面中性时选 spot。你是全权决策主体：rule_target 仅是规则引擎的参考意见，"
+            "你可以自主决定高于或低于它的目标仓位（FLAT/HALF/FULL/UNCHANGED），为自己给出的 target_level "
+            "负责；保护性止损与组合风控（单币/总仓位上限）仍由系统强制执行，你无需也无法绕过。"
+            "不得声称预知未来或保证收益，不得编造输入中没有的盘面数据。"
             + self._response_contract()
         )
         try:
@@ -3780,6 +3792,21 @@ class GuFaQuantPro:
                 f"AI fallback; requested={requested:.2f}; current={current_fraction:.2f}; "
                 f"rule_cap={rule_target:.2f}; applied={fallback_target:.2f}"
             )
+        if self.config.ai.decision_mode == "full":
+            # AI 全权模式：动作与目标档位直接生效，不受规则分数封顶、不受置信度门槛拦截。
+            # 置信度仅作记录；protective 已在周期入口置空（止损/止盈/移动止损不触发），
+            # 账户级熔断已忽略（仅记录），单币 20%/总仓位 70%/合约名义与保证金上限均已放开，
+            # 下单金额仍受 max_order_quote 与现金留存约束。
+            if ai.action == "BUY":
+                requested = max(current_fraction, requested)
+            elif ai.action == "SELL":
+                requested = min(current_fraction, requested)
+            # HOLD：按 AI 档位（UNCHANGED=维持 / FLAT=清仓 / HALF、FULL=按档位调）
+            return clamp(requested), (
+                f"AI full-authority; AI {ai.action}/{ai.target_level}; "
+                f"confidence={ai.confidence:.2f}; requested={requested:.2f}; "
+                f"rule_ref={rule_target:.2f}; current={current_fraction:.2f}"
+            )
         if ai.confidence < self.config.ai.minimum_allow_confidence:
             requested = current_fraction
             confidence_reason = (
@@ -3820,6 +3847,7 @@ class GuFaQuantPro:
         if unknown:
             raise SafetyError(f"每日初选包含候选池外标的: {sorted(unknown)}")
 
+        full_mode = self.config.ai.decision_mode == "full"
         raw: Dict[str, Tuple[float, str, AIDecision]] = {}
         for symbol, result in results.items():
             position = snapshot.positions.get(symbol)
@@ -3827,13 +3855,24 @@ class GuFaQuantPro:
                 position = AccountPosition(
                     symbol, 0.0, result.diagnostics.get("price", 0.0), 0.0, 0.0, 0.0
                 )
-            current_target_fraction = 0.0
-            if snapshot.equity > 0 and self.config.risk.max_symbol_allocation > 0:
-                current_target_fraction = (
-                    position.quote_value / snapshot.equity / self.config.risk.max_symbol_allocation
+            if full_mode:
+                # AI 全权：绝对坐标（权益占比 0~1），不受单币 20% / 总仓位 70% 缩放。
+                current_target_fraction = clamp(
+                    position.quote_value / snapshot.equity if snapshot.equity > 0 else 0.0
                 )
-            current_target_fraction = clamp(current_target_fraction)
-            rule_target, rule_reason = self.engine.target_fraction(result.score, current_target_fraction)
+                rule_target_rel, rule_reason = self.engine.target_fraction(
+                    result.score, current_target_fraction
+                )
+                # 规则目标转绝对权益占比（full 模式仅作参考/兜底，不封顶）
+                rule_target = clamp(rule_target_rel * self.config.risk.max_symbol_allocation)
+            else:
+                current_target_fraction = 0.0
+                if snapshot.equity > 0 and self.config.risk.max_symbol_allocation > 0:
+                    current_target_fraction = (
+                        position.quote_value / snapshot.equity / self.config.risk.max_symbol_allocation
+                    )
+                current_target_fraction = clamp(current_target_fraction)
+                rule_target, rule_reason = self.engine.target_fraction(result.score, current_target_fraction)
 
             if symbol in selected:
                 selection_context: Dict[str, Any] = {"selected": True}
@@ -3905,12 +3944,17 @@ class GuFaQuantPro:
                 reason = f"risk halt, no increase: {risk_status.reason}; {reason}"
             raw[symbol] = (target, reason, ai_decision)
 
-        raw_allocations = {
-            symbol: target * self.config.risk.max_symbol_allocation
-            for symbol, (target, _, _) in raw.items()
-        }
-        total = sum(raw_allocations.values())
-        scale = min(1.0, self.config.risk.max_total_allocation / max(total, EPSILON))
+        if full_mode:
+            # AI 全权：target 已是绝对权益占比，直接作为目标分配，不做单币/总仓位缩放。
+            raw_allocations = {symbol: target for symbol, (target, _, _) in raw.items()}
+            scale = 1.0
+        else:
+            raw_allocations = {
+                symbol: target * self.config.risk.max_symbol_allocation
+                for symbol, (target, _, _) in raw.items()
+            }
+            total = sum(raw_allocations.values())
+            scale = min(1.0, self.config.risk.max_total_allocation / max(total, EPSILON))
         decisions: Dict[str, SymbolDecision] = {}
         for symbol, (target, reason, ai_decision) in raw.items():
             allocation = raw_allocations[symbol] * scale
@@ -4026,9 +4070,26 @@ class GuFaQuantPro:
         self.gateway.update_high_water(snapshot)
         prev_halted = self.store.state.halted_reason
         risk_status = self.risk.evaluate(snapshot)
+        if self.config.ai.decision_mode == "full":
+            # AI 全权模式：账户级熔断（日内亏损/峰值回撤/成交次数上限）不阻止 AI 决策，
+            # 仅保留评估原因供展示；ORDER_UNCERTAIN（订单状态未知）硬停仍保留。
+            if risk_status.reason:
+                self.log.warning(
+                    "AI 全权模式：账户熔断评估已忽略（仅记录，不限制交易）: %s",
+                    risk_status.reason,
+                )
+            if self.store.state.halted_reason and not self.store.state.halted_reason.startswith(
+                "ORDER_UNCERTAIN"
+            ):
+                self.store.state.halted_reason = ""
+            risk_status = RiskStatus(True, risk_status.reason)
         if self.store.state.halted_reason and self.store.state.halted_reason != prev_halted:
             self._notify("halted", {"reason": self.store.state.halted_reason})
-        protective = self.risk.protective_exits(snapshot)
+        if self.config.ai.decision_mode == "full":
+            # AI 全权模式：不启用保护性止损/止盈/移动止损，仓位完全交由 AI 决策。
+            protective: Dict[str, str] = {}
+        else:
+            protective = self.risk.protective_exits(snapshot)
 
         # 暂停开关：state_dir/pause 存在时本周期不开新仓，仅继续管理存量与保护性退出。
         pause_file = self.state_dir / "pause"

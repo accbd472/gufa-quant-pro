@@ -1620,6 +1620,7 @@ def _swap_snapshot(equity: float = 10000.0) -> g.AccountSnapshot:
 def _swap_gateway_stub(tmp_path: Path):
     """带合约市场信息的 gateway 桩。"""
     gateway, store = make_gateway_stub(tmp_path)
+    gateway.config = SimpleNamespace(ai=SimpleNamespace(decision_mode="bounded"))
     gateway.markets = {
         "BTC/USDT:USDT": {"contractSize": 0.01, "swap": True, "spot": False},
     }
