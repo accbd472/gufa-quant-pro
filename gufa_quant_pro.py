@@ -2966,6 +2966,10 @@ class AIAdvisor:
         self.credentials = credentials
         self.client: Any = None
         self.last_error: str = ""  # 最近一次 AI 失败的可读原因（供日志/控制台排查）
+        # AI 熔断器：连续失败达阈值后暂停 AI 请求，避免上游 503 时一波请求打爆
+        # 自身限频（一次 tick 评估 54 币 × 内部 5 次重试 = 270 次请求）。
+        self._fail_streak = 0
+        self._circuit_open_until = 0.0
         if not config.enabled:
             return
         try:
@@ -3062,11 +3066,12 @@ class AIAdvisor:
         return AIRelayError(message, status=status, detail=detail)
 
     def _completion_content(self, messages: Sequence[Mapping[str, str]]) -> str:
-        """请求 AI 并返回非空正文；空正文/网络抖动自动重试（最多 2 次）。
+        """请求 AI 并返回非空正文；空正文/网络抖动自动重试（最多 5 次）。
 
         对 reasoning 型模型（如 deepseek-v4-flash），中转站偶发把输出预算
         耗尽在思考上、返回空 content（finish=length）。重试时依次去掉
         response_format / reasoning_effort 并放宽 max_tokens，最大化成功概率。
+        503/429/5xx 瞬时繁忙指数退避重试；4xx 配置类错误不重试直接抛。
         """
         kwargs: Dict[str, Any] = {
             "model": self.config.model,
@@ -3080,7 +3085,7 @@ class AIAdvisor:
             # 把输出预算耗尽在思考上导致空正文的概率。
             kwargs["reasoning_effort"] = self.config.reasoning_effort
         last_exc: Optional[BaseException] = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 response = self.client.chat.completions.create(**kwargs)
                 content = response.choices[0].message.content
@@ -3089,19 +3094,24 @@ class AIAdvisor:
                 last_exc = ConfigError("AI 响应正文必须是非空 JSON string")
             except Exception as exc:  # noqa: BLE001 - SDK/网络/中转站错误统一转成可读信息
                 last_exc = self._relay_error(exc)
-            if attempt < 2:
+            # 配置类错误（401/400/404 等）重试无意义，立即失败；429/503/5xx 属瞬时繁忙继续重试。
+            if (isinstance(last_exc, AIRelayError) and last_exc.status
+                    and 400 <= last_exc.status < 500 and last_exc.status != 429):
+                raise last_exc
+            if attempt < 4:
                 self.log.warning(
                     "AI 响应为空或请求失败（第 %d 次），调整参数重试: %s",
                     attempt + 1, last_exc,
                 )
-                time.sleep(0.8 * (attempt + 1))
+                time.sleep(0.8 * (2 ** attempt))  # 0.8/1.6/3.2/6.4/12.8 指数退避
                 if attempt == 0:
                     kwargs.pop("response_format", None)
-                else:
+                elif attempt == 1:
                     kwargs.pop("reasoning_effort", None)
                     kwargs["max_tokens"] = min(
                         int(kwargs.get("max_tokens", 3000)) + 1000, 4000
                     )
+                # 后续尝试保持宽松参数继续重试（503 瞬时繁忙需要更长退避）
         assert last_exc is not None
         raise last_exc
 
@@ -3595,6 +3605,22 @@ class AIAdvisor:
         reading = require_json_string(parsed.get("reading"), f"AI response.{name}.reading").strip()[:400]
         return AncientMethodReading(bias, confidence, reading)
 
+    def _note_ai_failure(self) -> None:
+        """记录一次 AI 失败；连续失败达阈值则打开熔断（暂停 AI 请求一段时间）。"""
+        self._fail_streak += 1
+        if self._fail_streak >= 4:
+            self._circuit_open_until = time.monotonic() + 90
+            self.log.warning(
+                "AI-1 连续失败 %d 次，熔断 90 秒暂停 AI 请求（上游不稳时避免打爆限频）",
+                self._fail_streak,
+            )
+            self._fail_streak = 0
+
+    def _note_ai_success(self) -> None:
+        """AI 调用成功：清零连续失败计数并关闭熔断。"""
+        self._fail_streak = 0
+        self._circuit_open_until = 0.0
+
     def decide_entry(
         self,
         symbol: str,
@@ -3613,6 +3639,9 @@ class AIAdvisor:
         """
         if not self.config.enabled:
             return [], "AI 已关闭，不设触发条件", "wait", "HALF"
+        # 熔断器打开：暂停 AI 请求，直接快速失败（调用方会写冷却，不会反复重试）。
+        if self._circuit_open_until and time.monotonic() < self._circuit_open_until:
+            return [], "AI 熔断中（上游不稳），保守等待", "error", "HALF"
         system = (
             "你是中国古法十项综合断卦师（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。"
             "现在使用信号触发模式：系统不再定时重算，而是由你设定『触发条件』，条件命中才交易。"
@@ -3648,6 +3677,7 @@ class AIAdvisor:
             ])
         except Exception as exc:  # noqa: BLE001 触发决策失败不阻断监听循环
             self.log.error("AI-1 入场决策失败 %s: %s", symbol, exc)
+            self._note_ai_failure()
             return [], "AI-1 决策失败，保守等待", "error", "HALF"
         try:
             parsed = require_json_object(json.loads(content), "AI-1 entry response")
@@ -3658,7 +3688,9 @@ class AIAdvisor:
             )
         except (ConfigError, json.JSONDecodeError) as exc:
             self.log.warning("AI-1 响应结构无效 %s: %s", symbol, exc)
+            self._note_ai_failure()
             return [], "AI-1 响应无效，保守等待", "error", "HALF"
+        self._note_ai_success()
         decision = str(parsed.get("decision", "wait")).strip().lower()
         if decision not in {"enter", "wait", "no_trade"}:
             decision = "wait"
