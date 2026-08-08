@@ -2430,7 +2430,13 @@ class ExchangeGateway:
         return False
 
     def estimate_vwap(self, symbol: str, side: str, amount: float, fallback_price: float) -> Tuple[float, float]:
-        book = self._safe_call(f"fetch_order_book:{symbol}", lambda: self.client.fetch_order_book(symbol, 20))
+        # 订单簿必须用实盘公开行情（market_client）：沙盒 demo 的订单簿是模拟薄盘，
+        # 会让 SOL 这类实盘深度充足的币被误判滑点超限。取 100 档评估（OKX 公开
+        # 接口支持），避免小市值币在 20 档内被误判"深度不足"。
+        book = self._safe_call(
+            f"fetch_order_book:{symbol}",
+            lambda: self.market_client.fetch_order_book(symbol, 100),
+        )
         levels = book.get("asks" if side == "buy" else "bids") or []
         remaining = amount
         cost = 0.0
