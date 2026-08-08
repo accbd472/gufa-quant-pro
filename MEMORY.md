@@ -35,3 +35,8 @@
 - 状态键：现货原符号，合约 `swap:SYMBOL`；AI 聚合决策失败时规则兜底 market=spot/leverage=1。
 - 已知噪音：tokenrhythm.studio 的 deepseek-v4-flash-0731 间歇性返回非 JSON，AI 拆解/聚合决策回退规则解读（8.4.1 起就有）；`validate` 子命令对死币（CC/CHIP/BREV 等无行情）硬校验 FATAL，run 模式不受影响。
 
+## 8.7.1（2026-08-08，commit 5be9655）
+
+- `depth_blocked`：薄盘 buy 拒单（"订单簿深度不足以成交"）当日记入状态缓存，当日不再重试，次日自动失效；卖出/保护性退出不受影响。A/USDT、ACT/USDT 这类沙盘薄盘币不再每周期刷拒单噪音。
+- 事故记录：console 网页端保存配置时 proxy_url 被空值覆盖 → bot 直连 OKX 超时、load_markets 循环失败、console auto_restart 反复重启（10:42–10:58 停机）。已恢复 proxy_url=127.0.0.1:7892 并给 console 保存逻辑加防御（空代理值不得覆盖已有代理）。教训：改配置后若 bot 连不上交易所，先查 `AppConfig.load` 里的 proxy_url 是否还在。
+
