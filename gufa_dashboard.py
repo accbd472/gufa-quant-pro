@@ -167,6 +167,59 @@ HTML = r"""<!DOCTYPE html>
     .aistep { font-size: 9px; }
     .chart { min-height: 56px; }
   }
+
+  /* ===== 竖屏适配 ===== */
+  /* 手机/窄竖屏（宽<=820 且高>宽）：单列流式，优先级 遥测→权益→决策→初选→日志 */
+  @media (orientation: portrait) and (max-width: 820px){
+    #app { padding: 6px 8px 4px; gap: 6px; }
+    header { flex-wrap: wrap; gap: 4px 12px; padding: 4px 8px; }
+    .logo { font-size: 14px; letter-spacing: 2px; }
+    .logo small { font-size: 8px; letter-spacing: 1px; margin-top: 1px; }
+    .st { font-size: 10px; gap: 4px; }
+    .led { width: 8px; height: 8px; }
+    .clock { font-size: 12px; letter-spacing: 1px; }
+    .tag { font-size: 9px; padding: 2px 6px; }
+    main {
+      grid-template-columns: 1fr;
+      grid-template-rows: none;
+      overflow-y: auto;
+    }
+    .card { grid-column: auto !important; grid-row: auto !important; padding: 6px 8px; border-radius: 8px; }
+    .card h3 { font-size: 9px; letter-spacing: 1px; margin-bottom: 4px; gap: 6px; }
+    .c-tele { order: 1; height: min(40vh, 340px); }
+    .c-eq   { order: 2; height: min(30vh, 270px); }
+    .c-dec  { order: 3; height: min(36vh, 330px); }
+    .c-sel  { order: 4; height: min(30vh, 300px); }
+    .c-log  { order: 5; height: min(28vh, 260px); }
+    .metrics { grid-template-columns: repeat(4, 1fr); gap: 4px; }
+    .m .v { font-size: 13px; }
+    .m .l { font-size: 8px; margin-top: 1px; }
+    .chart { min-height: 110px !important; }
+    .quotes { max-height: 64px; }
+    .aisteps { grid-template-columns: repeat(5, 1fr); gap: 3px; }
+    .aistep { font-size: 8px; padding: 2px 0; }
+    .aistep .st { font-size: 9px; }
+    .quote { font-size: 10px; }
+    .quote .sym { width: 64px; }
+    .quote .qv { width: 72px; }
+    .quote .qch { width: 54px; }
+    .verdict { font-size: 10px; }
+    .verdict .sym { width: 72px; }
+    .pick { font-size: 11px; gap: 8px; }
+    .pick .sym { width: 78px; }
+    .logbox { font-size: 9px; }
+    .dead { max-height: 36px; }
+    footer { font-size: 8px; letter-spacing: 1px; }
+  }
+  /* 竖屏大屏/平板（宽>820 的竖屏显示器）：保持双列，微调行高与字号 */
+  @media (orientation: portrait) and (min-width: 821px){
+    .logo { font-size: 22px; }
+    .m .v { font-size: 16px; }
+    .quote { font-size: 12px; }
+    .verdict { font-size: 12px; }
+    .logbox { font-size: 11px; }
+    main { grid-template-rows: 1.1fr 1.2fr 1fr; }
+  }
   ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-thumb { background: rgba(0,240,255,.25); border-radius: 3px; }
 </style>
 </head>
@@ -186,12 +239,12 @@ HTML = r"""<!DOCTYPE html>
 
   <main>
     <!-- 左上：权益曲线 -->
-    <div class="card" style="grid-column:1; grid-row:1">
+    <div class="card c-eq" style="grid-column:1; grid-row:1">
       <h3>EQUITY // 权益曲线</h3>
       <div class="chart"><canvas id="eqChart"></canvas></div>
     </div>
     <!-- 右上：指标 -->
-    <div class="card" style="grid-column:2; grid-row:1">
+    <div class="card c-tele" style="grid-column:2; grid-row:1">
       <h3>TELEMETRY // 遥测</h3>
       <div class="metrics">
         <div class="m"><div class="v" id="mEquity">--</div><div class="l">权益</div></div>
@@ -208,14 +261,14 @@ HTML = r"""<!DOCTYPE html>
       <div class="chart" style="flex:1 1 auto; min-height:70px"><canvas id="radar"></canvas></div>
     </div>
     <!-- 左下：选股 -->
-    <div class="card" style="grid-column:1; grid-row:2">
+    <div class="card c-sel" style="grid-column:1; grid-row:2">
       <h3>SELECTION // 每日古法初选 <span style="color:#5f7fa0;font-size:10px" id="selDate"></span></h3>
       <div class="picks" id="picks"><div class="empty">等待初选数据…</div></div>
       <h3 style="margin-top:6px">EXCLUDED // 当日剔除</h3>
       <div class="dead" id="dead" style="font-size:10px; max-height:44px; overflow-y:auto"></div>
     </div>
     <!-- 右下：决策 -->
-    <div class="card" style="grid-column:2; grid-row:2">
+    <div class="card c-dec" style="grid-column:2; grid-row:2">
       <h3>DECISIONS // AI 聚合决策 <span style="color:#5f7fa0;font-size:10px" id="liveTs"></span></h3>
       <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:40px; overflow-y:auto"><div class="empty">无持仓</div></div>
       <div class="verdicts" id="verdicts"><div class="empty">等待决策…</div></div>
@@ -223,7 +276,7 @@ HTML = r"""<!DOCTYPE html>
       <div class="aisteps" id="aisteps"><div class="empty">—</div></div>
     </div>
     <!-- 底部通栏：日志 -->
-    <div class="card" style="grid-column:1 / span 2; grid-row:3">
+    <div class="card c-log" style="grid-column:1 / span 2; grid-row:3">
       <h3>STREAM // 实时日志</h3>
       <div class="logbox" id="log"></div>
     </div>
@@ -234,7 +287,7 @@ HTML = r"""<!DOCTYPE html>
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-let eqHist = [], radarNames = [], radarVals = [];
+let eqHist = [], radarNames = [], radarVals = [], currentMode = "";
 
 /* ---------- 星空粒子 ---------- */
 (function stars(){
@@ -294,7 +347,8 @@ function drawRadar(){
   const W = c.width = c.clientWidth, H = c.height = c.clientHeight;
   ctx.clearRect(0,0,W,H);
   const N = radarNames.length, cx = W/2, cy = H/2, R = Math.min(W,H)/2 - 26;
-  if (!N) { ctx.fillStyle="#4a6a8a"; ctx.font="12px Consolas"; ctx.fillText("NO SIGNAL", cx-34, cy); return; }
+  if (!N) { ctx.fillStyle="#4a6a8a"; ctx.font="12px Consolas";
+    ctx.fillText(currentMode==="signal" ? "TRIGGER WATCH" : "NO SIGNAL", cx-42, cy); return; }
   const ang = i => -Math.PI/2 + i*2*Math.PI/N;
   // 网格环
   for (let ring=1; ring<=4; ring++){
@@ -322,6 +376,7 @@ function drawRadar(){
 function setLed(id, cls, txt){ const l=$(id); if(!l) return; l.className="led "+(cls||""); const t=$(id.slice(3).toLowerCase()+"Txt"); if(t) t.textContent=txt; }
 
 function render(d){
+  currentMode = d.mode||"";
   // 状态灯
   setLed("ledSys", d.status==="ok"?"ok":(d.status==="degraded"?"":"bad"), (d.status||"?").toUpperCase());
   setLed("ledNet", d.net_ok?"ok":"bad", d.net_ok?"LINK":"DOWN");
@@ -334,9 +389,12 @@ function render(d){
   if (d.equity!=null){ $("mEquity").textContent = d.equity.toFixed(2); }
   $("mPeak").textContent = d.peak!=null ? d.peak.toFixed(2) : "--";
   $("mTrades").textContent = d.trades_today!=null ? d.trades_today : "--";
-  $("mCycle").textContent = d.cycle_seconds!=null ? Math.round(d.cycle_seconds) : "--";
-  $("mFills").textContent = d.fills!=null ? d.fills : "--";
-  $("mReview").textContent = d.next_review_seconds!=null ? (d.next_review_seconds/60).toFixed(0)+"m" : "--";
+  $("mCycle").textContent = d.cycle_seconds!=null ? Math.round(d.cycle_seconds)
+    : (d.mode==="signal" ? "布防"+(d.triggers?d.triggers.length:0) : "--");
+  $("mFills").textContent = d.fills!=null ? d.fills
+    : (d.mode==="signal" ? Object.keys(d.quotes||{}).length : "--");
+  $("mReview").textContent = d.next_review_seconds!=null ? (d.next_review_seconds/60).toFixed(0)+"m"
+    : (d.mode==="signal" ? "实时" : "--");
   $("mCand").textContent = d.candidates!=null ? d.candidates : "--";
   $("mDayStart").textContent = d.day_start!=null ? d.day_start.toFixed(2) : "--";
   // 选股
@@ -367,13 +425,20 @@ function render(d){
     }).join("");
     $("liveQuotes").innerHTML = qs;
   } else { $("liveQuotes").innerHTML = '<div class="empty">无持仓</div>'; }
-  if (d.verdicts && d.verdicts.length){
+  if (d.mode==="signal" && d.triggers && d.triggers.length){
+    const ts = d.triggers.map(t=>`<div class="verdict"><span class="sym">${t.sym.replace('/USDT','')}</span>
+      <span class="vbadge hold">入${t.entry_n}</span>
+      <span class="cn">出${t.exit_n}</span>
+      <span class="cf">${t.target!=null?(t.target*100).toFixed(0)+"%仓":""}${t.first_at?" · "+String(t.first_at).slice(11,16):""}</span></div>`).join("");
+    $("verdicts").innerHTML = ts;
+  } else if (d.verdicts && d.verdicts.length){
     const vs = d.verdicts.map(v=>`<div class="verdict"><span class="sym">${v.sym.replace('/USDT','')}</span>
       <span class="vbadge ${v.action}">${v.action}</span>
       <span class="cn">${v.confidence!=null?v.confidence.toFixed(2):"--"}</span>
       <span class="cf">${v.conflicts||""}</span></div>`).join("");
     $("verdicts").innerHTML = vs;
   } else if (d.verdicts && d.verdicts.length===0) { $("verdicts").innerHTML = '<div class="empty">无持仓/无新决策</div>'; }
+  else if (d.mode==="signal") { $("verdicts").innerHTML = '<div class="empty">未布防触发条件</div>'; }
   // AI 十项解读步骤
   if (d.ai_steps && d.ai_steps.length){
     const nOk = d.ai_steps.filter(s=>s.status==="ok").length;
@@ -383,6 +448,11 @@ function render(d){
       const mark = s.status==="ok"?"✓":(s.status==="fallback"?"⚠":"✗");
       return `<div class="aistep ${s.status}"><span class="st">${mark}</span> ${s.name}</div>`;
     }).join("");
+  } else if (d.mode==="signal"){
+    const n = d.triggers ? d.triggers.length : 0;
+    $("aiStepSum").textContent = "// 信号模式 · AI-1 布防";
+    $("aisteps").innerHTML = `<div class="aistep ok"><span class="st">✓</span> AI-1 古法入场条件已布防（${n} 个标的）</div>` +
+      `<div class="aistep ok"><span class="st">✓</span> 实时轮询 2s · 条件触发即执行</div>`;
   }
   // 权益曲线
   if (d.equity_hist) eqHist = d.equity_hist;
@@ -618,6 +688,28 @@ class Snapshot:
             })
         verdicts.sort(key=lambda v: v["sym"])
 
+        # 触发布防（信号模式）：health.triggers: {sym: {entry_conditions, exit_conditions,
+        # entry_target, first_trigger_at, ref_price}} → 前端直接渲染列表。
+        triggers = []
+        for sym, info in (health.get("triggers") or {}).items():
+            if not isinstance(info, dict):
+                continue
+            triggers.append({
+                "sym": sym,
+                "entry_n": int(info.get("entry_conditions") or 0),
+                "exit_n": int(info.get("exit_conditions") or 0),
+                "target": info.get("entry_target"),
+                "first_at": info.get("first_trigger_at"),
+                "ref": info.get("ref_price"),
+            })
+        triggers.sort(key=lambda t: t["sym"])
+
+        # 信号模式：有触发布防即视为 AI 就绪（AI-1 已给出入场条件），顶栏不再显示 DOWN。
+        if health.get("mode") == "signal" and triggers:
+            ai["status"] = "ready"
+            ai_ok = True
+            ai_busy = False
+
         # 雷达：取最后一个决策的 readings（十项）
         radar_names: List[str] = []
         radar_values: List[float] = []
@@ -670,6 +762,7 @@ class Snapshot:
             "picks": picks,
             "dead": dead,
             "verdicts": verdicts,
+            "triggers": triggers,
             "radar": {"names": radar_names, "values": radar_values},
             "equity_hist": equity_hist,
             "logs": self._read_logs_html(),

@@ -5060,6 +5060,16 @@ class GuFaQuantPro:
             )
         except Exception as exc:  # noqa: BLE001 健康报告失败不影响交易
             self.log.debug("信号模式健康报告写入失败（忽略）: %s", exc)
+            return
+        try:
+            # 信号模式同样追加实时权益点，保证大屏权益曲线持续跳动。
+            append_jsonl(self.state_dir / "equity.jsonl", {
+                "ts": iso_now(),
+                "equity": round(snapshot.equity, 6),
+                "live": True,
+            })
+        except Exception as exc:  # noqa: BLE001
+            self.log.debug("信号模式权益点追加失败（忽略）: %s", exc)
 
     def run_cycle(self) -> Dict[str, Any]:
         cycle_started = time.monotonic()
