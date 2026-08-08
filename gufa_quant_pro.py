@@ -218,7 +218,17 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any], mode: int = 0o600)
         os.chmod(temp, mode)
     except OSError:
         pass
-    os.replace(str(temp), str(path))
+    # Windows：目标文件可能被其他进程（如 console/dashboard）短暂以读方式
+    # 打开，os.replace 会抛 PermissionError(WinError 5)。短重试后仍失败再抛。
+    for attempt in range(4):
+        try:
+            os.replace(str(temp), str(path))
+            return
+        except PermissionError:
+            if attempt < 3:
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            raise
 
 
 def append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1322,22 +1332,50 @@ class TriggerCondition:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "TriggerCondition":
+    def from_dict(cls, data: Mapping[str, Any], now_iso: Optional[str] = None) -> "TriggerCondition":
         kind = str(data.get("kind", ""))
         if kind not in {
             "price_above", "price_below", "change_pct_above", "change_pct_below",
             "rsi_above", "rsi_below", "volume_surge", "time_after",
         }:
             raise SafetyError(f"未知触发条件类型: {kind!r}")
-        # time_after 的 value 是 ISO 时间字符串，不能走 finite() 数值转换。
-        raw_value = data.get("value")
-        value: Any = str(raw_value) if kind == "time_after" else finite(raw_value)
+        if kind == "time_after":
+            # time_after 的 value 是 ISO 时间字符串；兼容 AI 输出纯数字 N
+            # （表示 N 小时后），此时需要 now_iso 上下文换算成绝对时刻。
+            value: Any = cls._normalize_time_after(data.get("value"), now_iso)
+        else:
+            # 数值类条件，不能走 finite() 吞掉非法值。
+            value = finite(data.get("value"))
         return cls(
             kind=kind,
             value=value,
             ref_price=finite(data.get("ref_price")),
             note=str(data.get("note", "")),
         )
+
+    @staticmethod
+    def _normalize_time_after(raw_value: Any, now_iso: Optional[str]) -> str:
+        """把 time_after 的 value 规范为 ISO 时间字符串。
+
+        AI 可能输出 ISO 时间戳（推荐）或纯数字 N（表示 N 小时后）；两者都
+        无法解析时返回空串，由调用方丢弃该条件（绝不产生永不触发/误触发）。
+        """
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return ""
+        dt = parse_iso(raw)
+        if dt is not None:
+            return dt.isoformat()
+        if now_iso:
+            try:
+                hours = float(raw)
+                if 0 < hours <= 720:  # 最多 30 天，防止异常大数
+                    base = parse_iso(now_iso)
+                    if base is not None:
+                        return (base + timedelta(hours=hours)).isoformat()
+            except (TypeError, ValueError):
+                pass
+        return ""
 
 
 @dataclass
@@ -1391,6 +1429,9 @@ class TriggerSet:
             TriggerCondition.from_dict(item)
             for item in data.get("exit", []) if isinstance(item, dict)
         ]
+        # 双保险：丢弃无法解析为绝对时刻的 time_after（防止空值/非法值误触发）。
+        exit_conds = [c for c in exit_conds if not (c.kind == "time_after" and not c.value)]
+        entry = [c for c in entry if not (c.kind == "time_after" and not c.value)]
         return cls(
             symbol=str(data.get("symbol", "")),
             entry=entry,
@@ -3006,6 +3047,12 @@ class AIAdvisor:
         return AIRelayError(message, status=status, detail=detail)
 
     def _completion_content(self, messages: Sequence[Mapping[str, str]]) -> str:
+        """请求 AI 并返回非空正文；空正文/网络抖动自动重试（最多 2 次）。
+
+        对 reasoning 型模型（如 deepseek-v4-flash），中转站偶发把输出预算
+        耗尽在思考上、返回空 content（finish=length）。重试时依次去掉
+        response_format / reasoning_effort 并放宽 max_tokens，最大化成功概率。
+        """
         kwargs: Dict[str, Any] = {
             "model": self.config.model,
             "messages": list(messages),
@@ -3017,17 +3064,31 @@ class AIAdvisor:
             # 思考档位：low 可显著降低 reasoning 模型（如 deepseek-v4-flash）
             # 把输出预算耗尽在思考上导致空正文的概率。
             kwargs["reasoning_effort"] = self.config.reasoning_effort
-        try:
-            response = self.client.chat.completions.create(**kwargs)
-        except Exception as exc:  # noqa: BLE001 - SDK/网络/中转站错误统一转成可读信息
-            raise self._relay_error(exc) from exc
-        try:
-            content = response.choices[0].message.content
-        except (AttributeError, IndexError, TypeError) as exc:
-            raise ConfigError("AI 响应缺少 choices[0].message.content") from exc
-        if not isinstance(content, str) or not content.strip():
-            raise ConfigError("AI 响应正文必须是非空 JSON string")
-        return content.strip()
+        last_exc: Optional[BaseException] = None
+        for attempt in range(3):
+            try:
+                response = self.client.chat.completions.create(**kwargs)
+                content = response.choices[0].message.content
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                last_exc = ConfigError("AI 响应正文必须是非空 JSON string")
+            except Exception as exc:  # noqa: BLE001 - SDK/网络/中转站错误统一转成可读信息
+                last_exc = self._relay_error(exc)
+            if attempt < 2:
+                self.log.warning(
+                    "AI 响应为空或请求失败（第 %d 次），调整参数重试: %s",
+                    attempt + 1, last_exc,
+                )
+                time.sleep(0.8 * (attempt + 1))
+                if attempt == 0:
+                    kwargs.pop("response_format", None)
+                else:
+                    kwargs.pop("reasoning_effort", None)
+                    kwargs["max_tokens"] = min(
+                        int(kwargs.get("max_tokens", 3000)) + 1000, 4000
+                    )
+        assert last_exc is not None
+        raise last_exc
 
     @staticmethod
     def _target_level(target: float, current_fraction: float) -> str:
@@ -3593,7 +3654,10 @@ class AIAdvisor:
                 if not isinstance(item, dict):
                     continue
                 try:
-                    conditions.append(TriggerCondition.from_dict(item))
+                    cond = TriggerCondition.from_dict(item, now_iso=now_iso)
+                    if cond.kind == "time_after" and not cond.value:
+                        continue  # time_after 无法解析为绝对时刻，丢弃
+                    conditions.append(cond)
                 except Exception:  # noqa: BLE001 单条无效忽略
                     continue
         if decision == "no_trade":
@@ -3671,7 +3735,10 @@ class AIAdvisor:
                 if not isinstance(item, dict):
                     continue
                 try:
-                    conditions.append(TriggerCondition.from_dict(item))
+                    cond = TriggerCondition.from_dict(item, now_iso=now_iso)
+                    if cond.kind == "time_after" and not cond.value:
+                        continue  # time_after 无法解析为绝对时刻，丢弃
+                    conditions.append(cond)
                 except Exception:  # noqa: BLE001
                     continue
         summary = str(parsed.get("summary", "")).strip()[:200]
@@ -3839,6 +3906,14 @@ class GuFaQuantPro:
         )
         self.gateway = ExchangeGateway(config, self.store, logger, credentials)
         self.engine = StrategyEngine(config.strategy, paipan_config=config.paipan)
+        # 信号触发模式需要直接访问排盘服务（古法择时 + AI 盘面载荷）；
+        # 周期模式走 engine，这里独立初始化一份，失败只降级不阻塞。
+        self.paipan_service: Optional[PaipanService] = None
+        try:
+            if getattr(config.paipan, "enabled", False):
+                self.paipan_service = build_paipan_service(config.paipan)
+        except Exception as exc:  # noqa: BLE001 排盘降级：择时回退立即监听、AI 载荷为空
+            self.log.warning("排盘服务初始化失败，古法择时/盘面载荷降级: %s", exc)
         self.risk = RiskManager(config.risk, self.store, logger)
         self.ai = AIAdvisor(config.ai, logger, credentials)
         self.ai.bind_strategy_weights(config.strategy.weights)
@@ -4483,10 +4558,13 @@ class GuFaQuantPro:
                 return False
             return volume_ratio >= cond.value
         if kind == "time_after":
-            try:
-                return now_iso >= str(cond.value)
-            except Exception:
+            # 用 datetime 比较，杜绝字符串比较的误判（如空串恒真、纯数字串）；
+            # 无法解析的 time_after 一律不触发，等待下次 AI 重新设定。
+            target = parse_iso(str(cond.value))
+            now = parse_iso(now_iso)
+            if target is None or now is None:
                 return False
+            return now >= target
         return False
 
     def _trigger_poll_loop(self) -> None:
@@ -4536,12 +4614,44 @@ class GuFaQuantPro:
                 continue
             time.sleep(self.config.runtime.trigger_poll_seconds)
 
+    def _sync_positions(self, snapshot: AccountSnapshot) -> None:
+        """信号模式：以交易所实时快照为权威源，同步 state.positions。
+
+        只保留快照中仍有余额的持仓（amount>0），并尽量延续历史 avg_entry /
+        high_water / opened_at；仅在发生变化时落盘，避免每 2 秒重复写文件。
+        """
+        state = self.store.state
+        new_positions: Dict[str, PositionState] = {}
+        for key, pos in snapshot.positions.items():
+            if pos.amount <= 0 or pos.quote_value < self.config.risk.dust_quote:
+                continue  # 空仓 / dust 残留都不算持仓，避免误触发补设出场条件
+            old = state.positions.get(key)
+            new_positions[key] = PositionState(
+                amount=pos.amount,
+                avg_entry=old.avg_entry if old else pos.avg_entry,
+                high_water=old.high_water if old and old.high_water > 0 else pos.high_water,
+                opened_at=old.opened_at if old else iso_now(),
+                updated_at=iso_now(),
+                market=pos.market,
+                side=pos.side,
+                leverage=pos.leverage,
+            )
+        if new_positions != state.positions:
+            state.positions = new_positions
+            try:
+                self.store.save()
+            except Exception as exc:  # noqa: BLE001 落盘失败不阻断监听，下次 tick 重试
+                self.log.warning("持仓状态同步落盘失败（下次 tick 重试）: %s", exc)
+
     def _trigger_tick(self) -> None:
         """单轮触发检查：刷新行情 -> 评估入场/出场 -> 执行。"""
         now_dt = datetime.now(timezone.utc)
         now_iso = iso_now()
         # 深度不足缓存按 UTC 日切：先清理昨日记录，当日新拒单再入缓存。
         self._prune_depth_blocked()
+        # 挂单对账：信号模式同样需要核对 write-ahead 残留的 pending 订单
+        # （进程崩溃/状态落盘失败后重启，必须确认订单是否已成交，禁止盲目重下）。
+        self.gateway.reconcile_pending_orders()
         # 行情：全量 ticker 一次拉取（OKX 批量接口限频 20req/2s，2 秒轮询安全）。
         # 目标 = 白名单现货 + 状态内持仓键（spot 裸名 / swap:SYMBOL）。
         try:
@@ -4555,16 +4665,21 @@ class GuFaQuantPro:
         snapshot = self.gateway.account_snapshot(
             {sym: prices[sym] for sym in self.config.runtime.symbols if prices.get(sym, 0.0) > 0}
         )
+        # 信号模式以交易所实时快照为权威源：同步 state.positions，
+        # 防止状态落盘失败/进程崩溃后本地持仓记录与交易所脱节。
+        self._sync_positions(snapshot)
         # 已持仓基准名（spot 裸名 / swap 前缀都归一到裸名，避免重复入场）。
+        # dust 残留（低于 dust_quote）不算持仓。
         managed_bases = {
             split_position_key(key)[1]
-            for key, pos in snapshot.positions.items() if pos.amount > 0
+            for key, pos in snapshot.positions.items()
+            if pos.amount > 0 and pos.quote_value >= self.config.risk.dust_quote
         }
         triggers = self.store.state.triggers
         # ---- 出场检查（先卖，释放资金） ----
         for key, pos in snapshot.positions.items():
-            if pos.amount <= 0:
-                continue
+            if pos.amount <= 0 or pos.quote_value < self.config.risk.dust_quote:
+                continue  # 空仓 / dust 不参与出场评估
             base = split_position_key(key)[1]
             if base not in triggers:
                 if (
@@ -4690,7 +4805,7 @@ class GuFaQuantPro:
         except Exception:  # noqa: BLE001
             paipan_payload = None
         position = self.store.state.positions.get(symbol)
-        position_quote = float(position.get("quote_value", 0.0)) if position else 0.0
+        position_quote = float(position.amount * price) if position else 0.0
         conditions, summary, decision, target_level = self.ai.decide_entry(
             symbol, price, paipan_payload,
             self._last_equity(), position_quote, now_iso,
@@ -4852,8 +4967,12 @@ class GuFaQuantPro:
         })
         self._notify("trigger_exit", {"symbol": symbol, "side": "sell"})
         # 出场后清触发状态，下次 tick 由 AI-1 重新评估入场。
+        # 注意：此时订单已成交，状态落盘失败只记警告，绝不误报"下单失败"。
         self.store.state.triggers.pop(symbol, None)
-        self.store.save()
+        try:
+            self.store.save()
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("出场状态落盘失败 %s（订单已成交，下次 tick 自动校正）: %s", symbol, exc)
         self._update_equity_from_fill(fill)
 
     def _arm_exit_trigger(
@@ -4866,7 +4985,7 @@ class GuFaQuantPro:
         except Exception:  # noqa: BLE001
             paipan_payload = None
         position = self.store.state.positions.get(symbol)
-        position_quote = float(position.get("quote_value", 0.0)) if position else 0.0
+        position_quote = float(position.amount * current_price) if position else 0.0
         exit_conds, summary, status = self.ai.decide_exit(
             symbol, current_price, ref_price, paipan_payload,
             self._last_equity(), position_quote, iso_now(),

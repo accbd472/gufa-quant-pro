@@ -1915,6 +1915,35 @@ def test_evaluate_condition_all_kinds() -> None:
         assert ev(None, cond, price, rsi, vol, now) == want, cond.kind
 
 
+def test_trigger_condition_time_after_normalization() -> None:
+    """AI 输出 time_after 的兼容性：ISO 时间戳原样保留，纯数字 N 转 N 小时后。"""
+    now = g.iso_now()
+    # ISO 时间戳
+    c1 = g.TriggerCondition.from_dict(
+        {"kind": "time_after", "value": "2026-08-10T00:00:00+00:00", "note": "x"},
+        now_iso=now,
+    )
+    assert c1.value == "2026-08-10T00:00:00+00:00"
+    # 纯数字 N（24 = 24 小时后）
+    c2 = g.TriggerCondition.from_dict(
+        {"kind": "time_after", "value": "24", "note": "x"}, now_iso=now,
+    )
+    base = g.parse_iso(now)
+    assert g.parse_iso(c2.value) is not None
+    delta = (g.parse_iso(c2.value) - base).total_seconds()
+    assert abs(delta - 24 * 3600) < 5
+    # 非法值 -> 空串（调用方丢弃，绝不误触发）
+    c3 = g.TriggerCondition.from_dict(
+        {"kind": "time_after", "value": "??", "note": "x"}, now_iso=now,
+    )
+    assert c3.value == ""
+    # 数值类条件不受影响
+    c4 = g.TriggerCondition.from_dict(
+        {"kind": "change_pct_above", "value": 0.08, "ref_price": 1.0},
+    )
+    assert c4.value == 0.08
+
+
 def test_runtime_trigger_config_validation(tmp_path: Path) -> None:
     def load_default(mutator):
         payload = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
