@@ -446,7 +446,9 @@ function render(d){
   if (d.ai_steps && d.ai_steps.length){
     const nOk = d.ai_steps.filter(s=>s.status==="ok").length;
     const nFb = d.ai_steps.filter(s=>s.status==="fallback").length;
-    $("aiStepSum").textContent = `// ${nOk}✓ ${nFb}⚠ 规则兜底` + (d.ai_agg_failed ? " · 聚合兜底" : "");
+    $("aiStepSum").textContent = d.mode==="signal"
+      ? "// 信号模式 · AI 实时决策"
+      : `// ${nOk}✓ ${nFb}⚠ 规则兜底` + (d.ai_agg_failed ? " · 聚合兜底" : "");
     $("aisteps").innerHTML = d.ai_steps.map(s=>{
       const mark = s.status==="ok"?"✓":(s.status==="fallback"?"⚠":"✗");
       return `<div class="aistep ${s.status}"><span class="st">${mark}</span> ${s.name}</div>`;
@@ -529,17 +531,52 @@ class Snapshot:
         return out
 
     # ---------- AI 步骤解析（最近一个周期内） ----------
-    def _ai_steps_and_status(self, health: Dict[str, Any]) -> Dict[str, Any]:
+    def _ai_steps_and_status(self, health: Dict[str, Any], mode: str = "") -> Dict[str, Any]:
         """解析 AI 十项解读的每步状态。
 
-        以「最近周期完成之后」的日志为准（当前周期进行中的 AI 活动），
-        并结合 health.decisions 的 fallback 标志判断最近已完成周期的结果。
-        日志约定：AI 拆分解读只有失败才写日志（成功不打印）。
+        周期模式：以「最近周期完成之后」的日志为准，统计拆分解读失败；
+        信号模式：无周期概念，直接按日志尾部统计 AI-1 入场决策成败 /
+                  AI-2 出场监控 / 空响应重试，反映真实 AI 健康度。
         """
         methods = ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]
         failed: set[str] = set()
         agg_failed = False
         relay_error = False
+
+        # ---- 信号模式：真实统计 ----
+        if mode == "signal":
+            ok1 = fail1 = empty = 0
+            for line in _tail(self.log_path, 300):
+                try:
+                    j = json.loads(line)
+                    msg = str(j.get("message", ""))
+                except Exception:
+                    continue
+                if "AI-1 入场决策失败" in msg:
+                    fail1 += 1
+                elif "AI-1 入场决策" in msg and "decision=" in msg:
+                    ok1 += 1
+                elif "AI 响应为空或请求失败" in msg or "AI 中转站错误" in msg:
+                    empty += 1
+            total = ok1 + fail1
+            if total == 0:
+                status = "idle"
+            elif fail1 > 0 and ok1 == 0:
+                status = "down"
+            elif fail1 > 0:
+                status = "degraded"
+            else:
+                status = "ready"
+            steps = [
+                {"name": f"AI-1 古法入场 · 成功 {ok1} · 失败 {fail1}",
+                 "status": "ok" if ok1 >= fail1 else "error"},
+                {"name": "AI-2 出场条件监控 · 就绪", "status": "ok"},
+                {"name": "AI 请求正常" if empty == 0 else f"AI 空响应/中转站错误 {empty} 次",
+                 "status": "ok" if empty == 0 else "fallback"},
+            ]
+            return {"status": status, "steps": steps,
+                    "agg_failed": False, "failed": sorted(failed)}
+
         lines = _tail(self.log_path, 200)
         # 从尾部往前收集最近一个周期内的 AI 失败。
         # 周期完成/失败日志是边界标记：跳过第一个（最近周期的结尾），
@@ -596,6 +633,7 @@ class Snapshot:
         if size == self._log_size and self._log_cache:
             return "".join(self._log_cache)
         rows: List[str] = []
+        dedup_seen: set[str] = set()
         for line in _tail(self.log_path, LOG_TAIL):
             try:
                 j = json.loads(line)
@@ -606,6 +644,14 @@ class Snapshot:
                 continue
             if not self._is_key_event(msg):
                 continue
+            # 高频刷屏事件合并：AI 错误/空响应/决策失败只保留最新 1 条，
+            # 避免日志卡被上游 503 刷屏，挤掉成交/布防等关键事件。
+            if ("AI 响应为空或请求失败" in msg or "AI 中转站错误" in msg
+                    or "AI-1 入场决策失败" in msg):
+                key = "AI_ERR"
+                if key in dedup_seen:
+                    continue
+                dedup_seen.add(key)
             if len(msg) > 130:
                 msg = msg[:130] + "…"
             cls = lvl if lvl in ("INFO", "WARNING", "ERROR") else ""
@@ -629,6 +675,10 @@ class Snapshot:
             "AI 聚合决策", "首次响应结构无效",
             "BUY filled", "SELL filled", "买入", "卖出", "下单",
             "订单", "成交", "仓位", "止损", "止盈",
+            # 信号模式关键事件
+            "信号触发模式启动", "AI-1 入场决策", "AI-2 出场",
+            "AI 响应为空或请求失败", "AI 中转站错误", "布防", "触发条件",
+            "AI-1 响应结构无效",
         )):
             return True
         # 网络错误合并显示：只保留每种错误最近 1 条
@@ -664,7 +714,7 @@ class Snapshot:
             net_ok = last_ok_ts > last_err_ts
         elif last_err_ts:
             net_ok = False
-        ai = self._ai_steps_and_status(health)
+        ai = self._ai_steps_and_status(health, health.get("mode", ""))
         ai_ok = ai["status"] == "ready"
         ai_busy = False
 
@@ -707,8 +757,8 @@ class Snapshot:
             })
         triggers.sort(key=lambda t: t["sym"])
 
-        # 信号模式：有触发布防即视为 AI 就绪（AI-1 已给出入场条件），顶栏不再显示 DOWN。
-        if health.get("mode") == "signal" and triggers:
+        # 信号模式：idle（刚启动尚未决策）且已有布防 → 视为就绪；否则以真实统计为准。
+        if health.get("mode") == "signal" and ai["status"] == "idle" and triggers:
             ai["status"] = "ready"
             ai_ok = True
             ai_busy = False
