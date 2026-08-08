@@ -3,13 +3,17 @@
 """
 GuFaQuant-Pro 8.0
 
+本文件由 AI 编写（模型：deepseek-v4-flash-0731）；使用前请自行审查，
+作者不对代码正确性、安全性或交易结果作任何担保。
+
 面向生产部署的、默认安全的 CCXT 现货多标的量化交易服务。
 
 设计边界：
 - 仅支持现货、单向做多；不伪装成可跨交易所安全通用的合约系统。
 - 不提供本地纸面账户；默认连接交易所 Sandbox/Testnet/Demo API，所有成交均以交易所回报为准。
 - 8.0 起十大古法因子替换为真实排盘（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱），
-  AI 作为断卦师解读完整盘面并转译为 BUY/SELL/HOLD；decision_mode=full 时 AI 全权决策：
+  由大语言模型（默认 deepseek-v4-flash-0731，config.ai.model 可配置）作为断卦师解读完整盘面
+  并转译为 BUY/SELL/HOLD；decision_mode=full 时 AI 全权决策：
   动作与目标仓位自主，不启用保护性止损/止盈/移动止损，账户级熔断（日内亏损/回撤/成交
   次数）与单币/总仓位/合约名义上限均放开；仅保留 ORDER_UNCERTAIN 硬停、max_order_quote
   单笔上限与现金留存等交易所安全阀。
@@ -4841,6 +4845,7 @@ def cmd_paipan_report(
         "version": APP_VERSION,
         "generated_at": utc_now().isoformat(),
         "report_time": now_dt.isoformat(),
+        "ai_model": config.ai.model or "",
         "paipan": {
             "true_solar_time": config.paipan.true_solar_time,
             "longitude": config.paipan.longitude,
@@ -4898,7 +4903,10 @@ def _report_markdown(payload: Dict[str, Any]) -> str:
                 summary = "、".join(str(chart.get(k)) for k in key if chart.get(k))
                 lines.append(f"- {method}: {summary or '（见完整 JSON）'}")
         lines.append("")
-    lines.append("> 排盘过程真实可复现；预测准确性不保证，不构成投资建议。")
+    lines.append(
+        f"> 排盘过程真实可复现；断卦解读由大模型生成（model={payload.get('ai_model') or '未配置'}）；"
+        "预测准确性不保证，不构成投资建议。"
+    )
     return "\n".join(lines)
 
 
