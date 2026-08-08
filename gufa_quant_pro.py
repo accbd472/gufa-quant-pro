@@ -1294,6 +1294,9 @@ class BotState:
     daily_selection_scores: Dict[str, float] = field(default_factory=dict)
     daily_selection_candle_times: Dict[str, str] = field(default_factory=dict)
     daily_selection_dead: Dict[str, str] = field(default_factory=dict)
+    # 当日订单簿深度不足（buy 拒单）的标的：symbol -> UTC 日期。次日自动失效重试，
+    # 避免薄盘币每周期重复下单失败刷日志；有持仓时卖出/保护性退出不受影响。
+    depth_blocked: Dict[str, str] = field(default_factory=dict)
     halted_reason: str = ""
 
     @classmethod
@@ -1330,6 +1333,9 @@ class BotState:
             },
             daily_selection_dead={
                 str(k): str(v) for k, v in dict(data.get("daily_selection_dead", {})).items()
+            },
+            depth_blocked={
+                str(k): str(v) for k, v in dict(data.get("depth_blocked", {})).items()
             },
             halted_reason=str(data.get("halted_reason", "")),
         )
@@ -3681,6 +3687,29 @@ class GuFaQuantPro:
         """判断一个初选失败是否属于死币（无行情数据），而非系统故障。"""
         return any(marker in message for marker in DEAD_SYMBOL_MARKERS)
 
+    @staticmethod
+    def _is_depth_error(message: str) -> bool:
+        """判断订单失败是否属于订单簿深度不足（薄盘拒单），而非系统故障。"""
+        return "订单簿深度不足以成交" in message
+
+    def _depth_blocked_today(self, symbol: str) -> bool:
+        """该标的是否已在当日深度不足缓存中（仅拦截新买入，卖出/保护退出不拦）。"""
+        today = utc_now().date().isoformat()
+        return self.store.state.depth_blocked.get(symbol) == today
+
+    def _prune_depth_blocked(self) -> None:
+        """清理过期深度缓存：仅保留当日的记录，次日自动失效重试。"""
+        today = utc_now().date().isoformat()
+        stale = {
+            symbol: day
+            for symbol, day in self.store.state.depth_blocked.items()
+            if day != today
+        }
+        if stale:
+            self.log.info("深度不足缓存过期清理 %d 个标的: %s", len(stale), sorted(stale))
+            for symbol in stale:
+                self.store.state.depth_blocked.pop(symbol, None)
+
     def _account_prices(self) -> Dict[str, float]:
         """账户估值必须覆盖完整白名单，即使标的未通过当日初选。
 
@@ -3983,6 +4012,8 @@ class GuFaQuantPro:
 
     def run_cycle(self) -> Dict[str, Any]:
         cycle_started = time.monotonic()
+        # 深度不足缓存按 UTC 日切：先清理昨日记录，当日新拒单再入缓存。
+        self._prune_depth_blocked()
         self.gateway.reconcile_pending_orders()
 
         # 第一阶段：每天用闭合日线扫描完整人工白名单。失败时 selected_symbols 为空，
@@ -4045,6 +4076,13 @@ class GuFaQuantPro:
                     leverage=decision.leverage,
                 )
                 if plan:
+                    if plan.side == "buy" and self._depth_blocked_today(symbol):
+                        self.log.info(
+                            "%s 当日订单簿深度不足，跳过买入（次日自动重试）: %s",
+                            symbol,
+                            self.store.state.depth_blocked.get(symbol, ""),
+                        )
+                        continue
                     plans.append(plan)
             except SafetyError as exc:
                 self.log.warning("%s 无法生成订单: %s", symbol, exc)
@@ -4098,6 +4136,9 @@ class GuFaQuantPro:
                     "plan": asdict(plan),
                     "error": repr(exc),
                 })
+                # 薄盘深度不足：当日记入 depth_blocked，本日不再重试买入（次日自动恢复）。
+                if plan.side == "buy" and self._is_depth_error(str(exc)):
+                    self.store.state.depth_blocked[plan.symbol] = utc_now().date().isoformat()
                 self.log.error("订单执行失败 %s %s: %s", plan.symbol, plan.side, exc, exc_info=True)
 
         state = self.store.state

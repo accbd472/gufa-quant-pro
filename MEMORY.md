@@ -26,3 +26,12 @@
 - `gufa_divination/` 是旧版平行包（仅被自身测试引用），主程序用顶层模块；保留勿删。
 - 正式盘安全门：`exchange.sandbox=false` 必须同时设置 `risk.live_trading_ack="I_UNDERSTAND_LIVE_TRADING_RISK"`。
 
+## 8.7.0 双市场（2026-08-08，commit c549dd9 + 3a83e18）
+
+- 目标：AI 可自主选择现货（spot）或合约（swap，OKX USDT 本位永续）+ 杠杆（1..max_leverage），long-only。
+- 配置（config.json 不入库，gitignore）：`exchange.allowed_markets=["spot","swap"]`、`market_type` 保持 `"spot"`（保证 profile_id 不变、旧状态文件沿用）；`risk.max_leverage=3.0`（保守起步，可调）、`futures_allow_short=false`、`max_futures_notional_pct=0.5`、`futures_margin_cap_pct=0.3`。
+- 合约仅在 sandbox 可用（`ExchangeConfig.validate` 强制：allowed_markets 含 swap 且非 sandbox 直接报错）；实盘合约需人工复核杠杆与强平风控后另开。
+- 无永续合约的币（OKB/PI/API3/APT/…共 28 个）自动回退现货，仅警告不阻塞；纯合约配置才硬校验。
+- 状态键：现货原符号，合约 `swap:SYMBOL`；AI 聚合决策失败时规则兜底 market=spot/leverage=1。
+- 已知噪音：tokenrhythm.studio 的 deepseek-v4-flash-0731 间歇性返回非 JSON，AI 拆解/聚合决策回退规则解读（8.4.1 起就有）；`validate` 子命令对死币（CC/CHIP/BREV 等无行情）硬校验 FATAL，run 模式不受影响。
+

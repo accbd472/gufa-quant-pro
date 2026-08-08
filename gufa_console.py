@@ -756,8 +756,19 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if section not in body or not isinstance(body[section], dict):
                 continue
             for key in fields:
-                if key in body[section]:
-                    payload.setdefault(section, {})[key] = body[section][key]
+                if key not in body[section]:
+                    continue
+                new_value = body[section][key]
+                # 防御：代理字段不允许用空值覆盖已有代理（网页表单未回填时会把
+                # proxy_url 清空，导致交易进程失去代理而无法连接交易所）。
+                if (
+                    section == "exchange"
+                    and key in {"proxy_url", "proxy_list"}
+                    and not new_value
+                    and payload.get("exchange", {}).get(key)
+                ):
+                    continue
+                payload.setdefault(section, {})[key] = new_value
         try:
             g.atomic_write_json(self.server.config_path, payload, mode=0o644)
             g.AppConfig.load(self.server.config_path)  # 校验
