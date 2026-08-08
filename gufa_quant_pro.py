@@ -2209,6 +2209,17 @@ class ExchangeGateway:
         供信号触发模式每 2 秒轮询使用：OKX 批量 tickers 接口限频 20req/2s，
         全部标的合并为一个请求，避免逐个 fetch_ticker 打爆限频。
         """
+        prices, _ = self.fetch_all_tickers_full(symbols)
+        return prices
+
+    def fetch_all_tickers_full(
+        self, symbols: Optional[Iterable[str]] = None
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """批量最新价 + 24h 涨跌幅（一次请求），返回 (prices, changes)。
+
+        prices: 状态键 → 最新价；changes: 状态键 → 24h 涨跌幅百分比。
+        供信号模式健康报告写入 change_pct，驱动大屏行情涨跌箭头。
+        """
         if symbols is None:
             symbols = self.runtime.symbols
         target_map: Dict[str, str] = {}
@@ -2218,19 +2229,23 @@ class ExchangeGateway:
             market, base = split_position_key(str(symbol))
             target_map[self.exchange_symbol(market, base)] = str(symbol)
         if not target_map:
-            return {}
+            return {}, {}
         tickers = self._safe_call(
             "fetch_tickers", lambda: self.client.fetch_tickers(list(target_map)),
         )
-        result: Dict[str, float] = {}
+        prices: Dict[str, float] = {}
+        changes: Dict[str, float] = {}
         for ex_symbol, ticker in (tickers or {}).items():
             state_key = target_map.get(str(ex_symbol))
             if state_key is None:
                 continue
             price = finite(ticker.get("last") or ticker.get("close"))
             if price > 0:
-                result[state_key] = price
-        return result
+                prices[state_key] = price
+            pct = finite(ticker.get("percentage"))
+            if -100 <= pct <= 1000:
+                changes[state_key] = pct
+        return prices, changes
 
     def reconcile_pending_orders(self) -> None:
         state = self.state_store.state
@@ -4659,7 +4674,7 @@ class GuFaQuantPro:
             for key in self.store.state.positions:
                 if key not in target_keys:
                     target_keys.append(key)
-            prices = self.gateway.fetch_all_tickers(target_keys)
+            prices, changes = self.gateway.fetch_all_tickers_full(target_keys)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"批量行情拉取失败: {exc}") from exc
         snapshot = self.gateway.account_snapshot(
@@ -4764,7 +4779,7 @@ class GuFaQuantPro:
                     break
         # 触发状态写盘 + 大屏健康报告
         self.store.save()
-        self._write_signal_health(snapshot, prices)
+        self._write_signal_health(snapshot, prices, changes)
 
     def _trigger_indicators(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         """轻量指标：RSI(14) 与成交量突增比（最新 1h 量 / 前 20 根均值）。
@@ -5018,7 +5033,8 @@ class GuFaQuantPro:
         except Exception:  # noqa: BLE001
             pass
 
-    def _write_signal_health(self, snapshot: AccountSnapshot, prices: Mapping[str, float]) -> None:
+    def _write_signal_health(self, snapshot: AccountSnapshot, prices: Mapping[str, float],
+                             changes: Optional[Mapping[str, float]] = None) -> None:
         """信号模式健康报告（大屏/监控）：权益、持仓、触发条件概览。"""
         state = self.store.state
         triggers_view: Dict[str, Any] = {}
@@ -5048,6 +5064,7 @@ class GuFaQuantPro:
                 sym: {
                     "price": round(pos.price, 10),
                     "value": round(pos.quote_value, 6),
+                    "change_pct": round(changes.get(sym, 0.0), 4) if changes else 0.0,
                 }
                 for sym, pos in snapshot.positions.items()
             },
