@@ -40,7 +40,7 @@ import time
 import traceback
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -71,9 +71,9 @@ except ImportError as exc:  # pragma: no cover
     _PAIPAN_IMPORT_ERROR = exc
 
 APP_NAME = "GuFaQuant-Pro"
-APP_VERSION = "8.7.0"
+APP_VERSION = "8.8.0"
 CONFIG_VERSION = 3
-STATE_VERSION = 4
+STATE_VERSION = 5
 CREDENTIALS_VERSION = 2
 AI_KEYS_VERSION = 1
 STRATEGY_NAMES = ("奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱")
@@ -661,6 +661,12 @@ class RuntimeConfig:
     webhook_url: str = ""  # 可选：成交/熔断等事件通知端点（留空禁用）
     once_on_start: bool = True
     max_consecutive_cycle_errors: int = 5
+    # 信号触发模式（trigger_mode="signal"）：不再按固定周期全量重算，
+    # 而是 AI 预设触发条件（价格/涨跌幅/RSI/放量/吉时），监听循环按最小间隔
+    # （OKX 批量 tickers 限频 20req/2s，取 2 秒）轮询，条件命中才执行交易。
+    trigger_mode: str = "signal"   # "signal"=信号触发（默认）| "cycle"=旧周期模式
+    trigger_poll_seconds: int = 2  # 监听轮询间隔（秒），不得小于 1
+    trigger_max_wait_hours: float = 24.0  # 触发条件最长等待，超时唤醒 AI 重新评估
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "RuntimeConfig":
@@ -669,8 +675,10 @@ class RuntimeConfig:
         int_fields = {
             "ohlcv_limit", "poll_interval_seconds", "max_candle_lag_seconds",
             "log_max_bytes", "log_backup_count", "max_consecutive_cycle_errors",
+            "trigger_poll_seconds",
         }
         bool_fields = {"closed_candle_only", "once_on_start"}
+        float_fields = {"trigger_max_wait_hours"}
         values: Dict[str, Any] = {}
         for key, value in data.items():
             path = f"runtime.{key}"
@@ -689,6 +697,13 @@ class RuntimeConfig:
                 values[key] = require_json_int(value, path)
             elif key in bool_fields:
                 values[key] = require_json_bool(value, path)
+            elif key in float_fields:
+                values[key] = require_json_number(value, path)
+            elif key == "trigger_mode":
+                mode = require_json_string(value, path).strip().lower()
+                if mode not in {"signal", "cycle"}:
+                    raise ConfigError("runtime.trigger_mode 必须是 signal 或 cycle")
+                values[key] = mode
         cfg = cls(**values)
         cfg.symbols = [symbol.strip() for symbol in cfg.symbols]
         cfg.quote_currency = cfg.quote_currency.strip().upper()
@@ -716,6 +731,10 @@ class RuntimeConfig:
             raise ConfigError("runtime.ohlcv_limit 至少为 120")
         if self.poll_interval_seconds < 5:
             raise ConfigError("runtime.poll_interval_seconds 至少为 5 秒")
+        if self.trigger_poll_seconds < 1:
+            raise ConfigError("runtime.trigger_poll_seconds 至少为 1 秒")
+        if self.trigger_max_wait_hours <= 0 or self.trigger_max_wait_hours > 168:
+            raise ConfigError("runtime.trigger_max_wait_hours 必须在 (0, 168] 小时")
         if not self.timeframe:
             raise ConfigError("runtime.timeframe 不能为空")
         if not self.state_dir or not self.health_file:
@@ -1281,6 +1300,112 @@ class PositionState:
 
 
 @dataclass
+class TriggerCondition:
+    """一条触发条件。
+
+    kind: price_above / price_below        —— 现价（相对 ref_price 基准价）
+          change_pct_above / below         —— 相对基准价的涨跌幅（如 0.05=+5%）
+          rsi_above / rsi_below            —— RSI 阈值
+          volume_surge                     —— 成交量突增倍数（value=倍数）
+          time_after                       —— 到点唤醒（value=ISO 时间戳）
+    value: 条件数值
+    ref_price: 基准价（买入价基准；price/change 类必须）
+    note: AI 给出的可读理由
+    """
+
+    kind: str
+    value: float
+    ref_price: float = 0.0
+    note: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TriggerCondition":
+        kind = str(data.get("kind", ""))
+        if kind not in {
+            "price_above", "price_below", "change_pct_above", "change_pct_below",
+            "rsi_above", "rsi_below", "volume_surge", "time_after",
+        }:
+            raise SafetyError(f"未知触发条件类型: {kind!r}")
+        # time_after 的 value 是 ISO 时间字符串，不能走 finite() 数值转换。
+        raw_value = data.get("value")
+        value: Any = str(raw_value) if kind == "time_after" else finite(raw_value)
+        return cls(
+            kind=kind,
+            value=value,
+            ref_price=finite(data.get("ref_price")),
+            note=str(data.get("note", "")),
+        )
+
+
+@dataclass
+class TriggerSet:
+    """单个标的的触发条件集：入场（AI-1 古法决策）与出场（AI-2 古法决策）。
+
+    entry: 入场条件列表；命中任一即按 entry_target 建仓。
+    exit:  出场条件列表；命中任一即平仓。
+    entry_target: 入场目标仓位（0.5=半仓，1.0=满仓，绝对权益占比）。
+    entry_market / entry_leverage: 入场市场（spot/swap）与杠杆。
+    first_trigger_at: 古法择时确定的当日首次触发时刻（ISO）；未到则只监听不入场。
+    ref_price: 买入成交均价（AI-2 出场涨跌幅的基准），入场后由系统回填。
+    created_at / updated_at: 时间戳。
+    """
+
+    symbol: str
+    entry: List[TriggerCondition] = field(default_factory=list)
+    exit: List[TriggerCondition] = field(default_factory=list)
+    entry_target: float = 0.5
+    entry_market: str = MARKET_SPOT
+    entry_leverage: float = 1.0
+    first_trigger_at: str = ""
+    ref_price: float = 0.0
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "entry": [c.to_dict() for c in self.entry],
+            "exit": [c.to_dict() for c in self.exit],
+            "entry_target": self.entry_target,
+            "entry_market": self.entry_market,
+            "entry_leverage": self.entry_leverage,
+            "first_trigger_at": self.first_trigger_at,
+            "ref_price": self.ref_price,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TriggerSet":
+        entry = [
+            TriggerCondition.from_dict(item)
+            for item in dict(data.get("entry", {})).values() if isinstance(item, dict)
+        ] if isinstance(data.get("entry"), dict) else [
+            TriggerCondition.from_dict(item)
+            for item in data.get("entry", []) if isinstance(item, dict)
+        ]
+        exit_conds = [
+            TriggerCondition.from_dict(item)
+            for item in data.get("exit", []) if isinstance(item, dict)
+        ]
+        return cls(
+            symbol=str(data.get("symbol", "")),
+            entry=entry,
+            exit=exit_conds,
+            entry_target=clamp(finite(data.get("entry_target")), 0.0, 1.0),
+            entry_market=str(data.get("entry_market", MARKET_SPOT)),
+            entry_leverage=clamp(finite(data.get("entry_leverage")), 1.0, 50.0),
+            first_trigger_at=str(data.get("first_trigger_at", "")),
+            ref_price=finite(data.get("ref_price")),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+        )
+
+
+@dataclass
 class BotState:
     version: int = STATE_VERSION
     profile_id: str = ""
@@ -1305,6 +1430,12 @@ class BotState:
     # 避免薄盘币每周期重复下单失败刷日志；有持仓时卖出/保护性退出不受影响。
     depth_blocked: Dict[str, str] = field(default_factory=dict)
     halted_reason: str = ""
+    # 信号触发模式状态：symbol -> 触发条件集（入场/出场），由 AI 预设、监听循环消费。
+    # 结构见 TriggerSet.to_dict；不参与旧周期模式（trigger_mode=cycle 时为空）。
+    triggers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # AI-1 入场评估冷却：symbol -> ISO 时间。古法判定"暂不交易"或 AI 调用失败时写入，
+    # 监听循环在该时间前不再唤醒 AI-1，避免每 2 秒轮询反复调用 AI 烧钱/打爆限频。
+    trigger_skip_until: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BotState":
@@ -1345,6 +1476,14 @@ class BotState:
                 str(k): str(v) for k, v in dict(data.get("depth_blocked", {})).items()
             },
             halted_reason=str(data.get("halted_reason", "")),
+            triggers={
+                str(k): dict(v) for k, v in dict(data.get("triggers", {})).items()
+                if isinstance(v, dict)
+            },
+            # AI-1 暂不交易/失败的冷却：symbol -> ISO 时间，在此之前不再唤醒 AI-1。
+            trigger_skip_until={
+                str(k): str(v) for k, v in dict(data.get("trigger_skip_until", {})).items()
+            },
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1369,10 +1508,16 @@ class StateStore:
         except Exception as exc:
             raise SafetyError(f"状态文件损坏，拒绝启动: {self.path}: {exc}") from exc
         if state.version != STATE_VERSION:
-            raise SafetyError(
-                f"状态文件版本不兼容: {state.version} != {STATE_VERSION}。"
-                "请备份状态文件并按升级文档迁移，禁止自动降级或跳过检查。"
-            )
+            # v4 -> v5：新增 triggers 字段（信号触发模式状态），旧状态自动补空。
+            if state.version == 4 and STATE_VERSION == 5:
+                state.version = 5
+                # 迁移写盘：self.state 尚未赋值，不能走 self.save()。
+                atomic_write_json(self.path, state.to_dict())
+            else:
+                raise SafetyError(
+                    f"状态文件版本不兼容: {state.version} != {STATE_VERSION}。"
+                    "请备份状态文件并按升级文档迁移，禁止自动降级或跳过检查。"
+                )
         if state.profile_id != self.profile_id:
             if not state.profile_id:
                 raise SafetyError(
@@ -2013,6 +2158,37 @@ class ExchangeGateway:
                 result[str(symbol)] = finite(ticker.get("quoteVolume") or 0.0)
             except (TypeError, ValueError):
                 result[str(symbol)] = 0.0
+        return result
+
+    def fetch_all_tickers(
+        self, symbols: Optional[Iterable[str]] = None
+    ) -> Dict[str, float]:
+        """批量最新价（一次请求），返回键为状态键（spot 裸名 / swap:SYMBOL）。
+
+        供信号触发模式每 2 秒轮询使用：OKX 批量 tickers 接口限频 20req/2s，
+        全部标的合并为一个请求，避免逐个 fetch_ticker 打爆限频。
+        """
+        if symbols is None:
+            symbols = self.runtime.symbols
+        target_map: Dict[str, str] = {}
+        for symbol in symbols:
+            if not symbol:
+                continue
+            market, base = split_position_key(str(symbol))
+            target_map[self.exchange_symbol(market, base)] = str(symbol)
+        if not target_map:
+            return {}
+        tickers = self._safe_call(
+            "fetch_tickers", lambda: self.client.fetch_tickers(list(target_map)),
+        )
+        result: Dict[str, float] = {}
+        for ex_symbol, ticker in (tickers or {}).items():
+            state_key = target_map.get(str(ex_symbol))
+            if state_key is None:
+                continue
+            price = finite(ticker.get("last") or ticker.get("close"))
+            if price > 0:
+                result[state_key] = price
         return result
 
     def reconcile_pending_orders(self) -> None:
@@ -3343,6 +3519,168 @@ class AIAdvisor:
         reading = require_json_string(parsed.get("reading"), f"AI response.{name}.reading").strip()[:400]
         return AncientMethodReading(bias, confidence, reading)
 
+    def decide_entry(
+        self,
+        symbol: str,
+        current_price: float,
+        paipan_payload: Optional[Mapping[str, Any]],
+        account_equity: float,
+        position_quote: float,
+        now_iso: str,
+    ) -> Tuple[List[TriggerCondition], str, str, str]:
+        """AI-1 入场决策（信号触发模式）：按古法判断交不交易，并给出触发条件。
+
+        返回 (conditions, summary, decision_mode, target_level)。
+        decision_mode: "enter"=建议入场 | "wait"=继续等待 | "no_trade"=古法不宜交易
+                       | "error"=AI 调用/响应失败（调用方应退避重试）。
+        target_level: "HALF" / "FULL"，仅 decision=enter 时有效。
+        """
+        if not self.config.enabled:
+            return [], "AI 已关闭，不设触发条件", "wait", "HALF"
+        system = (
+            "你是中国古法十项综合断卦师（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。"
+            "现在使用信号触发模式：系统不再定时重算，而是由你设定『触发条件』，条件命中才交易。"
+            "你必须基于完整盘面与当前行情，判断是否交易，并把入场时机翻译成明确、可执行的触发条件。"
+            "输出必须是单个 JSON object，不得输出 Markdown/代码块/解释。字段只能包含："
+            "decision（string，精确等于 enter / wait / no_trade 之一）、"
+            "summary（string，中文一句话总结断卦结论）、"
+            "conditions（array，0 到 4 个触发条件，每个是 object："
+            "kind（string，精确等于 price_above/price_below/change_pct_above/change_pct_below/"
+            "rsi_above/rsi_below/volume_surge/time_after 之一）、"
+            "value（number，条件数值：price 类为价格、change_pct 类为涨跌幅小数如 0.03=+3%、"
+            "rsi 类为 0-100、volume_surge 为倍数、time_after 为 ISO 时间字符串）、"
+            "ref_price（number，基准价，price/change_pct 类必填，其余给 0）、"
+            "note（string，中文说明触发理由））、"
+            "target_level（string，精确等于 HALF/FULL 之一，建议入场时的目标仓位）、"
+            "first_trigger_at（string，ISO 时间，由你结合古法择时判断的当日首次触发时刻；"
+            "表示在此之前不监听该标的，可给当前时间）"
+            "。不得输出 conditions 之外的字段。"
+        )
+        request = {
+            "symbol": symbol,
+            "current_price": current_price,
+            "account_equity": account_equity,
+            "current_position_quote": position_quote,
+            "now_iso": now_iso,
+            "paipan": dict(paipan_payload or {}),
+            "note": "古法判断交易时机并给出可执行触发条件；decision=no_trade 时 conditions 必须为空数组。",
+        }
+        try:
+            content = self._completion_content([
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+            ])
+        except Exception as exc:  # noqa: BLE001 触发决策失败不阻断监听循环
+            self.log.error("AI-1 入场决策失败 %s: %s", symbol, exc)
+            return [], "AI-1 决策失败，保守等待", "error", "HALF"
+        try:
+            parsed = require_json_object(json.loads(content), "AI-1 entry response")
+            reject_unknown(
+                parsed,
+                {"decision", "summary", "conditions", "target_level", "first_trigger_at"},
+                "AI-1 entry response",
+            )
+        except (ConfigError, json.JSONDecodeError) as exc:
+            self.log.warning("AI-1 响应结构无效 %s: %s", symbol, exc)
+            return [], "AI-1 响应无效，保守等待", "error", "HALF"
+        decision = str(parsed.get("decision", "wait")).strip().lower()
+        if decision not in {"enter", "wait", "no_trade"}:
+            decision = "wait"
+        conditions: List[TriggerCondition] = []
+        raw_conds = parsed.get("conditions")
+        if isinstance(raw_conds, list):
+            for item in raw_conds[:4]:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    conditions.append(TriggerCondition.from_dict(item))
+                except Exception:  # noqa: BLE001 单条无效忽略
+                    continue
+        if decision == "no_trade":
+            conditions = []
+        target_level = str(parsed.get("target_level", "HALF")).strip().upper()
+        if target_level not in {"HALF", "FULL"}:
+            target_level = "HALF"
+        first_at = str(parsed.get("first_trigger_at", "")).strip()
+        summary = str(parsed.get("summary", "")).strip()[:200]
+        self.log.warning(
+            "AI-1 入场决策 %s | decision=%s target=%s conditions=%d first_at=%s | %s",
+            symbol, decision, target_level, len(conditions), first_at[:19] or "-", summary,
+        )
+        return conditions, summary, decision, target_level
+
+    def decide_exit(
+        self,
+        symbol: str,
+        current_price: float,
+        ref_price: float,
+        paipan_payload: Optional[Mapping[str, Any]],
+        account_equity: float,
+        position_quote: float,
+        now_iso: str,
+    ) -> Tuple[List[TriggerCondition], str, str]:
+        """AI-2 出场决策（信号触发模式）：按古法判断卖出条件，输出出场触发条件。
+
+        返回 (exit_conditions, summary, status)。status: "ok"=正常 | "error"=调用/响应失败。
+        """
+        if not self.config.enabled:
+            return [], "AI 已关闭，不设出场条件", "ok"
+        system = (
+            "你是中国古法十项综合断卦师（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。"
+            "系统使用信号触发模式。现在你负责『出场决策』：为已持仓标的设定卖出触发条件。"
+            "必须基于完整盘面、当前价格与持仓成本（买入价基准）判断，并给出明确可执行的触发条件。"
+            "输出必须是单个 JSON object，不得输出 Markdown/代码块/解释。字段只能包含："
+            "summary（string，中文一句话总结断卦结论）、"
+            "conditions（array，1 到 5 个出场触发条件，每个是 object："
+            "kind（string，精确等于 price_above/price_below/change_pct_above/change_pct_below/"
+            "rsi_above/rsi_below/volume_surge/time_after 之一）、"
+            "value（number，条件数值：change_pct 类为涨跌幅小数如 0.08=+8% 止盈、-0.05=-5% 止损，"
+            "其余同上）、"
+            "ref_price（number，基准价，必须使用给定持仓成本价）、"
+            "note（string，中文说明卖出理由））"
+            "。conditions 至少 1 条；若古法认为应继续持有，可只给 time_after 一条作为最迟复查。"
+        )
+        request = {
+            "symbol": symbol,
+            "current_price": current_price,
+            "ref_price": ref_price,
+            "account_equity": account_equity,
+            "position_quote": position_quote,
+            "now_iso": now_iso,
+            "paipan": dict(paipan_payload or {}),
+            "note": "以买入价为基准设定卖出触发条件（止盈/止损/时间兜底）。",
+        }
+        try:
+            content = self._completion_content([
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+            ])
+        except Exception as exc:  # noqa: BLE001
+            self.log.error("AI-2 出场决策失败 %s: %s", symbol, exc)
+            return [], "AI-2 决策失败，沿用现有出场条件", "error"
+        try:
+            parsed = require_json_object(json.loads(content), "AI-2 exit response")
+            reject_unknown(parsed, {"summary", "conditions"}, "AI-2 exit response")
+        except (ConfigError, json.JSONDecodeError) as exc:
+            self.log.warning("AI-2 响应结构无效 %s: %s", symbol, exc)
+            return [], "AI-2 响应无效，沿用现有出场条件", "error"
+        conditions: List[TriggerCondition] = []
+        raw_conds = parsed.get("conditions")
+        if isinstance(raw_conds, list):
+            for item in raw_conds[:5]:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    conditions.append(TriggerCondition.from_dict(item))
+                except Exception:  # noqa: BLE001
+                    continue
+        summary = str(parsed.get("summary", "")).strip()[:200]
+        self.log.warning(
+            "AI-2 出场决策 %s | ref=%.4f conditions=%d | %s",
+            symbol, ref_price, len(conditions), summary,
+        )
+        return conditions, summary, "ok"
+
     def _aggregate_decision(
         self,
         symbol: str,
@@ -3506,6 +3844,7 @@ class GuFaQuantPro:
         self.ai.bind_strategy_weights(config.strategy.weights)
         self.audit_path = self.state_dir / "orders.audit.jsonl"
         self.stop_event = threading.Event()
+        self._indicator_cache: Dict[str, Tuple[float, float, float]] = {}
         self._install_signal_handlers()
 
     def _install_signal_handlers(self) -> None:
@@ -4058,6 +4397,551 @@ class GuFaQuantPro:
         else:
             self.log.warning("webhook %s 发送失败", event)
 
+    # ================= 信号触发模式（trigger_mode="signal"） =================
+
+    def _auspicious_first_hour(self, symbol: str, now_dt) -> str:
+        """古法择时：扫描当天剩余 12 时辰（每 2 小时一档），对每档做时空盘打分，
+        取信号最强且晚于当前时刻的档位作为首次触发时刻。
+
+        排盘打分成本高，12 档全跑会慢；实际折中：从当前时辰起每 2 小时一档，
+        最多评估 6 档，选最高分档。失败时返回当前时刻（立即开始监听）。
+        """
+        try:
+            if self.paipan_service is None:
+                return iso_now()
+            base = now_dt.replace(minute=0, second=0, microsecond=0)
+            best_ts: Optional[float] = None
+            best_score = -1.0
+            for slot in range(6):
+                probe = base + timedelta(hours=slot * 2)
+                if probe <= now_dt:
+                    continue
+                try:
+                    chart = self.paipan_service.paipan(
+                        symbol, now_dt=probe,
+                        listing_ts=self._listing_ts(symbol),
+                    )
+                    # PaipanResult 无统一评分字段：用时空盘成功生成的方法数
+                    # 作为该时辰"盘面可用性"打分，至少让档位选择有区分度。
+                    current = getattr(chart, "current", None)
+                    if isinstance(current, dict):
+                        score = float(sum(
+                            1 for v in current.values()
+                            if isinstance(v, dict) and "error" not in v
+                        ))
+                    else:
+                        score = 0.0
+                except Exception:  # noqa: BLE001 单档失败跳过
+                    continue
+                if score > best_score:
+                    best_score = score
+                    best_ts = probe.timestamp()
+            if best_ts is None:
+                return iso_now()
+            return datetime.fromtimestamp(best_ts, tz=timezone.utc).isoformat()
+        except Exception:  # noqa: BLE001 择时失败不阻塞，立即监听
+            return iso_now()
+
+    def _listing_ts(self, symbol: str) -> Optional[float]:
+        """标的上市时间（本命盘基准）；manual 优先，其次 ohlcv 探测结果。"""
+        try:
+            lt = self.config.paipan.listing_times or {}
+            manual = str(lt.get(symbol, "") or "").strip()
+            if manual:
+                dt = parse_iso(manual)
+                return dt.timestamp()
+        except Exception:
+            pass
+        return None
+
+    def _evaluate_condition(
+        self,
+        cond: TriggerCondition,
+        price: float,
+        rsi: Optional[float],
+        volume_ratio: Optional[float],
+        now_iso: str,
+    ) -> bool:
+        """评估单条触发条件是否命中。price 为最新价；ref_price 为条件基准。"""
+        kind = cond.kind
+        if kind in {"price_above", "price_below"}:
+            if price <= 0 or cond.value <= 0:
+                return False
+            return price >= cond.value if kind == "price_above" else price <= cond.value
+        if kind in {"change_pct_above", "change_pct_below"}:
+            base = cond.ref_price if cond.ref_price > 0 else price
+            if base <= 0:
+                return False
+            pct = (price - base) / base
+            return pct >= cond.value if kind == "change_pct_above" else pct <= cond.value
+        if kind in {"rsi_above", "rsi_below"}:
+            if rsi is None:
+                return False
+            return rsi >= cond.value if kind == "rsi_above" else rsi <= cond.value
+        if kind == "volume_surge":
+            if volume_ratio is None:
+                return False
+            return volume_ratio >= cond.value
+        if kind == "time_after":
+            try:
+                return now_iso >= str(cond.value)
+            except Exception:
+                return False
+        return False
+
+    def _trigger_poll_loop(self) -> None:
+        """信号触发主循环：每 trigger_poll_seconds 拉全量 ticker，评估触发条件。
+
+        入场命中 -> 执行买入（记录成交均价为基准价）-> 唤醒 AI-2 设定出场条件。
+        出场命中 -> 执行卖出 -> 唤醒 AI-1 重新评估入场。
+        """
+        self.log.warning(
+            "信号触发模式启动 | poll=%ds max_wait=%.1fh symbols=%d",
+            self.config.runtime.trigger_poll_seconds,
+            self.config.runtime.trigger_max_wait_hours,
+            len(self.config.runtime.symbols),
+        )
+        # 启动时对账一次挂单，防止带未确认订单进入监听。
+        try:
+            self.gateway.reconcile_pending_orders()
+        except OrderUncertainError:
+            raise
+        except Exception as exc:  # noqa: BLE001 对账失败不阻塞监听，下次 tick 再试
+            self.log.warning("启动挂单对账失败，继续监听: %s", exc)
+        consecutive_errors = 0
+        while not self.stop_event.is_set():
+            try:
+                self._trigger_tick()
+                consecutive_errors = 0
+            except OrderUncertainError:
+                raise
+            except Exception as exc:  # noqa: BLE001 单轮失败不退出，退避重试
+                consecutive_errors += 1
+                retry = min(30 * (2 ** (consecutive_errors - 1)), 600)
+                self.log.error(
+                    "触发监听失败 (%d 次，%ds 后重试): %s",
+                    consecutive_errors, retry, exc, exc_info=True,
+                )
+                atomic_write_json(self.state_dir / self.config.runtime.health_file, {
+                    "app": APP_NAME,
+                    "version": APP_VERSION,
+                    "status": "degraded",
+                    "timestamp": iso_now(),
+                    "mode": "signal",
+                    "consecutive_errors": consecutive_errors,
+                    "retry_after_seconds": retry,
+                    "error": str(exc),
+                }, mode=0o644)
+                time.sleep(retry)
+                continue
+            time.sleep(self.config.runtime.trigger_poll_seconds)
+
+    def _trigger_tick(self) -> None:
+        """单轮触发检查：刷新行情 -> 评估入场/出场 -> 执行。"""
+        now_dt = datetime.now(timezone.utc)
+        now_iso = iso_now()
+        # 深度不足缓存按 UTC 日切：先清理昨日记录，当日新拒单再入缓存。
+        self._prune_depth_blocked()
+        # 行情：全量 ticker 一次拉取（OKX 批量接口限频 20req/2s，2 秒轮询安全）。
+        # 目标 = 白名单现货 + 状态内持仓键（spot 裸名 / swap:SYMBOL）。
+        try:
+            target_keys = list(self.config.runtime.symbols)
+            for key in self.store.state.positions:
+                if key not in target_keys:
+                    target_keys.append(key)
+            prices = self.gateway.fetch_all_tickers(target_keys)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"批量行情拉取失败: {exc}") from exc
+        snapshot = self.gateway.account_snapshot(
+            {sym: prices[sym] for sym in self.config.runtime.symbols if prices.get(sym, 0.0) > 0}
+        )
+        # 已持仓基准名（spot 裸名 / swap 前缀都归一到裸名，避免重复入场）。
+        managed_bases = {
+            split_position_key(key)[1]
+            for key, pos in snapshot.positions.items() if pos.amount > 0
+        }
+        triggers = self.store.state.triggers
+        # ---- 出场检查（先卖，释放资金） ----
+        for key, pos in snapshot.positions.items():
+            if pos.amount <= 0:
+                continue
+            base = split_position_key(key)[1]
+            if base not in triggers:
+                if (
+                    self.store.state.trigger_skip_until.get(base)
+                    and now_iso < self.store.state.trigger_skip_until[base]
+                ):
+                    continue  # AI-2 失败退避期内不重复唤醒
+                # 重启恢复：已有持仓但尚无出场条件（例如程序升级前买入），
+                # 以持仓成本（买入价基准）唤醒 AI-2 补出场条件；缺成本时用现价。
+                self.log.warning(
+                    "%s 已有持仓但无出场条件，以买入价 %.6f 唤醒 AI-2 补设",
+                    key, pos.avg_entry or pos.price,
+                )
+                self._arm_exit_trigger(base, pos.price, pos.avg_entry or pos.price)
+                continue
+        for symbol in list(triggers):
+            ts = TriggerSet.from_dict(triggers[symbol])
+            if symbol not in managed_bases:
+                continue
+            price = prices.get(symbol, 0.0)
+            if price <= 0:
+                continue
+            rsi, vol_ratio = self._trigger_indicators(symbol)
+            for cond in ts.exit:
+                if self._evaluate_condition(cond, price, rsi, vol_ratio, now_iso):
+                    self._execute_trigger_exit(symbol, price, cond)
+                    break
+        # ---- 入场检查 ----
+        paused = (self.state_dir / "pause").exists()
+        if paused:
+            self.log.warning("检测到暂停标记 %s：本 tick 不开新仓，仅管理存量仓位",
+                             self.state_dir / "pause")
+        skip_until = self.store.state.trigger_skip_until
+        for symbol in self.config.runtime.symbols:
+            if symbol in managed_bases:
+                continue  # 已持仓标的只管理出场
+            if paused:
+                continue
+            if self._depth_blocked_today(symbol):
+                continue  # 当日深度不足缓存
+            # AI-1 冷却：古法判定暂不交易/调用失败，未到时间不重复唤醒。
+            if skip_until.get(symbol) and now_iso < skip_until[symbol]:
+                continue
+            ts = triggers.get(symbol)
+            if ts is None:
+                # 无触发条件：AI-1 首次评估（带古法择时）。
+                ts = self._arm_entry_trigger(symbol, prices.get(symbol, 0.0), now_dt, now_iso)
+                if ts is None:
+                    continue
+                triggers[symbol] = ts.to_dict()
+                self.store.save()
+                continue
+            ts = TriggerSet.from_dict(ts)
+            # 古法择时：未到首次触发时刻不监听。
+            if ts.first_trigger_at and now_iso < ts.first_trigger_at:
+                continue
+            # 超时：超过最长等待唤醒 AI-1 重新评估。
+            created = ts.created_at
+            if created:
+                try:
+                    created_dt = parse_iso(created)
+                    if (now_dt - created_dt).total_seconds() > (
+                        self.config.runtime.trigger_max_wait_hours * 3600
+                    ):
+                        self.log.warning("%s 触发条件超时，唤醒 AI-1 重新评估", symbol)
+                        refreshed = self._arm_entry_trigger(
+                            symbol, prices.get(symbol, 0.0), now_dt, now_iso
+                        )
+                        if refreshed is not None:
+                            triggers[symbol] = refreshed.to_dict()
+                            self.store.save()
+                        continue
+                except Exception:
+                    pass
+            price = prices.get(symbol, 0.0)
+            if price <= 0:
+                continue
+            rsi, vol_ratio = self._trigger_indicators(symbol)
+            for cond in ts.entry:
+                if self._evaluate_condition(cond, price, rsi, vol_ratio, now_iso):
+                    self._execute_trigger_entry(symbol, price, ts, cond)
+                    break
+        # 触发状态写盘 + 大屏健康报告
+        self.store.save()
+        self._write_signal_health(snapshot, prices)
+
+    def _trigger_indicators(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
+        """轻量指标：RSI(14) 与成交量突增比（最新 1h 量 / 前 20 根均值）。
+
+        缓存 60 秒：2 秒轮询下若每 tick 都拉 K 线，54 个标的会打爆 OKX
+        K 线限频（40req/2s）；指标对秒级行情不敏感，60s 刷新足够。
+        """
+        cached = self._indicator_cache.get(symbol)
+        if cached is not None and time.monotonic() - cached[0] < 60.0:
+            return cached[1], cached[2]
+        try:
+            df = self.gateway.fetch_ohlcv(symbol, timeframe="1h", limit=30)
+            if df is None or len(df) < 22:
+                return None, None
+            close = df["close"].astype(float)
+            vol = df["volume"].astype(float)
+            delta = close.diff()
+            gain = delta.clip(lower=0.0).ewm(alpha=1 / 14, adjust=False).mean()
+            loss = (-delta.clip(upper=0.0)).ewm(alpha=1 / 14, adjust=False).mean()
+            rsi = float(100.0 - 100.0 / (1.0 + gain.iloc[-1] / max(loss.iloc[-1], 1e-12)))
+            avg_vol = float(vol.iloc[-21:-1].mean())
+            vol_ratio = float(vol.iloc[-1] / avg_vol) if avg_vol > 0 else None
+            self._indicator_cache[symbol] = (time.monotonic(), rsi, vol_ratio)
+            return rsi, vol_ratio
+        except Exception:  # noqa: BLE001 指标失败不阻断价格触发
+            return None, None
+
+    def _arm_entry_trigger(
+        self,
+        symbol: str,
+        price: float,
+        now_dt,
+        now_iso: str,
+    ) -> Optional[TriggerSet]:
+        """AI-1 入场评估 + 古法择时。返回触发条件集；暂不交易/失败返回 None 并写冷却。"""
+        try:
+            paipan_payload = self._paipan_payload(symbol, now_dt) if self.paipan_service else None
+        except Exception:  # noqa: BLE001
+            paipan_payload = None
+        position = self.store.state.positions.get(symbol)
+        position_quote = float(position.get("quote_value", 0.0)) if position else 0.0
+        conditions, summary, decision, target_level = self.ai.decide_entry(
+            symbol, price, paipan_payload,
+            self._last_equity(), position_quote, now_iso,
+        )
+        skip = self.store.state.trigger_skip_until
+        if decision == "error":
+            # AI 调用/响应失败：退避 10 分钟再问，避免每 2 秒轮询打爆限频。
+            skip[symbol] = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+            self.store.save()
+            return None
+        if decision == "no_trade":
+            # 古法判定今日不宜交易：冷却到次日 UTC 零点，当天不再问 AI-1。
+            next_day = datetime.combine(
+                utc_now().date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+            )
+            skip[symbol] = next_day.isoformat()
+            self.log.warning("AI-1 %s 今日不宜交易，次日 %s 再评估（%s）", symbol, next_day.date(), summary)
+            self.store.save()
+            return None
+        if decision == "wait" and not conditions:
+            # 继续等待且无条件：30 分钟后再问。
+            skip[symbol] = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+            self.log.warning("AI-1 %s 继续等待（%s）", symbol, summary or decision)
+            self.store.save()
+            return None
+        first_at = self._auspicious_first_hour(symbol, now_dt)
+        ts = TriggerSet(
+            symbol=symbol,
+            entry=conditions,
+            entry_target=1.0 if target_level == "FULL" else 0.5,
+            first_trigger_at=first_at,
+            created_at=now_iso,
+            updated_at=now_iso,
+        )
+        self.store.state.trigger_skip_until.pop(symbol, None)
+        return ts
+
+    @staticmethod
+    def _chart_summary(chart: Mapping[str, Any]) -> Dict[str, Any]:
+        """把单法盘面 dict 精简为传给 AI 的摘要（控制 token 与响应体量）。"""
+        out: Dict[str, Any] = {}
+        for key, value in chart.items():
+            if key in {"method", "chart_type", "error"}:
+                out[key] = value
+            elif isinstance(value, (str, int, float, bool)) or value is None:
+                out[key] = value
+            elif isinstance(value, list) and len(value) <= 8:
+                out[key] = [
+                    v for v in value if isinstance(v, (str, int, float, bool))
+                ][:8]
+        return out
+
+    def _paipan_payload(self, symbol: str, now_dt) -> Optional[Dict[str, Any]]:
+        """构建传给 AI 的盘面摘要（十项 method -> 核心字段，本命盘+时空盘）。"""
+        if self.paipan_service is None:
+            return None
+        try:
+            chart = self.paipan_service.paipan(
+                symbol, now_dt=now_dt, listing_ts=self._listing_ts(symbol)
+            )
+            data = chart.to_dict() if hasattr(chart, "to_dict") else {}
+            if not isinstance(data, dict):
+                return None
+            current = data.get("current") if isinstance(data.get("current"), dict) else {}
+            natal = data.get("natal") if isinstance(data.get("natal"), dict) else {}
+            payload: Dict[str, Any] = {
+                "time_label": data.get("time_label", ""),
+                "diagnostics": data.get("diagnostics", {}),
+            }
+            for name, item in current.items():
+                if isinstance(item, dict):
+                    payload[f"current_{name}"] = self._chart_summary(item)
+            for name, item in natal.items():
+                if isinstance(item, dict):
+                    payload[f"natal_{name}"] = self._chart_summary(item)
+            return payload
+        except Exception:  # noqa: BLE001 排盘失败不阻断 AI 决策（无盘面也问）
+            return None
+
+    def _last_equity(self) -> float:
+        try:
+            return float(self.store.state.last_equity or 0.0)
+        except Exception:
+            return 0.0
+
+    def _execute_trigger_entry(
+        self, symbol: str, price: float, ts: TriggerSet, cond: TriggerCondition
+    ) -> None:
+        """入场触发命中：按目标仓位买入，成交均价回填为 ref_price，唤醒 AI-2 设出场。"""
+        self.log.warning(
+            "入场触发 %s | cond=%s value=%s price=%.4f target=%.0f%%",
+            symbol, cond.kind, cond.value, price, ts.entry_target * 100,
+        )
+        self._prune_depth_blocked()
+        snapshot = self.gateway.account_snapshot(
+            {sym: p for sym, p in self.gateway.fetch_all_tickers(
+                self.config.runtime.symbols).items() if p > 0}
+        )
+        try:
+            plan = self.gateway.plan_rebalance(
+                snapshot, symbol, ts.entry_target,
+                f"信号触发入场: {cond.kind}={cond.value} {cond.note or ''}",
+                market=ts.entry_market, leverage=ts.entry_leverage,
+            )
+            if plan is None:
+                return
+            fill = self.gateway.execute(plan)
+        except OrderUncertainError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.log.error("触发入场下单失败 %s: %s", symbol, exc)
+            return
+        avg = float(fill.average_price or 0.0) or price
+        append_jsonl(self.audit_path, {
+            "ts": iso_now(), "event": "trigger_entry",
+            "symbol": symbol, "condition": cond.to_dict(),
+            "plan": asdict(plan), "fill": asdict(fill),
+        })
+        self._notify("trigger_entry", {"symbol": symbol, "side": "buy", "avg": avg})
+        # 唤醒 AI-2 设定出场条件（买入价为基准）。
+        self._arm_exit_trigger(symbol, price, avg)
+        self._update_equity_from_fill(fill)
+
+    def _execute_trigger_exit(
+        self, symbol: str, price: float, cond: TriggerCondition
+    ) -> None:
+        """出场触发命中：平仓该标的，移除触发状态，唤醒 AI-1 重新评估。"""
+        self.log.warning(
+            "出场触发 %s | cond=%s value=%s price=%.4f",
+            symbol, cond.kind, cond.value, price,
+        )
+        snapshot = self.gateway.account_snapshot(
+            {sym: p for sym, p in self.gateway.fetch_all_tickers(
+                self.config.runtime.symbols).items() if p > 0}
+        )
+        try:
+            market = (
+                MARKET_SWAP
+                if position_key(MARKET_SWAP, symbol) in snapshot.positions
+                else MARKET_SPOT
+            )
+            plan = self.gateway.plan_rebalance(
+                snapshot, symbol, 0.0,
+                f"信号触发出场: {cond.kind}={cond.value} {cond.note or ''}",
+                market=market,
+            )
+            if plan is None:
+                return
+            fill = self.gateway.execute(plan)
+        except OrderUncertainError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.log.error("触发出场下单失败 %s: %s", symbol, exc)
+            return
+        append_jsonl(self.audit_path, {
+            "ts": iso_now(), "event": "trigger_exit",
+            "symbol": symbol, "condition": cond.to_dict(),
+            "plan": asdict(plan), "fill": asdict(fill),
+        })
+        self._notify("trigger_exit", {"symbol": symbol, "side": "sell"})
+        # 出场后清触发状态，下次 tick 由 AI-1 重新评估入场。
+        self.store.state.triggers.pop(symbol, None)
+        self.store.save()
+        self._update_equity_from_fill(fill)
+
+    def _arm_exit_trigger(
+        self, symbol: str, current_price: float, ref_price: float
+    ) -> None:
+        """AI-2 出场决策：以买入价为基准设定出场条件。失败则保留现有触发并退避。"""
+        try:
+            now_dt = datetime.now(timezone.utc)
+            paipan_payload = self._paipan_payload(symbol, now_dt) if self.paipan_service else None
+        except Exception:  # noqa: BLE001
+            paipan_payload = None
+        position = self.store.state.positions.get(symbol)
+        position_quote = float(position.get("quote_value", 0.0)) if position else 0.0
+        exit_conds, summary, status = self.ai.decide_exit(
+            symbol, current_price, ref_price, paipan_payload,
+            self._last_equity(), position_quote, iso_now(),
+        )
+        if status == "error":
+            # AI-2 调用/响应失败：保留现有出场条件不覆盖，10 分钟后重试。
+            self.store.state.trigger_skip_until[symbol] = (
+                datetime.now(timezone.utc) + timedelta(minutes=10)
+            ).isoformat()
+            self.store.save()
+            return
+        ts = self.store.state.triggers.get(symbol)
+        ts_obj = TriggerSet.from_dict(ts) if ts else TriggerSet(symbol=symbol)
+        ts_obj.exit = exit_conds
+        ts_obj.ref_price = ref_price
+        ts_obj.updated_at = iso_now()
+        self.store.state.triggers[symbol] = ts_obj.to_dict()
+        self.store.save()
+
+    def _update_equity_from_fill(self, fill) -> None:
+        """成交后刷新账户权益快照（供 health 与后续决策参考）。"""
+        try:
+            snapshot = self.gateway.account_snapshot(
+                {sym: p for sym, p in self.gateway.fetch_all_tickers(
+                    self.config.runtime.symbols).items() if p > 0}
+            )
+            self.store.state.last_equity = snapshot.equity
+            self.store.state.last_cycle_at = iso_now()
+            self.store.save()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _write_signal_health(self, snapshot: AccountSnapshot, prices: Mapping[str, float]) -> None:
+        """信号模式健康报告（大屏/监控）：权益、持仓、触发条件概览。"""
+        state = self.store.state
+        triggers_view: Dict[str, Any] = {}
+        for symbol, ts_dict in state.triggers.items():
+            try:
+                ts_obj = TriggerSet.from_dict(ts_dict)
+            except Exception:  # noqa: BLE001 单条损坏不影响整体
+                continue
+            triggers_view[symbol] = {
+                "entry_conditions": len(ts_obj.entry),
+                "exit_conditions": len(ts_obj.exit),
+                "entry_target": ts_obj.entry_target,
+                "first_trigger_at": ts_obj.first_trigger_at,
+                "ref_price": ts_obj.ref_price,
+            }
+        report = {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "status": "halted" if state.halted_reason else "ok",
+            "timestamp": iso_now(),
+            "mode": "signal",
+            "exchange": self.config.exchange.id,
+            "sandbox": self.config.exchange.sandbox,
+            "equity": round(snapshot.equity, 6),
+            "quote_free": round(snapshot.quote_free, 6),
+            "quotes": {
+                sym: {
+                    "price": round(pos.price, 10),
+                    "value": round(pos.quote_value, 6),
+                }
+                for sym, pos in snapshot.positions.items()
+            },
+            "triggers": triggers_view,
+            "live_updated_at": iso_now(),
+        }
+        try:
+            atomic_write_json(
+                self.state_dir / self.config.runtime.health_file, report, mode=0o644
+            )
+        except Exception as exc:  # noqa: BLE001 健康报告失败不影响交易
+            self.log.debug("信号模式健康报告写入失败（忽略）: %s", exc)
+
     def run_cycle(self) -> Dict[str, Any]:
         cycle_started = time.monotonic()
         # 深度不足缓存按 UTC 日切：先清理昨日记录，当日新拒单再入缓存。
@@ -4301,6 +5185,11 @@ class GuFaQuantPro:
             self.config.selection.min_score,
             self.config.runtime.timeframe,
         )
+        # 8.8.0：信号触发模式（默认）——不再按固定周期全量重算，
+        # 由 AI-1（古法入场）+ AI-2（古法出场）预设触发条件，监听循环按最小间隔轮询。
+        if self.config.runtime.trigger_mode == "signal":
+            self._trigger_poll_loop()
+            return
         consecutive_errors = 0
         retry_delay = self.config.runtime.poll_interval_seconds
         first = True

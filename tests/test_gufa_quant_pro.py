@@ -272,7 +272,16 @@ def test_state_version_and_profile_are_bound(tmp_path: Path) -> None:
     assert store.state.profile_id == "profile-a"
 
     payload = json.loads(state_path.read_text(encoding="utf-8"))
-    payload["version"] = g.STATE_VERSION - 1
+    # v4 -> v5 合法自动迁移（新增 triggers/trigger_skip_until 字段）
+    payload["version"] = 4
+    write_json(state_path, payload)
+    migrated = g.StateStore(state_path, "profile-a")
+    assert migrated.state.version == g.STATE_VERSION
+    assert migrated.state.triggers == {}
+    assert migrated.state.trigger_skip_until == {}
+
+    # 低于 v4 的旧版本仍拒绝（禁止跳过版本迁移）
+    payload["version"] = 3
     write_json(state_path, payload)
     with pytest.raises(g.SafetyError, match="状态文件版本不兼容"):
         g.StateStore(state_path, "profile-a")
@@ -1844,5 +1853,118 @@ def test_exchange_config_allowed_markets_validation(tmp_path: Path) -> None:
                            allowed_markets=("spot", "swap"))
     cfg.validate()
     assert cfg.allowed_markets == ("spot", "swap")
+
+
+# =============================================================================
+# 信号触发模式（8.8.0：AI-1 入场 / AI-2 出场 + 条件监听）
+# =============================================================================
+
+
+def test_trigger_condition_round_trip_with_time_after() -> None:
+    """time_after 的 value 是 ISO 字符串，序列化往返不得丢失。"""
+    cond = g.TriggerCondition(
+        kind="time_after", value="2026-08-10T00:00:00+00:00", note="最迟复查"
+    )
+    again = g.TriggerCondition.from_dict(cond.to_dict())
+    assert again.kind == "time_after"
+    assert again.value == "2026-08-10T00:00:00+00:00"
+    assert again.note == "最迟复查"
+
+
+def test_trigger_set_round_trip() -> None:
+    ts = g.TriggerSet(
+        symbol="BTC/USDT",
+        entry=[g.TriggerCondition("price_above", 60000.0, note="突破买入")],
+        exit=[
+            g.TriggerCondition("change_pct_above", 0.08, ref_price=55000.0),
+            g.TriggerCondition("change_pct_below", -0.05, ref_price=55000.0),
+        ],
+        entry_target=1.0,
+        entry_market=g.MARKET_SWAP,
+        entry_leverage=3.0,
+        first_trigger_at="2026-08-09T08:00:00+00:00",
+        ref_price=55000.0,
+        created_at="2026-08-09T07:00:00+00:00",
+    )
+    again = g.TriggerSet.from_dict(ts.to_dict())
+    assert again.to_dict() == ts.to_dict()
+
+
+def test_trigger_condition_rejects_unknown_kind() -> None:
+    with pytest.raises(g.SafetyError, match="未知触发条件类型"):
+        g.TriggerCondition.from_dict({"kind": "moon_align", "value": 1})
+
+
+def test_evaluate_condition_all_kinds() -> None:
+    ev = g.GuFaQuantPro._evaluate_condition
+    now = "2026-08-09T10:00:00+00:00"
+    cases = [
+        (g.TriggerCondition("price_above", 100.0), 120.0, None, None, True),
+        (g.TriggerCondition("price_above", 100.0), 80.0, None, None, False),
+        (g.TriggerCondition("price_below", 100.0), 80.0, None, None, True),
+        (g.TriggerCondition("change_pct_above", 0.08, ref_price=1.0), 1.09, None, None, True),
+        (g.TriggerCondition("change_pct_above", 0.08, ref_price=1.0), 1.05, None, None, False),
+        (g.TriggerCondition("change_pct_below", -0.05, ref_price=1.0), 0.94, None, None, True),
+        (g.TriggerCondition("rsi_above", 70.0), 1.0, 75.0, None, True),
+        (g.TriggerCondition("rsi_above", 70.0), 1.0, None, None, False),  # 指标缺失不命中
+        (g.TriggerCondition("volume_surge", 2.0), 1.0, None, 3.5, True),
+        (g.TriggerCondition("time_after", "2026-08-09T09:00:00+00:00"), 1.0, None, None, True),
+        (g.TriggerCondition("time_after", "2026-08-09T11:00:00+00:00"), 1.0, None, None, False),
+    ]
+    for cond, price, rsi, vol, want in cases:
+        assert ev(None, cond, price, rsi, vol, now) == want, cond.kind
+
+
+def test_runtime_trigger_config_validation(tmp_path: Path) -> None:
+    def load_default(mutator):
+        payload = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+        mutator(payload)
+        return g.AppConfig.from_dict(payload)
+
+    # JSON 往返：tuple 型默认值（如 allowed_markets）转成 list 再解析
+    payload = json.loads(json.dumps(g.default_config_dict()))
+    payload["runtime"]["trigger_mode"] = "signal"
+    payload["runtime"]["trigger_poll_seconds"] = 2
+    payload["runtime"]["trigger_max_wait_hours"] = 24.0
+    write_json(tmp_path / "config.json", payload)
+    cfg = g.AppConfig.from_dict(payload)
+    assert cfg.runtime.trigger_mode == "signal"
+    assert cfg.runtime.trigger_poll_seconds == 2
+    assert cfg.runtime.trigger_max_wait_hours == 24.0
+
+    with pytest.raises(g.ConfigError, match="trigger_mode 必须是 signal 或 cycle"):
+        load_default(lambda p: p["runtime"].__setitem__("trigger_mode", "bogus"))
+    with pytest.raises(g.ConfigError, match="trigger_poll_seconds 至少为 1"):
+        load_default(lambda p: p["runtime"].__setitem__("trigger_poll_seconds", 0))
+    with pytest.raises(g.ConfigError, match="trigger_max_wait_hours 必须在"):
+        load_default(lambda p: p["runtime"].__setitem__("trigger_max_wait_hours", 200))
+
+
+def test_trigger_mode_default_is_signal() -> None:
+    cfg = g.RuntimeConfig()
+    assert cfg.trigger_mode == "signal"
+    assert cfg.trigger_poll_seconds == 2
+
+
+def test_bot_state_trigger_fields_round_trip(tmp_path: Path) -> None:
+    store = g.StateStore(tmp_path / "state.json", "profile-trigger")
+    store.state.triggers["ETH/USDT"] = {
+        "symbol": "ETH/USDT",
+        "entry": [{"kind": "price_above", "value": 3500.0, "ref_price": 0.0, "note": ""}],
+        "exit": [],
+        "entry_target": 0.5,
+        "entry_market": "spot",
+        "entry_leverage": 1.0,
+        "first_trigger_at": "",
+        "ref_price": 0.0,
+        "created_at": "2026-08-09T00:00:00+00:00",
+        "updated_at": "2026-08-09T00:00:00+00:00",
+    }
+    store.state.trigger_skip_until["DOGE/USDT"] = "2026-08-09T12:00:00+00:00"
+    store.save()
+    again = g.StateStore(tmp_path / "state.json", "profile-trigger")
+    assert again.state.triggers["ETH/USDT"]["entry"][0]["kind"] == "price_above"
+    assert again.state.trigger_skip_until["DOGE/USDT"] == "2026-08-09T12:00:00+00:00"
+
 
 
