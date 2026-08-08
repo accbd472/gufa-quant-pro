@@ -392,7 +392,7 @@ function render(d){
   $("mCycle").textContent = d.cycle_seconds!=null ? Math.round(d.cycle_seconds)
     : (d.mode==="signal" ? "布防"+(d.triggers?d.triggers.length:0) : "--");
   $("mFills").textContent = d.fills!=null ? d.fills
-    : (d.mode==="signal" ? Object.keys(d.quotes||{}).length : "--");
+    : (d.mode==="signal" ? d.position_count : "--");
   $("mReview").textContent = d.next_review_seconds!=null ? (d.next_review_seconds/60).toFixed(0)+"m"
     : (d.mode==="signal" ? "实时" : "--");
   $("mCand").textContent = d.candidates!=null ? d.candidates : "--";
@@ -408,13 +408,16 @@ function render(d){
   $("dead").innerHTML = d.dead && Object.keys(d.dead).length
     ? Object.entries(d.dead).map(([k,v])=>`<span>✕ ${k.replace('/USDT','')}: ${v}</span>&nbsp;&nbsp;`).join("") : "<span style='color:#4a6a8a'>无剔除</span>";
   // 决策
-  if (d.quotes && Object.keys(d.quotes).length){
+  // 实时行情列表：仅展示真实持仓（value>0），避免把监控行情当持仓误导
+  const heldEntries = d.quotes && Object.keys(d.quotes).length
+    ? Object.entries(d.quotes).filter(([,q])=> q && Number(q.value)>0) : [];
+  if (heldEntries.length){
     if (d.live_updated_at) $("liveTs").textContent = "// " + d.live_updated_at.slice(11,19) + " 实时价";
     const shortName = (sym)=>{
       const m = String(sym).match(/^(?:swap:)?([^/]+)\//);
       return (m?m[1]:sym) + (String(sym).startsWith("swap:")?"◆":"");
     };
-    const qs = Object.entries(d.quotes).map(([sym,q])=>{
+    const qs = heldEntries.map(([sym,q])=>{
       const pct = q.change_pct!=null ? q.change_pct : 0;
       const cls = pct>0.0001 ? "up" : (pct<-0.0001 ? "down" : "");
       const arrow = pct>0.0001 ? "▲" : (pct<-0.0001 ? "▼" : "•");
@@ -754,6 +757,7 @@ class Snapshot:
             "cycle_seconds": health.get("cycle_seconds"),
             "next_review_seconds": health.get("next_review_seconds"),
             "fills": health.get("fills"),
+            "position_count": len(state.get("positions") or {}),
             "quotes": health.get("quotes") or {},
             "live_updated_at": health.get("live_updated_at"),
             "candidates": len((health.get("daily_selection") or {}).get("candidates") or [])
