@@ -2457,6 +2457,46 @@ class ExchangeGateway:
         slippage_bps = abs(vwap / fallback_price - 1) * 10000
         return vwap, slippage_bps
 
+    def order_book_fill_info(
+        self, symbol: str, side: str, amount: float, fallback_price: float
+    ) -> Optional[Dict[str, float]]:
+        """实盘订单簿成交能力评估（不抛异常，供 AI 缩量决策使用）。
+
+        返回 100 档内可成交数量/金额、对应滑点、可成交比例；
+        订单簿拉取失败或无可成交档位时返回 None。
+        """
+        try:
+            book = self._safe_call(
+                f"fetch_order_book:{symbol}",
+                lambda: self.market_client.fetch_order_book(symbol, 100),
+            )
+            levels = book.get("asks" if side == "buy" else "bids") or []
+        except Exception:  # noqa: BLE001 评估失败由调用方降级（保守放弃）
+            return None
+        remaining = amount
+        cost = 0.0
+        filled = 0.0
+        for level in levels:
+            level_price, level_amount = finite(level[0]), finite(level[1])
+            if level_price <= 0 or level_amount <= 0:
+                continue
+            take = min(remaining, level_amount)
+            cost += take * level_price
+            filled += take
+            remaining -= take
+            if remaining <= EPSILON:
+                break
+        if filled <= 0:
+            return None
+        vwap = cost / filled
+        slippage_bps = abs(vwap / fallback_price - 1) * 10000 if fallback_price > 0 else 0.0
+        return {
+            "fillable_amount": filled,
+            "fillable_quote": cost,
+            "slippage_bps": slippage_bps,
+            "fill_ratio": min(1.0, filled / amount) if amount > 0 else 0.0,
+        }
+
     def normalize_amount(self, symbol: str, side: str, amount: float, price: float) -> float:
         if amount <= 0 or price <= 0:
             return 0.0
@@ -3763,6 +3803,83 @@ class AIAdvisor:
         )
         return conditions, summary, decision, target_level
 
+    def decide_downsize(
+        self,
+        symbol: str,
+        reason: str,
+        plan_amount: float,
+        plan_quote: float,
+        fillable_amount: float,
+        fillable_quote: float,
+        slippage_bps: float,
+        max_slippage_bps: float,
+        now_iso: str,
+    ) -> Tuple[str, float]:
+        """滑点/深度检查失败后的缩量仲裁：AI 判断少买还是放弃。
+
+        返回 (action, amount_pct)：
+        - action: "buy" = 缩量买入（amount_pct 为新数量占原计划比例，0.05~1.0）
+        - action: "skip" = 放弃该标的
+        AI 调用失败或熔断时保守返回 ("skip", 0.0)。
+        """
+        if not self.config.enabled:
+            return "skip", 0.0
+        if self._circuit_open_until and time.monotonic() < self._circuit_open_until:
+            self.log.warning("AI 熔断中，缩量决策走保守放弃 %s", symbol)
+            return "skip", 0.0
+        fill_ratio = (fillable_amount / plan_amount) if plan_amount > 0 else 0.0
+        system = (
+            "你是中国古法量化交易系统的风控仲裁 AI。当系统因订单簿深度不足或滑点超限，"
+            "无法按原计划数量买入某标的时，由你决定：缩量买入（减小数量）还是放弃。"
+            "输出必须是单个 JSON object，不得输出 Markdown/代码块/解释。字段只能包含："
+            "action（string，精确等于 buy / skip 之一）、"
+            "amount_pct（number，0.05 到 1.0 之间，buy 时表示新下单数量=原计划数量×amount_pct；skip 时给 0）、"
+            "reason（string，中文一句话说明决策理由）。不得输出其他字段。"
+        )
+        request = {
+            "symbol": symbol,
+            "plan_amount": plan_amount,
+            "plan_quote": plan_quote,
+            "failure_reason": reason,
+            "fillable_amount": round(fillable_amount, 6),
+            "fillable_quote": round(fillable_quote, 2),
+            "fill_ratio": round(fill_ratio, 4),
+            "estimated_slippage_bps": round(slippage_bps, 2),
+            "max_slippage_bps": max_slippage_bps,
+            "now_iso": now_iso,
+            "note": (
+                "原计划无法成交：可成交比例 fill_ratio 是 100 档订单簿能承接的原计划比例。"
+                "若缩量后仍会大幅滑点超限（如 fill_ratio 过低或原滑点远高于上限），选择 skip；"
+                "若只是略微超限或深度差一点，缩量（amount_pct 取较小值如 0.3~0.7）后滑点可控，选择 buy。"
+            ),
+        }
+        try:
+            content = self._completion_content([
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+            ])
+            parsed = require_json_object(json.loads(content), "AI downsize response")
+            reject_unknown(parsed, {"action", "amount_pct", "reason"}, "AI downsize response")
+        except Exception as exc:  # noqa: BLE001 决策失败保守放弃
+            self.log.error("AI 缩量决策失败 %s: %s", symbol, exc)
+            self._note_ai_failure()
+            return "skip", 0.0
+        self._note_ai_success()
+        action = str(parsed.get("action", "skip")).strip().lower()
+        if action not in {"buy", "skip"}:
+            action = "skip"
+        try:
+            amount_pct = float(parsed.get("amount_pct", 0.0))
+        except (TypeError, ValueError):
+            amount_pct = 0.0
+        amount_pct = min(1.0, max(0.05, amount_pct)) if action == "buy" else 0.0
+        summary = str(parsed.get("reason", "")).strip()[:200]
+        self.log.warning(
+            "AI 缩量仲裁 %s | action=%s amount_pct=%.0f%% fill_ratio=%.1f%% slip=%.1f/%.0fbps | %s",
+            symbol, action, amount_pct * 100, fill_ratio * 100, slippage_bps, max_slippage_bps, summary,
+        )
+        return action, amount_pct
+
     def decide_exit(
         self,
         symbol: str,
@@ -4994,6 +5111,7 @@ class GuFaQuantPro:
             {sym: p for sym, p in self.gateway.fetch_all_tickers(
                 self.config.runtime.symbols).items() if p > 0}
         )
+        plan: Optional[OrderPlan] = None
         try:
             plan = self.gateway.plan_rebalance(
                 snapshot, symbol, ts.entry_target,
@@ -5006,6 +5124,9 @@ class GuFaQuantPro:
         except OrderUncertainError:
             raise
         except Exception as exc:  # noqa: BLE001
+            # 深度不足/滑点超限：反馈 AI 仲裁缩量买入或放弃（只缩一次，仍失败则当日屏蔽）。
+            if self._retry_downsize_entry(symbol, plan, price, ts, cond, exc):
+                return
             self.log.error("触发入场下单失败 %s: %s", symbol, exc)
             return
         avg = float(fill.average_price or 0.0) or price
@@ -5018,6 +5139,100 @@ class GuFaQuantPro:
         # 唤醒 AI-2 设定出场条件（买入价为基准）。
         self._arm_exit_trigger(symbol, price, avg)
         self._update_equity_from_fill(fill)
+
+    def _retry_downsize_entry(
+        self,
+        symbol: str,
+        plan: Optional[OrderPlan],
+        price: float,
+        ts: TriggerSet,
+        cond: TriggerCondition,
+        exc: BaseException,
+    ) -> bool:
+        """深度不足/滑点超限时，向 AI 仲裁缩量买入或放弃。
+
+        返回 True 表示异常已按 AI 决策处理（缩量成交 / 判定放弃），调用方不再打 ERROR；
+        返回 False 表示非深度/滑点类异常，由调用方走原失败路径。
+        """
+        message = str(exc)
+        is_depth = "订单簿深度不足以成交" in message
+        is_slippage = "预计滑点" in message
+        if plan is None or not (is_depth or is_slippage):
+            return False
+        reason = "深度不足" if is_depth else "滑点超限"
+        info = self.gateway.order_book_fill_info(
+            plan.symbol, plan.side, plan.amount, plan.reference_price
+        )
+        if info is None:
+            self.log.warning("%s 订单簿评估失败，保守放弃（%s）", symbol, reason)
+            self._block_depth_today(symbol, message)
+            return True
+        action, amount_pct = self.ai.decide_downsize(
+            symbol,
+            reason,
+            plan.amount,
+            plan.estimated_quote,
+            info["fillable_amount"],
+            info["fillable_quote"],
+            info["slippage_bps"],
+            self.config.risk.max_slippage_bps,
+            iso_now(),
+        )
+        if action != "buy" or amount_pct <= 0:
+            self.log.warning("AI 判定放弃 %s（%s）：当日本日不再重试", symbol, reason)
+            self._block_depth_today(symbol, message)
+            append_jsonl(self.audit_path, {
+                "ts": iso_now(), "event": "trigger_entry_skip",
+                "symbol": symbol, "reason": reason,
+                "plan": asdict(plan), "ai_action": "skip",
+            })
+            return True
+        # AI 判定缩量买入：构造缩量计划重试一次（数量×amount_pct）。
+        new_amount = plan.amount * amount_pct
+        new_plan = OrderPlan(
+            symbol=plan.symbol,
+            side=plan.side,
+            amount=new_amount,
+            reference_price=plan.reference_price,
+            estimated_quote=plan.estimated_quote * amount_pct,
+            target_allocation=plan.target_allocation * amount_pct,
+            current_allocation=plan.current_allocation,
+            reason=f"{plan.reason}（AI 缩量 {amount_pct:.0%}）",
+            market=plan.market,
+            leverage=plan.leverage,
+            contracts=0.0,
+        )
+        try:
+            fill = self.gateway.execute(new_plan)
+        except Exception as exc2:  # noqa: BLE001 缩量后仍失败，当日屏蔽不再重试
+            self.log.error("AI 缩量后仍失败 %s: %s", symbol, exc2)
+            self._block_depth_today(symbol, message)
+            append_jsonl(self.audit_path, {
+                "ts": iso_now(), "event": "trigger_entry_skip",
+                "symbol": symbol, "reason": reason,
+                "plan": asdict(plan), "ai_action": "buy", "amount_pct": amount_pct,
+                "error": repr(exc2),
+            })
+            return True
+        avg = float(fill.average_price or 0.0) or price
+        append_jsonl(self.audit_path, {
+            "ts": iso_now(), "event": "trigger_entry",
+            "symbol": symbol, "condition": cond.to_dict(),
+            "plan": asdict(new_plan), "fill": asdict(fill),
+            "downsize": {"from_amount": plan.amount, "amount_pct": amount_pct},
+        })
+        self._notify("trigger_entry", {"symbol": symbol, "side": "buy", "avg": avg})
+        self._arm_exit_trigger(symbol, price, avg)
+        self._update_equity_from_fill(fill)
+        return True
+
+    def _block_depth_today(self, symbol: str, message: str) -> None:
+        """薄盘/滑点拦截：当日记入 depth_blocked，本日不再重试买入（次日自动恢复）。"""
+        self.store.state.depth_blocked[symbol] = utc_now().date().isoformat()
+        self.store.save()
+        append_jsonl(self.audit_path, {
+            "ts": iso_now(), "event": "depth_blocked", "symbol": symbol, "error": message,
+        })
 
     def _execute_trigger_exit(
         self, symbol: str, price: float, cond: TriggerCondition
