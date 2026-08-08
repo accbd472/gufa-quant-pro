@@ -128,6 +128,7 @@ HTML = r"""<!DOCTYPE html>
   .quotes { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; flex: 0 0 auto;
     border: 1px solid rgba(0,240,255,.15); border-radius: 6px; padding: 4px 8px; margin-bottom: 5px; }
   .quote { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+  .quote.held { background: rgba(0,240,255,.06); border-left: 2px solid var(--cy); padding-left: 4px; }
   .quote .sym { width: 76px; color: var(--cy); white-space: nowrap; }
   .quote .qp { flex: 1; color: #e8f6ff; text-align: right; }
   .quote .qch { width: 62px; text-align: right; }
@@ -269,8 +270,8 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <!-- 右下：决策 -->
     <div class="card c-dec" style="grid-column:2; grid-row:2">
-      <h3>DECISIONS // AI 聚合决策 <span style="color:#5f7fa0;font-size:10px" id="liveTs"></span></h3>
-      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:40px; overflow-y:auto"><div class="empty">无持仓</div></div>
+      <h3>LIVE QUOTES // 实时行情 <span style="color:#5f7fa0;font-size:10px" id="liveTs"></span></h3>
+      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:40px; overflow-y:auto"><div class="empty">等待行情…</div></div>
       <div class="verdicts" id="verdicts"><div class="empty">等待决策…</div></div>
       <h3 style="margin-top:6px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
       <div class="aisteps" id="aisteps"><div class="empty">—</div></div>
@@ -408,26 +409,28 @@ function render(d){
   $("dead").innerHTML = d.dead && Object.keys(d.dead).length
     ? Object.entries(d.dead).map(([k,v])=>`<span>✕ ${k.replace('/USDT','')}: ${v}</span>&nbsp;&nbsp;`).join("") : "<span style='color:#4a6a8a'>无剔除</span>";
   // 决策
-  // 实时行情列表：仅展示真实持仓（value>0），避免把监控行情当持仓误导
-  const heldEntries = d.quotes && Object.keys(d.quotes).length
-    ? Object.entries(d.quotes).filter(([,q])=> q && Number(q.value)>0) : [];
-  if (heldEntries.length){
-    if (d.live_updated_at) $("liveTs").textContent = "// " + d.live_updated_at.slice(11,19) + " 实时价";
+  // 实时行情列表：显示全部监控币行情（持仓 value>0 高亮标注），
+  // 空仓时也持续滚动价格，避免看起来"价格不更新"。
+  const quoteEntries = d.quotes && Object.keys(d.quotes).length
+    ? Object.entries(d.quotes) : [];
+  if (quoteEntries.length){
+    if (d.live_updated_at) $("liveTs").textContent = "// " + d.live_updated_at.slice(11,19) + " 实时";
     const shortName = (sym)=>{
       const m = String(sym).match(/^(?:swap:)?([^/]+)\//);
       return (m?m[1]:sym) + (String(sym).startsWith("swap:")?"◆":"");
     };
-    const qs = heldEntries.map(([sym,q])=>{
-      const pct = q.change_pct!=null ? q.change_pct : 0;
+    const qs = quoteEntries.map(([sym,q])=>{
+      const held = q && Number(q.value)>0;
+      const pct = q && q.change_pct!=null ? q.change_pct : 0;
       const cls = pct>0.0001 ? "up" : (pct<-0.0001 ? "down" : "");
       const arrow = pct>0.0001 ? "▲" : (pct<-0.0001 ? "▼" : "•");
-      return `<div class="quote"><span class="sym">${shortName(sym)}</span>
-        <span class="qp">${Number(q.price).toPrecision(6)}</span>
+      return `<div class="quote${held?" held":""}"><span class="sym">${shortName(sym)}${held?"◆":""}</span>
+        <span class="qp">${q?Number(q.price).toPrecision(6):"--"}</span>
         <span class="qch ${cls}">${arrow}${Math.abs(pct).toFixed(2)}%</span>
-        <span class="qv">${Number(q.value).toFixed(2)}U</span></div>`;
+        <span class="qv">${held?Number(q.value).toFixed(2)+"U":"--"}</span></div>`;
     }).join("");
     $("liveQuotes").innerHTML = qs;
-  } else { $("liveQuotes").innerHTML = '<div class="empty">无持仓</div>'; }
+  } else { $("liveQuotes").innerHTML = '<div class="empty">等待行情…</div>'; }
   if (d.mode==="signal" && d.triggers && d.triggers.length){
     const ts = d.triggers.map(t=>`<div class="verdict"><span class="sym">${t.sym.replace('/USDT','')}</span>
       <span class="vbadge hold">入${t.entry_n}</span>
