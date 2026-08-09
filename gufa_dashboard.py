@@ -108,7 +108,7 @@ HTML = r"""<!DOCTYPE html>
   .tag.sb { color: var(--pu); border-color: rgba(168,85,247,.5); }
 
   /* ---------- 布局 ---------- */
-  main { flex: 1; display: grid; grid-template-columns: 1.55fr 1fr; grid-template-rows: 1.05fr 1.1fr .85fr; gap: 8px; min-height: 0; }
+  main { flex: 1; display: grid; grid-template-columns: 1.55fr 1fr; grid-template-rows: 0.9fr 1.35fr .75fr; gap: 8px; min-height: 0; }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
     display: flex; flex-direction: column; min-height: 0; position: relative; overflow: hidden;
     backdrop-filter: blur(6px); }
@@ -161,7 +161,7 @@ HTML = r"""<!DOCTYPE html>
   .quote .qch.up { color: var(--gr); }
   .quote .qch.down { color: var(--rd); }
   .quote .qv { width: 84px; text-align: right; color: #8fb4d8; }
-  .verdicts { display: flex; flex-direction: column; gap: 5px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
+  .verdicts { display: flex; flex-direction: column; gap: 5px; overflow-y: auto; flex: 0 1 auto; min-height: 0; max-height: 56px; }
   .verdict { display: flex; align-items: center; gap: 8px; font-size: 11px; }
   .verdict .sym { width: 88px; color: var(--cy); }
   .vbadge { padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
@@ -173,7 +173,7 @@ HTML = r"""<!DOCTYPE html>
 
   /* ---------- AI 十项解读步骤 ---------- */
   .aisteps { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 5px;
-    margin-top: 5px; flex: 1 1 0; min-height: 0; align-content: start; }
+    margin-top: 5px; flex: 1 1 0; min-height: 90px; align-content: start; overflow-y: auto; }
   .aistep { text-align: center; font-size: 10px; padding: 3px 4px; border-radius: 5px; word-break: break-word;
     border: 1px solid var(--line); background: rgba(0,20,40,.35); color: #8fb4d8; letter-spacing: 1px; }
   .aistep.ok { border-color: rgba(52,255,176,.45); color: var(--gr); box-shadow: 0 0 6px rgba(52,255,176,.15); }
@@ -301,7 +301,7 @@ HTML = r"""<!DOCTYPE html>
       <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:24px; overflow-y:auto"><div class="empty">等待行情…</div></div>
       <h3 style="margin-top:4px">POSITIONS // 持仓 <span style="color:#5f7fa0;font-size:10px" id="posSum"></span></h3>
       <div class="quotes" id="positions" style="font-size:11px; max-height:48px; overflow-y:auto"><div class="empty">无持仓</div></div>
-      <div class="verdicts" id="verdicts" style="flex:0 1 auto; max-height:64px"><div class="empty">等待决策…</div></div>
+      <div class="verdicts" id="verdicts" style="flex:0 1 auto; max-height:56px"><div class="empty">等待决策…</div></div>
       <h3 style="margin-top:4px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
       <div class="aisteps" id="aisteps" style="flex:1 1 0; min-height:90px; overflow-y:auto"><div class="empty">—</div></div>
     </div>
