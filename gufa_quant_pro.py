@@ -1380,14 +1380,14 @@ class TriggerCondition:
 
 @dataclass
 class TriggerSet:
-    """单个标的的触发条件集：入场（AI-1 古法决策）与出场（AI-2 古法决策）。
+    """单个标的的触发条件集：入场（AI-2 决策）与出场（AI-3 决策）。
 
     entry: 入场条件列表；命中任一即按 entry_target 建仓。
     exit:  出场条件列表；命中任一即平仓。
     entry_target: 入场目标仓位（0.5=半仓，1.0=满仓，绝对权益占比）。
     entry_market / entry_leverage: 入场市场（spot/swap）与杠杆。
     first_trigger_at: 古法择时确定的当日首次触发时刻（ISO）；未到则只监听不入场。
-    ref_price: 买入成交均价（AI-2 出场涨跌幅的基准），入场后由系统回填。
+    ref_price: 买入成交均价（AI-3 出场涨跌幅的基准），入场后由系统回填。
     created_at / updated_at: 时间戳。
     """
 
@@ -1474,10 +1474,10 @@ class BotState:
     # 信号触发模式状态：symbol -> 触发条件集（入场/出场），由 AI 预设、监听循环消费。
     # 结构见 TriggerSet.to_dict；不参与旧周期模式（trigger_mode=cycle 时为空）。
     triggers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    # AI-1 入场评估冷却：symbol -> ISO 时间。古法判定"暂不交易"或 AI 调用失败时写入，
-    # 监听循环在该时间前不再唤醒 AI-1，避免每 2 秒轮询反复调用 AI 烧钱/打爆限频。
+    # AI-2 入场评估冷却：symbol -> ISO 时间。古法判定"暂不交易"或 AI 调用失败时写入，
+    # 监听循环在该时间前不再唤醒 AI-2，避免每 2 秒轮询反复调用 AI 烧钱/打爆限频。
     trigger_skip_until: Dict[str, str] = field(default_factory=dict)
-    # 最近一次 AI-1 布防返回的十项古法读数（奇门/六壬/.../四柱），供大屏雷达展示。
+    # 最近一次布防返回的十项古法读数（AI-1 断卦结果），供大屏雷达展示。
     last_readings: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -1523,7 +1523,7 @@ class BotState:
                 str(k): dict(v) for k, v in dict(data.get("triggers", {})).items()
                 if isinstance(v, dict)
             },
-            # AI-1 暂不交易/失败的冷却：symbol -> ISO 时间，在此之前不再唤醒 AI-1。
+            # AI-2 暂不交易/失败的冷却：symbol -> ISO 时间，在此之前不再唤醒 AI-2。
             trigger_skip_until={
                 str(k): str(v) for k, v in dict(data.get("trigger_skip_until", {})).items()
             },
@@ -3770,7 +3770,7 @@ class AIAdvisor:
         if self._fail_streak >= 4:
             self._circuit_open_until = time.monotonic() + 90
             self.log.warning(
-                "AI-1 连续失败 %d 次，熔断 90 秒暂停 AI 请求（上游不稳时避免打爆限频）",
+                "AI 调用连续失败 %d 次，熔断 90 秒暂停 AI 请求（上游不稳时避免打爆限频）",
                 self._fail_streak,
             )
             self._fail_streak = 0
@@ -5132,8 +5132,8 @@ class GuFaQuantPro:
     def _trigger_poll_loop(self) -> None:
         """信号触发主循环：每 trigger_poll_seconds 拉全量 ticker，评估触发条件。
 
-        入场命中 -> 执行买入（记录成交均价为基准价）-> 唤醒 AI-2 设定出场条件。
-        出场命中 -> 执行卖出 -> 唤醒 AI-1 重新评估入场。
+        入场命中 -> 执行买入（记录成交均价为基准价）-> 唤醒 AI-3 设定出场条件。
+        出场命中 -> 执行卖出 -> 唤醒 AI-2 重新评估入场。
         """
         self.log.warning(
             "信号触发模式启动 | poll=%ds max_wait=%.1fh symbols=%d",
@@ -5248,23 +5248,23 @@ class GuFaQuantPro:
                     self.store.state.trigger_skip_until.get(base)
                     and now_iso < self.store.state.trigger_skip_until[base]
                 ):
-                    continue  # AI-2 失败退避期内不重复唤醒
+                    continue  # AI-3 失败退避期内不重复唤醒
                 # 重启恢复：已有持仓但尚无出场条件（例如程序升级前买入），
-                # 以持仓成本（买入价基准）唤醒 AI-2 补出场条件；缺成本时用现价。
+                # 以持仓成本（买入价基准）唤醒 AI-3 补出场条件；缺成本时用现价。
                 self.log.warning(
-                    "%s 已有持仓但无出场条件，以买入价 %.6f 唤醒 AI-2 补设",
+                    "%s 已有持仓但无出场条件，以买入价 %.6f 唤醒 AI-3 补设",
                     key, pos.avg_entry or pos.price,
                 )
                 self._arm_exit_trigger(base, pos.price, pos.avg_entry or pos.price)
                 continue
             # 已有出场条件但缺十项古法读数（如重启后 last_readings 清空）：
-            # 主动调一次 AI-2 补 readings，让大屏雷达有数据可画。
+            # 主动调一次 AI-3 补 readings，让大屏雷达有数据可画。
             if base not in self.store.state.last_readings:
                 if not (
                     self.store.state.trigger_skip_until.get(base)
                     and now_iso < self.store.state.trigger_skip_until[base]
                 ):
-                    self.log.info("%s 持仓但缺古法读数，唤醒 AI-2 补 readings", base)
+                    self.log.info("%s 持仓但缺古法读数，唤醒 AI-3 补 readings", base)
                     self._arm_exit_trigger(base, pos.price, pos.avg_entry or pos.price)
         for symbol in list(triggers):
             ts = TriggerSet.from_dict(triggers[symbol])
@@ -5295,12 +5295,12 @@ class GuFaQuantPro:
                 continue
             if self._depth_blocked_today(symbol):
                 continue  # 当日深度不足缓存
-            # AI-1 冷却：古法判定暂不交易/调用失败，未到时间不重复唤醒。
+            # AI-2 冷却：古法判定暂不交易/调用失败，未到时间不重复唤醒。
             if skip_until.get(symbol) and now_iso < skip_until[symbol]:
                 continue
             ts = triggers.get(symbol)
             if ts is None:
-                # 无触发条件：AI-1 首次评估（带古法择时）。
+                # 无触发条件：AI-2 首次评估（带古法择时）。
                 ts = self._arm_entry_trigger(symbol, prices.get(symbol, 0.0), now_dt, now_iso)
                 if ts is None:
                     continue
@@ -5311,7 +5311,7 @@ class GuFaQuantPro:
             # 古法择时：未到首次触发时刻不监听。
             if ts.first_trigger_at and now_iso < ts.first_trigger_at:
                 continue
-            # 超时：超过最长等待唤醒 AI-1 重新评估。
+            # 超时：超过最长等待唤醒 AI-2 重新评估。
             created = ts.created_at
             if created:
                 try:
@@ -5319,7 +5319,7 @@ class GuFaQuantPro:
                     if (now_dt - created_dt).total_seconds() > (
                         self.config.runtime.trigger_max_wait_hours * 3600
                     ):
-                        self.log.warning("%s 触发条件超时，唤醒 AI-1 重新评估", symbol)
+                        self.log.warning("%s 触发条件超时，唤醒 AI-2 重新评估", symbol)
                         refreshed = self._arm_entry_trigger(
                             symbol, prices.get(symbol, 0.0), now_dt, now_iso
                         )
@@ -5430,18 +5430,18 @@ class GuFaQuantPro:
             self.store.save()
             return None
         if decision == "no_trade":
-            # 古法判定今日不宜交易：冷却到次日 UTC 零点，当天不再问 AI-1。
+            # 古法判定今日不宜交易：冷却到次日 UTC 零点，当天不再问 AI-2。
             next_day = datetime.combine(
                 utc_now().date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
             )
             skip[symbol] = next_day.isoformat()
-            self.log.warning("AI-1 %s 今日不宜交易，次日 %s 再评估（%s）", symbol, next_day.date(), summary)
+            self.log.warning("AI-2 %s 今日不宜交易，次日 %s 再评估（%s）", symbol, next_day.date(), summary)
             self.store.save()
             return None
         if decision == "wait" and not conditions:
             # 继续等待且无条件：30 分钟后再问。
             skip[symbol] = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
-            self.log.warning("AI-1 %s 继续等待（%s）", symbol, summary or decision)
+            self.log.warning("AI-2 %s 继续等待（%s）", symbol, summary or decision)
             self.store.save()
             return None
         first_at = self._auspicious_first_hour(symbol, now_dt)
@@ -5502,7 +5502,7 @@ class GuFaQuantPro:
     def _execute_trigger_entry(
         self, symbol: str, price: float, ts: TriggerSet, cond: TriggerCondition
     ) -> None:
-        """入场触发命中：按目标仓位买入，成交均价回填为 ref_price，唤醒 AI-2 设出场。"""
+        """入场触发命中：按目标仓位买入，成交均价回填为 ref_price，唤醒 AI-3 设出场。"""
         self.log.warning(
             "入场触发 %s | cond=%s value=%s price=%.4f target=%.0f%%",
             symbol, cond.kind, cond.value, price, ts.entry_target * 100,
@@ -5544,7 +5544,7 @@ class GuFaQuantPro:
             "plan": asdict(plan), "fill": asdict(fill),
         })
         self._notify("trigger_entry", {"symbol": symbol, "side": "buy", "avg": avg})
-        # 唤醒 AI-2 设定出场条件（买入价为基准）。
+        # 唤醒 AI-3 设定出场条件（买入价为基准）。
         self._arm_exit_trigger(symbol, price, avg)
         self._update_equity_from_fill(fill)
 
@@ -5647,7 +5647,7 @@ class GuFaQuantPro:
     ) -> None:
         """出场触发命中：先 disarm 防重复触发，再平仓该标的。
 
-        成功 → 移除触发状态，下次 tick 由 AI-1 重新评估入场。
+        成功 → 移除触发状态，下次 tick 由 AI-2 重新评估入场。
         plan is None（快照已无仓位）→ 移除触发（触发已无意义）。
         下单失败 → 恢复触发 + 退避 10 分钟，避免每个 tick 重复触发刷屏。
         """
@@ -5695,7 +5695,7 @@ class GuFaQuantPro:
             fill = self.gateway.execute(plan)
         except OrderUncertainError:
             # 订单状态不确定（可能已成交）：保持 disarm 防止重复下单，
-            # 交由挂单对账确认；若仓位仍在，下次 AI-2 评估会重新布防。
+            # 交由挂单对账确认；若仓位仍在，下次 AI-3 评估会重新布防。
             raise
         except Exception as exc:  # noqa: BLE001
             self.log.error("触发出场下单失败 %s: %s", symbol, exc)
@@ -5745,7 +5745,7 @@ class GuFaQuantPro:
             self.store.state.last_readings[symbol] = readings
             self.store.save()
         if status == "error":
-            # AI-2 调用/响应失败：保留现有出场条件不覆盖，10 分钟后重试。
+            # AI-3 调用/响应失败：保留现有出场条件不覆盖，10 分钟后重试。
             self.store.state.trigger_skip_until[symbol] = (
                 datetime.now(timezone.utc) + timedelta(minutes=10)
             ).isoformat()
@@ -6075,7 +6075,7 @@ class GuFaQuantPro:
             self.config.runtime.timeframe,
         )
         # 8.8.0：信号触发模式（默认）——不再按固定周期全量重算，
-        # 由 AI-1（古法入场）+ AI-2（古法出场）预设触发条件，监听循环按最小间隔轮询。
+        # 由 AI-2（古法入场）+ AI-3（古法出场）预设触发条件，监听循环按最小间隔轮询。
         if self.config.runtime.trigger_mode == "signal":
             self._trigger_poll_loop()
             return
