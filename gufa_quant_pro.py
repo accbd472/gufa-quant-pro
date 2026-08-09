@@ -1477,6 +1477,8 @@ class BotState:
     # AI-1 入场评估冷却：symbol -> ISO 时间。古法判定"暂不交易"或 AI 调用失败时写入，
     # 监听循环在该时间前不再唤醒 AI-1，避免每 2 秒轮询反复调用 AI 烧钱/打爆限频。
     trigger_skip_until: Dict[str, str] = field(default_factory=dict)
+    # 最近一次 AI-1 布防返回的十项古法读数（奇门/六壬/.../四柱），供大屏雷达展示。
+    last_readings: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "BotState":
@@ -1525,6 +1527,7 @@ class BotState:
             trigger_skip_until={
                 str(k): str(v) for k, v in dict(data.get("trigger_skip_until", {})).items()
             },
+            last_readings=dict(data.get("last_readings", {})),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -3712,19 +3715,20 @@ class AIAdvisor:
         account_equity: float,
         position_quote: float,
         now_iso: str,
-    ) -> Tuple[List[TriggerCondition], str, str, str]:
+    ) -> Tuple[List[TriggerCondition], str, str, str, Optional[Dict[str, Any]]]:
         """AI-1 入场决策（信号触发模式）：按古法判断交不交易，并给出触发条件。
 
-        返回 (conditions, summary, decision_mode, target_level)。
+        返回 (conditions, summary, decision_mode, target_level, readings)。
         decision_mode: "enter"=建议入场 | "wait"=继续等待 | "no_trade"=古法不宜交易
                        | "error"=AI 调用/响应失败（调用方应退避重试）。
         target_level: "HALF" / "FULL"，仅 decision=enter 时有效。
+        readings: 十项古法读数字典（奇门/六壬/.../四柱），AI 未提供时为 None。
         """
         if not self.config.enabled:
-            return [], "AI 已关闭，不设触发条件", "wait", "HALF"
+            return [], "AI 已关闭，不设触发条件", "wait", "HALF", None
         # 熔断器打开：暂停 AI 请求，直接快速失败（调用方会写冷却，不会反复重试）。
         if self._circuit_open_until and time.monotonic() < self._circuit_open_until:
-            return [], "AI 熔断中（上游不稳），保守等待", "error", "HALF"
+            return [], "AI 熔断中（上游不稳），保守等待", "error", "HALF", None
         system = (
             "你是中国古法十项综合断卦师（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。"
             "现在使用信号触发模式：系统不再定时重算，而是由你设定『触发条件』，条件命中才交易。"
@@ -3741,8 +3745,10 @@ class AIAdvisor:
             "note（string，中文说明触发理由））、"
             "target_level（string，精确等于 HALF/FULL 之一，建议入场时的目标仓位）、"
             "first_trigger_at（string，ISO 时间，由你结合古法择时判断的当日首次触发时刻；"
-            "表示在此之前不监听该标的，可给当前时间）"
-            "。不得输出 conditions 之外的字段。"
+            "表示在此之前不监听该标的，可给当前时间）、"
+            "readings（object，十项古法读数，key 为奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱，"
+            "value 为 object 含 bias（bullish/bearish/neutral）、confidence（0..1）、reading（中文简述））"
+            "。readings 为可选字段，但建议每次都完整填写。"
         )
         request = {
             "symbol": symbol,
@@ -3761,18 +3767,18 @@ class AIAdvisor:
         except Exception as exc:  # noqa: BLE001 触发决策失败不阻断监听循环
             self.log.error("AI-1 入场决策失败 %s: %s", symbol, exc)
             self._note_ai_failure()
-            return [], "AI-1 决策失败，保守等待", "error", "HALF"
+            return [], "AI-1 决策失败，保守等待", "error", "HALF", None
         try:
             parsed = require_json_object(json.loads(content), "AI-1 entry response")
             reject_unknown(
                 parsed,
-                {"decision", "summary", "conditions", "target_level", "first_trigger_at"},
+                {"decision", "summary", "conditions", "target_level", "first_trigger_at", "readings"},
                 "AI-1 entry response",
             )
         except (ConfigError, json.JSONDecodeError) as exc:
             self.log.warning("AI-1 响应结构无效 %s: %s", symbol, exc)
             self._note_ai_failure()
-            return [], "AI-1 响应无效，保守等待", "error", "HALF"
+            return [], "AI-1 响应无效，保守等待", "error", "HALF", None
         self._note_ai_success()
         decision = str(parsed.get("decision", "wait")).strip().lower()
         if decision not in {"enter", "wait", "no_trade"}:
@@ -3797,11 +3803,27 @@ class AIAdvisor:
             target_level = "HALF"
         first_at = str(parsed.get("first_trigger_at", "")).strip()
         summary = str(parsed.get("summary", "")).strip()[:200]
+        raw_readings = parsed.get("readings")
+        readings: Optional[Dict[str, Any]] = None
+        if isinstance(raw_readings, dict):
+            readings = {}
+            for name in ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]:
+                rd = raw_readings.get(name)
+                if isinstance(rd, dict):
+                    try:
+                        readings[name] = {
+                            "bias": str(rd.get("bias", "neutral")).strip().lower(),
+                            "confidence": max(0.0, min(1.0, float(rd.get("confidence", 0.0)))),
+                            "reading": str(rd.get("reading", ""))[:200],
+                        }
+                    except Exception:  # noqa: BLE001 单项损坏忽略
+                        continue
         self.log.warning(
-            "AI-1 入场决策 %s | decision=%s target=%s conditions=%d first_at=%s | %s",
-            symbol, decision, target_level, len(conditions), first_at[:19] or "-", summary,
+            "AI-1 入场决策 %s | decision=%s target=%s conditions=%d first_at=%s readings=%d | %s",
+            symbol, decision, target_level, len(conditions), first_at[:19] or "-",
+            len(readings or {}), summary,
         )
-        return conditions, summary, decision, target_level
+        return conditions, summary, decision, target_level, readings
 
     def decide_downsize(
         self,
@@ -5013,10 +5035,14 @@ class GuFaQuantPro:
             paipan_payload = None
         position = self.store.state.positions.get(symbol)
         position_quote = float(position.amount * price) if position else 0.0
-        conditions, summary, decision, target_level = self.ai.decide_entry(
+        conditions, summary, decision, target_level, readings = self.ai.decide_entry(
             symbol, price, paipan_payload,
             self._last_equity(), position_quote, now_iso,
         )
+        # 缓存十项古法读数供大屏雷达使用（最新一次 AI-1 布防的读数）。
+        if readings:
+            self.store.state.last_readings = readings
+            self.store.save()
         skip = self.store.state.trigger_skip_until
         if decision == "error":
             # AI 调用/响应失败：退避 10 分钟再问，避免每 2 秒轮询打爆限频。
@@ -5367,6 +5393,11 @@ class GuFaQuantPro:
             },
             "triggers": triggers_view,
             "fills": len(state.positions),
+            "decisions": {
+                "_last_readings": {
+                    "readings": state.last_readings,
+                },
+            } if state.last_readings else {},
             "live_updated_at": iso_now(),
         }
         try:

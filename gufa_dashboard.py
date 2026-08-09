@@ -850,11 +850,30 @@ class Snapshot:
             ai_ok = True
             ai_busy = False
 
-        # 雷达：周期模式取最后一个决策的十项 readings；
-        # 信号模式无 readings，用系统状态指标填充雷达（布防/持仓/行情/成交/AI/权益）。
+        # 雷达：优先读真实十项 readings（信号模式从 last_readings，周期模式从 decisions）；
+        # 都没有时用系统状态指标占位（布防/持仓/行情/成交/屏蔽/AI）。
         radar_names: List[str] = []
         radar_values: List[float] = []
+        last_readings = None
         if health.get("mode") == "signal":
+            dec = health.get("decisions") or {}
+            lr = dec.get("_last_readings") or {}
+            if isinstance(lr.get("readings"), dict) and lr["readings"]:
+                last_readings = lr["readings"]
+        else:
+            for sym, info in reversed(list(decisions.items())):
+                readings = info.get("readings") or info.get("ai", {}).get("readings")
+                if isinstance(readings, dict) and readings:
+                    last_readings = readings
+                    break
+        if isinstance(last_readings, dict) and last_readings:
+            for name, rd in list(last_readings.items())[:10]:
+                radar_names.append(str(name))
+                try:
+                    radar_values.append(float(rd.get("confidence", 0.0)))
+                except Exception:
+                    radar_values.append(0.0)
+        else:
             pos_count = len(state.get("positions") or {})
             trigger_count = len(health.get("triggers") or {})
             quote_count = len(health.get("quotes") or {})
@@ -869,20 +888,6 @@ class Snapshot:
                 min(1.0, blocked / 20.0),
                 1.0 if ai_ok else 0.4,
             ]
-        else:
-            last_readings = None
-            for sym, info in reversed(list(decisions.items())):
-                readings = info.get("readings") or info.get("ai", {}).get("readings")
-                if isinstance(readings, dict) and readings:
-                    last_readings = readings
-                    break
-            if isinstance(last_readings, dict):
-                for name, rd in list(last_readings.items())[:10]:
-                    radar_names.append(str(name))
-                    try:
-                        radar_values.append(float(rd.get("confidence", 0.0)))
-                    except Exception:
-                        radar_values.append(0.0)
 
         # 订单审计尾部（最近 3 条）
         orders = []
