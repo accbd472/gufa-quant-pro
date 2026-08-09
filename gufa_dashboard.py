@@ -468,12 +468,8 @@ function render(d){
   if (d.equity!=null){ $("mEquity").textContent = d.equity.toFixed(2); }
   $("mPeak").textContent = d.peak!=null ? d.peak.toFixed(2) : "--";
   $("mTrades").textContent = d.trades_today!=null ? d.trades_today : "--";
-  $("mCycle").textContent = d.cycle_seconds!=null ? Math.round(d.cycle_seconds)
-    : (d.mode==="signal" ? "布防"+(d.triggers?d.triggers.length:0) : "--");
   $("mFills").textContent = d.fills!=null ? d.fills
     : (d.mode==="signal" ? d.position_count : "--");
-  $("mReview").textContent = d.next_review_seconds!=null ? (d.next_review_seconds/60).toFixed(0)+"m"
-    : (d.mode==="signal" ? "实时" : "--");
   $("mCand").textContent = d.candidates!=null ? d.candidates : "--";
   $("mDayStart").textContent = d.day_start!=null ? d.day_start.toFixed(2) : "--";
   // 选股
