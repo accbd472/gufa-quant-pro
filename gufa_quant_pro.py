@@ -4134,12 +4134,12 @@ class AIAdvisor:
             "note": "以买入价为基准设定卖出触发条件（止盈/止损/时间兜底）。",
         }
         if split_readings is not None:
-            # 综合决策只需 bias/confidence + 短摘要；完整 readings 留给大屏展示。
+            # 出场决策带完整 readings（与入场一致，输入侧无预算压力）。
             request["readings"] = {
                 name: {
                     "bias": rd.get("bias", "neutral"),
                     "confidence": rd.get("confidence", 0.0),
-                    "reading": str(rd.get("reading", ""))[:60],
+                    "reading": str(rd.get("reading", "")),
                 }
                 for name, rd in split_readings.items()
             }
