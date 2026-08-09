@@ -583,9 +583,16 @@ function render(d){
         return `<span class="${cls}" data-sym="${s}">${s.replace('/USDT','')}</span>`;
       }).join("");
       $("radarSyms").querySelectorAll(".rsym").forEach(el=>{
-        el.onclick = ()=>{ radarSelSym = el.dataset.sym;
-          radarSym = radarSelSym; radarVals = radarAll[radarSelSym]||[0,0,0,0,0,0,0,0,0,0];
+        el.onclick = ()=>{
+          radarSelSym = el.dataset.sym;
+          radarSym = radarSelSym;
+          radarVals = radarAll[radarSelSym]||[0,0,0,0,0,0,0,0,0,0];
           $("radarSym").textContent = "// "+radarSelSym.replace('/USDT','');
+          $("radarSyms").querySelectorAll(".rsym").forEach(x=>x.classList.remove("active"));
+          el.classList.add("active");
+          drawRadar();
+        };
+      });
     } else { $("radarSyms").innerHTML = ""; }
     drawRadar();
   }
