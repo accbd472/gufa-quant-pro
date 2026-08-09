@@ -5034,7 +5034,11 @@ class GuFaQuantPro:
         now_mono = time.monotonic()
         if now_mono - getattr(self, "_last_heartbeat_log", 0.0) >= 30.0:
             self._last_heartbeat_log = now_mono
-            pos_real = sum(1 for p in snapshot.positions.values() if p.amount > 0)
+            # 按价值过滤 dust（< dust_quote=5U 的灰尘仓不算持仓，与 state 口径一致）
+            pos_real = sum(
+                1 for p in snapshot.positions.values()
+                if p.quote_value > self.config.risk.dust_quote
+            )
             self.log.info(
                 "心跳 | 布防=%d 持仓=%d 权益=%.0f 行情=%d",
                 len(triggers), pos_real, snapshot.equity, len(prices),
