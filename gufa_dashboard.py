@@ -297,12 +297,12 @@ HTML = r"""<!DOCTYPE html>
     <!-- 右下：决策 -->
     <div class="card c-dec" style="grid-column:2; grid-row:2">
       <h3>LIVE QUOTES // 实时行情 <span style="color:#5f7fa0;font-size:10px" id="liveTs"></span></h3>
-      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:34px; overflow-y:auto"><div class="empty">等待行情…</div></div>
-      <h3 style="margin-top:6px">POSITIONS // 持仓 <span style="color:#5f7fa0;font-size:10px" id="posSum"></span></h3>
-      <div class="quotes" id="positions" style="font-size:11px; max-height:96px; overflow-y:auto"><div class="empty">无持仓</div></div>
-      <div class="verdicts" id="verdicts"><div class="empty">等待决策…</div></div>
-      <h3 style="margin-top:6px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
-      <div class="aisteps" id="aisteps"><div class="empty">—</div></div>
+      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:28px; overflow-y:auto"><div class="empty">等待行情…</div></div>
+      <h3 style="margin-top:4px">POSITIONS // 持仓 <span style="color:#5f7fa0;font-size:10px" id="posSum"></span></h3>
+      <div class="quotes" id="positions" style="font-size:11px; max-height:60px; overflow-y:auto"><div class="empty">无持仓</div></div>
+      <div class="verdicts" id="verdicts" style="max-height:120px"><div class="empty">等待决策…</div></div>
+      <h3 style="margin-top:4px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
+      <div class="aisteps" id="aisteps" style="flex:1 1 auto; min-height:0; overflow-y:auto"><div class="empty">—</div></div>
     </div>
     <!-- 底部通栏：日志 -->
     <div class="card c-log" style="grid-column:1 / span 2; grid-row:3">
@@ -317,6 +317,7 @@ HTML = r"""<!DOCTYPE html>
 "use strict";
 const $ = id => document.getElementById(id);
 let eqHist = [], radarNames = [], radarVals = [], currentMode = "";
+let curTriggers = 0, curPositions = 0;
 
 /* ---------- 星空粒子 ---------- */
 (function stars(){
@@ -377,7 +378,9 @@ function drawRadar(){
   ctx.clearRect(0,0,W,H);
   const N = radarNames.length, cx = W/2, cy = H/2, R = Math.min(W,H)/2 - 26;
   if (!N) { ctx.fillStyle="#4a6a8a"; ctx.font="12px Consolas";
-    ctx.fillText(currentMode==="signal" ? "TRIGGER WATCH" : "NO SIGNAL", cx-42, cy); return; }
+    ctx.fillText(currentMode==="signal"
+      ? "TRIGGER WATCH · "+curTriggers+" 布防 / "+curPositions+" 持仓"
+      : "NO SIGNAL", cx-74, cy); return; }
   const ang = i => -Math.PI/2 + i*2*Math.PI/N;
   // 网格环
   for (let ring=1; ring<=4; ring++){
@@ -406,6 +409,8 @@ function setLed(id, cls, txt){ const l=$(id); if(!l) return; l.className="led "+
 
 function render(d){
   currentMode = d.mode||"";
+  curTriggers = (d.triggers&&d.triggers.length)||0;
+  curPositions = d.position_count||0;
   // 状态灯
   setLed("ledSys", d.status==="ok"?"ok":(d.status==="degraded"?"":"bad"), (d.status||"?").toUpperCase());
   setLed("ledNet", d.net_ok?"ok":"bad", d.net_ok?"LINK":"DOWN");
