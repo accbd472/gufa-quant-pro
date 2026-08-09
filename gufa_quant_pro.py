@@ -5430,18 +5430,22 @@ class GuFaQuantPro:
             self.store.save()
             return None
         if decision == "no_trade":
-            # 古法判定今日不宜交易：冷却到次日 UTC 零点，当天不再问 AI-2。
-            next_day = datetime.combine(
-                utc_now().date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
+            # 古法判定今日不宜交易：冷却到次日北京时间零点（lunar 日柱换日界，
+            # 与排盘东八区 CHINA_TZ 一致）。旧逻辑用 UTC 日界（=北京时间次日 08:00）
+            # 与古法日界错位——凌晨时段会出现"次日仍属今日"的歧义。
+            china_tz = timezone(timedelta(hours=8))
+            china_next = datetime.combine(
+                utc_now().astimezone(china_tz).date() + timedelta(days=1),
+                datetime.min.time(),
+                tzinfo=china_tz,
             )
-            skip[symbol] = next_day.isoformat()
-            # 日志同时标注 UTC 与北京时间（UTC+8），避免凌晨时段"次日"日期歧义。
-            local_next = next_day.astimezone(timezone(timedelta(hours=8)))
+            # 存储统一用 UTC ISO，保证与 now_iso 的字符串比较安全。
+            skip[symbol] = china_next.astimezone(UTC).isoformat()
             self.log.warning(
-                "AI-2 %s 今日不宜交易，冷却至 %s（UTC）/%s（北京时间）再评估（%s）",
+                "AI-2 %s 今日不宜交易，冷却至 %s（北京时间）/%s（UTC）再评估（%s）",
                 symbol,
-                next_day.strftime("%m-%d %H:%M"),
-                local_next.strftime("%m-%d %H:%M"),
+                china_next.strftime("%m-%d %H:%M"),
+                china_next.astimezone(UTC).strftime("%m-%d %H:%M"),
                 summary,
             )
             self.store.save()
