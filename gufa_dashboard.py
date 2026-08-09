@@ -172,8 +172,9 @@ HTML = r"""<!DOCTYPE html>
   .verdict .cn { font-size: 11px; color: var(--pu); }
 
   /* ---------- AI 十项解读步骤 ---------- */
-  .aisteps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin-top: 5px; flex-shrink: 0; }
-  .aistep { text-align: center; font-size: 10px; padding: 2px 1px; border-radius: 5px;
+  .aisteps { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 5px;
+    margin-top: 5px; flex: 1 1 0; min-height: 0; align-content: start; }
+  .aistep { text-align: center; font-size: 10px; padding: 3px 4px; border-radius: 5px; word-break: break-word;
     border: 1px solid var(--line); background: rgba(0,20,40,.35); color: #8fb4d8; letter-spacing: 1px; }
   .aistep.ok { border-color: rgba(52,255,176,.45); color: var(--gr); box-shadow: 0 0 6px rgba(52,255,176,.15); }
   .aistep.fallback { border-color: rgba(255,209,102,.45); color: var(--am); box-shadow: 0 0 6px rgba(255,209,102,.12); }
@@ -297,12 +298,12 @@ HTML = r"""<!DOCTYPE html>
     <!-- 右下：决策 -->
     <div class="card c-dec" style="grid-column:2; grid-row:2">
       <h3>LIVE QUOTES // 实时行情 <span style="color:#5f7fa0;font-size:10px" id="liveTs"></span></h3>
-      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:28px; overflow-y:auto"><div class="empty">等待行情…</div></div>
+      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:24px; overflow-y:auto"><div class="empty">等待行情…</div></div>
       <h3 style="margin-top:4px">POSITIONS // 持仓 <span style="color:#5f7fa0;font-size:10px" id="posSum"></span></h3>
-      <div class="quotes" id="positions" style="font-size:11px; max-height:60px; overflow-y:auto"><div class="empty">无持仓</div></div>
-      <div class="verdicts" id="verdicts" style="max-height:120px"><div class="empty">等待决策…</div></div>
+      <div class="quotes" id="positions" style="font-size:11px; max-height:48px; overflow-y:auto"><div class="empty">无持仓</div></div>
+      <div class="verdicts" id="verdicts" style="flex:0 1 auto; max-height:64px"><div class="empty">等待决策…</div></div>
       <h3 style="margin-top:4px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
-      <div class="aisteps" id="aisteps" style="flex:1 1 auto; min-height:0; overflow-y:auto"><div class="empty">—</div></div>
+      <div class="aisteps" id="aisteps" style="flex:1 1 0; min-height:90px; overflow-y:auto"><div class="empty">—</div></div>
     </div>
     <!-- 底部通栏：日志 -->
     <div class="card c-log" style="grid-column:1 / span 2; grid-row:3">
@@ -508,8 +509,8 @@ function render(d){
   } else if (d.mode==="signal"){
     const n = d.triggers ? d.triggers.length : 0;
     $("aiStepSum").textContent = "// 信号模式 · AI-1 布防";
-    $("aisteps").innerHTML = `<div class="aistep ok"><span class="st">✓</span> AI-1 古法入场条件已布防（${n} 个标的）</div>` +
-      `<div class="aistep ok"><span class="st">✓</span> 实时轮询 2s · 条件触发即执行</div>`;
+    $("aisteps").innerHTML = `<div class="aistep ok"><span class="st">✓</span> AI-1 布防 ${n} 标的</div>` +
+      `<div class="aistep ok"><span class="st">✓</span> 轮询 2s · 触发即执行</div>`;
   }
   // 权益曲线
   if (d.equity_hist) eqHist = d.equity_hist;
