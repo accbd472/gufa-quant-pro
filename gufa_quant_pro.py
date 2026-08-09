@@ -3107,11 +3107,15 @@ class AIAdvisor:
         }
 
     @classmethod
-    def _response_contract(cls) -> str:
+    def _response_contract(cls, require_readings: bool = True) -> str:
         template = json.dumps(cls._response_template(), ensure_ascii=False, separators=(",", ":"))
-        return (
+        top_fields = (
+            "action、target_level、confidence、market、leverage、summary、next_review_minutes"
+            + ("、readings、conflicts、risk_notes。" if require_readings else "、conflicts、risk_notes。")
+        )
+        contract = (
             "输出协议是强制接口契约：只能输出一个 JSON object，不得输出 Markdown、代码块、解释、前后缀或思维过程。"
-            "顶层必须且只能包含 action、target_level、confidence、market、leverage、summary、next_review_minutes、readings、conflicts、risk_notes。"
+            "顶层必须且只能包含 " + top_fields +
             "action 必须是 JSON string，并且只能精确等于 BUY、SELL、HOLD 之一；不得为 null、数字或对象。"
             "target_level 必须是 JSON string，并且只能精确等于 FLAT、HALF、FULL、UNCHANGED 之一。"
             "market 必须是 JSON string，只能精确等于 spot 或 swap（永续合约）；只能从输入给出的 allowed_markets 中选择，"
@@ -3122,14 +3126,23 @@ class AIAdvisor:
             "next_review_minutes 必须是 1 到 360 的 JSON integer，表示你建议的下一次行情复查间隔（分钟）："
             "波动剧烈、持仓重或方向不确定时用短间隔（如 5-30），市场平淡、空仓且无信号时可用长间隔（如 120-360）；"
             "无法判断时必须用 60，不得缺失。"
-            "readings 必须是 JSON object，必须完整且只包含奇门、六壬、太乙、易经、风水、八字、梅花、紫微、八卦、四柱。"
-            "每个 readings 项必须且只能包含 bias、confidence、reading；bias 只能是 bullish、bearish、neutral；"
-            "reading 必须是该古法盘面的断卦解读（如体用生克、三传与日干关系、值符吉门、命宫主星、日主旺衰等），"
-            "不得泛泛重复 value 数值。"
-            "conflicts 与 risk_notes 必须是 JSON string array。不得改字段名，不得把字段放入 decision、result、data 等嵌套对象。"
-            "若无法确定交易动作，必须使用 action=HOLD、target_level=UNCHANGED、market=spot、leverage=1、低 confidence，仍须完整填写十项 readings。"
-            f"严格结构示例（内容应根据输入重写，但结构和字段名不得改变）：{template}"
         )
+        if require_readings:
+            contract += (
+                "readings 必须是 JSON object，必须完整且只包含奇门、六壬、太乙、易经、风水、八字、梅花、紫微、八卦、四柱。"
+                "每个 readings 项必须且只能包含 bias、confidence、reading；bias 只能是 bullish、bearish、neutral；"
+                "reading 必须是该古法盘面的断卦解读（如体用生克、三传与日干关系、值符吉门、命宫主星、日主旺衰等），"
+                "不得泛泛重复 value 数值。"
+            )
+        else:
+            contract += "readings 已由系统单独提供，你不得输出 readings 字段（输出将被忽略）。"
+        contract += (
+            "conflicts 与 risk_notes 必须是 JSON string array。不得改字段名，不得把字段放入 decision、result、data 等嵌套对象。"
+            "若无法确定交易动作，必须使用 action=HOLD、target_level=UNCHANGED、market=spot、leverage=1、低 confidence"
+            + ("，仍须完整填写十项 readings。" if require_readings else "。")
+            + f"严格结构示例（内容应根据输入重写，但结构和字段名不得改变）：{template}"
+        )
+        return contract
 
     @staticmethod
     def _relay_error(exc: Exception) -> AIRelayError:
@@ -3672,7 +3685,11 @@ class AIAdvisor:
         paipan = result.diagnostics.get("paipan")
         method_paipan = None
         if isinstance(paipan, dict):
-            method_paipan = paipan.get(name)
+            # 盘面是 {current: {十项}, natal: {十项}} 嵌套结构；旧逻辑 paipan.get(name)
+            # 取不到任何盘面，导致定时拆分模式 AI 请求不带盘面只能空谈 value。
+            current = paipan.get("current") if isinstance(paipan.get("current"), dict) else {}
+            natal = paipan.get("natal") if isinstance(paipan.get("natal"), dict) else {}
+            method_paipan = current.get(name) or natal.get(name)
         request: Dict[str, Any] = {
             "symbol": symbol,
             "candle_time": result.candle_time,
@@ -4241,7 +4258,7 @@ class AIAdvisor:
             "（leverage 取 1..max_leverage 且不超过 max_futures_notional_pct 约束）；其余情况选 spot、leverage=1。"
             "注意：输出中不得包含 readings 字段（十项解读已由上游单独提供），"
             "只需输出 action、target_level、confidence、market、leverage、summary、conflicts、risk_notes、next_review_minutes。"
-            + self._response_contract()
+            + self._response_contract(require_readings=False)
         )
         content = self._completion_content([
             {"role": "system", "content": system},
@@ -5321,18 +5338,13 @@ class GuFaQuantPro:
 
     @staticmethod
     def _chart_summary(chart: Mapping[str, Any]) -> Dict[str, Any]:
-        """把单法盘面 dict 精简为传给 AI 的摘要（控制 token 与响应体量）。"""
-        out: Dict[str, Any] = {}
-        for key, value in chart.items():
-            if key in {"method", "chart_type", "error"}:
-                out[key] = value
-            elif isinstance(value, (str, int, float, bool)) or value is None:
-                out[key] = value
-            elif isinstance(value, list) and len(value) <= 8:
-                out[key] = [
-                    v for v in value if isinstance(v, (str, int, float, bool))
-                ][:8]
-        return out
+        """单法盘面全量透传给 AI（历史版本曾丢弃 dict 字段）。
+
+        旧逻辑只保留标量/list，导致奇门九宫（jiu_gong）、六壬天地盘（tianpan）、
+        太乙十六神/三基/五福等核心断卦结构被整体删除，AI 断卦缺失依据。
+        输入侧预算充足（十项全量约 8k 字符），无需摘要，全量保留。
+        """
+        return dict(chart)
 
     def _paipan_payload(self, symbol: str, now_dt) -> Optional[Dict[str, Any]]:
         """构建传给 AI 的盘面摘要（十项 method -> 核心字段，本命盘+时空盘）。"""
