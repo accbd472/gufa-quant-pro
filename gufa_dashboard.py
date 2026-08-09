@@ -396,10 +396,9 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
-    <!-- AI 十项解读（币种选择器挪到这里，与雷达联动） -->
+    <!-- AI 十项解读（点击持仓行切换币种，与雷达联动） -->
     <div class="card" style="grid-area:aisteps">
       <h3>AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
-      <div class="radar-syms" id="radarSyms" style="display:flex;gap:3px;flex-wrap:wrap;flex-shrink:0;margin-bottom:4px"></div>
       <div class="aisteps" id="aisteps"><div class="empty">—</div></div>
     </div>
     <!-- 日志 -->
@@ -512,7 +511,6 @@ function selectSym(sym){
   radarSelSym = sym; radarSym = sym;
   radarVals = radarAll[sym] || [0,0,0,0,0,0,0,0,0,0];
   $("radarSym").textContent = "// " + sym.replace('/USDT','');
-  document.querySelectorAll("#radarSyms .rsym").forEach(x=>x.classList.toggle("active", x.dataset.sym===sym));
   document.querySelectorAll("#positions .posrow").forEach(x=>x.classList.toggle("posactive", x.dataset.sym===sym));
   drawRadar();
   renderTenReadings(sym);
@@ -686,15 +684,6 @@ function render(d){
     if (radarSelSym && radarAll[radarSelSym]) { radarSym = radarSelSym; }
     radarVals = radarAll[radarSym] || (d.radar.values||[]);
     $("radarSym") && ($("radarSym").textContent = radarSym ? "// "+radarSym.replace('/USDT','') : "");
-    // 渲染持仓币种选择器（点击切换雷达+十项解读）
-    const syms = Object.keys(radarAll);
-    if (syms.length){
-      $("radarSyms").innerHTML = syms.map(s=>{
-        const cls = s===radarSym ? "rsym active" : "rsym";
-        return `<span class="${cls}" data-sym="${s}">${s.replace('/USDT','')}</span>`;
-      }).join("");
-      $("radarSyms").querySelectorAll(".rsym").forEach(el=>{ el.onclick = ()=>selectSym(el.dataset.sym); });
-    } else { $("radarSyms").innerHTML = ""; }
     drawRadar();
   }
   // AI 历史买卖动作
