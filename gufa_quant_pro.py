@@ -5127,7 +5127,14 @@ class GuFaQuantPro:
             # 深度不足/滑点超限：反馈 AI 仲裁缩量买入或放弃（只缩一次，仍失败则当日屏蔽）。
             if self._retry_downsize_entry(symbol, plan, price, ts, cond, exc):
                 return
+            # 非深度/滑点类失败（交易所限额、No market data 等）：当日屏蔽避免刷屏重试。
             self.log.error("触发入场下单失败 %s: %s", symbol, exc)
+            self._block_depth_today(symbol, str(exc))
+            append_jsonl(self.audit_path, {
+                "ts": iso_now(), "event": "trigger_entry_skip",
+                "symbol": symbol, "reason": "下单失败",
+                "error": repr(exc),
+            })
             return
         avg = float(fill.average_price or 0.0) or price
         append_jsonl(self.audit_path, {
@@ -5359,6 +5366,7 @@ class GuFaQuantPro:
                 for sym, pos in snapshot.positions.items()
             },
             "triggers": triggers_view,
+            "fills": len(state.positions),
             "live_updated_at": iso_now(),
         }
         try:
