@@ -3710,6 +3710,103 @@ class AIAdvisor:
         self._fail_streak = 0
         self._circuit_open_until = 0.0
 
+    @staticmethod
+    def _compact_paipan(
+        paipan_payload: Optional[Mapping[str, Any]], limit: int = 150,
+    ) -> Dict[str, Any]:
+        """精简盘面 payload：每个字段只保留前 limit 字符，控制 prompt 体积。
+
+        完整排盘 22 项（current_十项 + natal_十项）约 1.3 万字符，加上其他
+        上下文会让 reasoning 型模型（如 deepseek-v4-flash）把输出预算耗尽在
+        思考上，导致 content 为空或 JSON 被截断。拆分成小请求后，综合决策
+        请求只需带精简盘面摘要 + 十项 readings，即可大幅缩小 prompt。
+        """
+        if not isinstance(paipan_payload, dict):
+            return {}
+        compact: Dict[str, Any] = {}
+        for key, value in paipan_payload.items():
+            if not isinstance(value, (dict, list, str)):
+                continue
+            try:
+                text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+            except Exception:  # noqa: BLE001 单字段序列化失败跳过
+                continue
+            compact[key] = text[:limit]
+        return compact
+
+    def _entry_read_single_method(
+        self,
+        name: str,
+        symbol: str,
+        current_price: float,
+        account_equity: float,
+        position_quote: float,
+        now_iso: str,
+        paipan_payload: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """AI-1 拆分模式：单项古法解读请求（只带该项盘面，输出 bias/confidence/reading）。"""
+        method_paipan = None
+        if isinstance(paipan_payload, dict):
+            method_paipan = paipan_payload.get(f"current_{name}") or paipan_payload.get(f"natal_{name}")
+        if isinstance(method_paipan, dict):
+            try:
+                method_paipan = json.dumps(method_paipan, ensure_ascii=False)[:400]
+            except Exception:  # noqa: BLE001
+                method_paipan = None
+        request = {
+            "symbol": symbol,
+            "current_price": current_price,
+            "account_equity": account_equity,
+            "current_position_quote": position_quote,
+            "now_iso": now_iso,
+            "method": name,
+            "paipan": method_paipan or {},
+            "note": f"只解读「{name}」这一项古法，不要解读其他古法，不要给出交易动作。",
+        }
+        system = (
+            f"你是中国古法「{name}」断卦师。只负责解读「{name}」这一项，不要解读其他古法，"
+            "不要给出交易动作。输出必须是一个 JSON object，字段只能且必须包含 "
+            "bias（bullish/bearish/neutral）、confidence（0 到 1 的 JSON number）、"
+            "reading（中文断卦解读，须结合盘面具体断卦，150 字以内）。不得输出其他字段。"
+        )
+        content = self._completion_content([
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+        ])
+        parsed = self._parse_single_method_strict(name, content)
+        return {
+            "bias": parsed.bias,
+            "confidence": parsed.confidence,
+            "reading": parsed.reading,
+        }
+
+    def _entry_readings_split(
+        self,
+        symbol: str,
+        current_price: float,
+        account_equity: float,
+        position_quote: float,
+        now_iso: str,
+        paipan_payload: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """AI-1 拆分模式：十项各发一次小请求获取 readings，单项失败用中性兜底。"""
+        readings: Dict[str, Any] = {}
+        for name in STRATEGY_NAMES:
+            try:
+                readings[name] = self._entry_read_single_method(
+                    name, symbol, current_price, account_equity, position_quote,
+                    now_iso, paipan_payload,
+                )
+            except AIRelayError:
+                raise  # 中转站整体故障：上抛，由 decide_entry 统一回退
+            except Exception as exc:  # noqa: BLE001 单项失败不影响其余九项
+                self.log.warning("AI-1 拆分解读「%s」失败，该项中性兜底: %s", name, exc)
+                readings[name] = {
+                    "bias": "neutral", "confidence": 0.0,
+                    "reading": f"（AI 单项解读失败，规则兜底）{ANCIENT_METHOD_DESCRIPTIONS[name]}",
+                }
+        return readings
+
     def decide_entry(
         self,
         symbol: str,
@@ -3732,6 +3829,20 @@ class AIAdvisor:
         # 熔断器打开：暂停 AI 请求，直接快速失败（调用方会写冷却，不会反复重试）。
         if self._circuit_open_until and time.monotonic() < self._circuit_open_until:
             return [], "AI 熔断中（上游不稳），保守等待", "error", "HALF", None
+        # 拆分模式（split_readings）：十项 readings 各发一次小请求（只带单项盘面），
+        # 综合决策请求只带精简盘面 + 拆分得到的 readings，避免单次大 prompt 把
+        # reasoning 模型的输出预算耗尽在思考上导致空正文/JSON 截断。
+        split_readings: Optional[Dict[str, Any]] = None
+        if self.config.split_readings:
+            try:
+                split_readings = self._entry_readings_split(
+                    symbol, current_price, account_equity, position_quote,
+                    now_iso, paipan_payload,
+                )
+            except AIRelayError as exc:
+                self.log.error("AI-1 拆分读取十项解读失败（中转站错误）%s: %s", symbol, exc)
+                self._note_ai_failure()
+                return [], "AI-1 决策失败，保守等待", "error", "HALF", None
         system = (
             "你是中国古法十项综合断卦师（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。"
             "现在使用信号触发模式：系统不再定时重算，而是由你设定『触发条件』，条件命中才交易。"
@@ -3748,20 +3859,37 @@ class AIAdvisor:
             "note（string，中文说明触发理由））、"
             "target_level（string，精确等于 HALF/FULL 之一，建议入场时的目标仓位）、"
             "first_trigger_at（string，ISO 时间，由你结合古法择时判断的当日首次触发时刻；"
-            "表示在此之前不监听该标的，可给当前时间）、"
-            "readings（object，十项古法读数，key 为奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱，"
-            "value 为 object 含 bias（bullish/bearish/neutral）、confidence（0..1）、reading（中文简述））"
-            "。readings 为可选字段，但建议每次都完整填写。"
+            "表示在此之前不监听该标的，可给当前时间）"
         )
-        request = {
+        if split_readings is None:
+            # 非拆分模式：要求 AI 一并输出十项 readings。
+            system += (
+                "、readings（object，十项古法读数，key 为奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱，"
+                "value 为 object 含 bias（bullish/bearish/neutral）、confidence（0..1）、reading（中文简述））"
+                "。readings 为可选字段，但建议每次都完整填写。"
+            )
+        else:
+            # 拆分模式：readings 已由系统单独获取，综合请求无需再输出。
+            system += "。readings 已由系统提供，不要再输出 readings 字段。"
+        request: Dict[str, Any] = {
             "symbol": symbol,
             "current_price": current_price,
             "account_equity": account_equity,
             "current_position_quote": position_quote,
             "now_iso": now_iso,
-            "paipan": dict(paipan_payload or {}),
+            "paipan": self._compact_paipan(paipan_payload),
             "note": "古法判断交易时机并给出可执行触发条件；decision=no_trade 时 conditions 必须为空数组。",
         }
+        if split_readings is not None:
+            # 综合决策只需 bias/confidence + 短摘要；完整 readings 留给大屏展示。
+            request["readings"] = {
+                name: {
+                    "bias": rd.get("bias", "neutral"),
+                    "confidence": rd.get("confidence", 0.0),
+                    "reading": str(rd.get("reading", ""))[:60],
+                }
+                for name, rd in split_readings.items()
+            }
         try:
             content = self._completion_content([
                 {"role": "system", "content": system},
@@ -3807,8 +3935,8 @@ class AIAdvisor:
         first_at = str(parsed.get("first_trigger_at", "")).strip()
         summary = str(parsed.get("summary", "")).strip()[:200]
         raw_readings = parsed.get("readings")
-        readings: Optional[Dict[str, Any]] = None
-        if isinstance(raw_readings, dict):
+        readings: Optional[Dict[str, Any]] = split_readings
+        if readings is None and isinstance(raw_readings, dict):
             readings = {}
             for name in ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]:
                 rd = raw_readings.get(name)
@@ -3923,6 +4051,18 @@ class AIAdvisor:
         """
         if not self.config.enabled:
             return [], "AI 已关闭，不设出场条件", "ok", None
+        # 拆分模式：十项 readings 各发一次小请求（复用通用单项解读），
+        # 综合出场决策请求只带精简盘面 + readings，避免大 prompt 空正文/截断。
+        split_readings: Optional[Dict[str, Any]] = None
+        if self.config.split_readings:
+            try:
+                split_readings = self._entry_readings_split(
+                    symbol, current_price, account_equity, position_quote,
+                    now_iso, paipan_payload,
+                )
+            except AIRelayError as exc:
+                self.log.error("AI-2 拆分读取十项解读失败（中转站错误）%s: %s", symbol, exc)
+                return [], "AI-2 决策失败，沿用现有出场条件", "error", None
         system = (
             "你是中国古法十项综合断卦师（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。"
             "系统使用信号触发模式。现在你负责『出场决策』：为已持仓标的设定卖出触发条件。"
@@ -3937,20 +4077,35 @@ class AIAdvisor:
             "ref_price（number，基准价，必须使用给定持仓成本价）、"
             "note（string，中文说明卖出理由））"
             "。conditions 至少 1 条；若古法认为应继续持有，可只给 time_after 一条作为最迟复查。"
-            "readings（object，十项古法读数，key 为奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱，"
-            "value 为 object 含 bias（bullish/bearish/neutral）、confidence（0..1）、reading（中文简述））"
-            "。readings 为可选字段，但建议每次都完整填写。"
         )
-        request = {
+        if split_readings is None:
+            system += (
+                "readings（object，十项古法读数，key 为奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱，"
+                "value 为 object 含 bias（bullish/bearish/neutral）、confidence（0..1）、reading（中文简述））"
+                "。readings 为可选字段，但建议每次都完整填写。"
+            )
+        else:
+            system += "readings 已由系统提供，不要再输出 readings 字段。"
+        request: Dict[str, Any] = {
             "symbol": symbol,
             "current_price": current_price,
             "ref_price": ref_price,
             "account_equity": account_equity,
             "position_quote": position_quote,
             "now_iso": now_iso,
-            "paipan": dict(paipan_payload or {}),
+            "paipan": self._compact_paipan(paipan_payload),
             "note": "以买入价为基准设定卖出触发条件（止盈/止损/时间兜底）。",
         }
+        if split_readings is not None:
+            # 综合决策只需 bias/confidence + 短摘要；完整 readings 留给大屏展示。
+            request["readings"] = {
+                name: {
+                    "bias": rd.get("bias", "neutral"),
+                    "confidence": rd.get("confidence", 0.0),
+                    "reading": str(rd.get("reading", ""))[:60],
+                }
+                for name, rd in split_readings.items()
+            }
         try:
             content = self._completion_content([
                 {"role": "system", "content": system},
@@ -3980,8 +4135,8 @@ class AIAdvisor:
                     continue
         summary = str(parsed.get("summary", "")).strip()[:200]
         raw_readings = parsed.get("readings")
-        readings: Optional[Dict[str, Any]] = None
-        if isinstance(raw_readings, dict):
+        readings: Optional[Dict[str, Any]] = split_readings
+        if readings is None and isinstance(raw_readings, dict):
             readings = {}
             for name in ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]:
                 rd = raw_readings.get(name)
