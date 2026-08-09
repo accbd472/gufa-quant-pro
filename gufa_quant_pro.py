@@ -3042,7 +3042,15 @@ class AIDecision:
 
 
 class AIAdvisor:
-    """逐项解读十大技术因子，并把叙述转译为受规则与风控约束的交易目标。"""
+    """三层 AI 决策架构：
+
+    AI-1 断卦师：接收 K 线行情上下文 + 完整古法盘面，逐项解读十项古法，
+                 输出 bias/confidence/reading（_divine_all_methods）。
+    AI-2 入场决策师：综合 AI-1 十项解读、持仓与风控约束，确认是否买入、
+                     买入多少仓位，并给出触发条件（decide_entry）。
+    AI-3 出场决策师：综合 AI-1 十项解读与持仓成本，设定出场触发条件
+                     （decide_exit）。
+    """
 
     def __init__(
         self,
@@ -3773,8 +3781,8 @@ class AIAdvisor:
         self._circuit_open_until = 0.0
 
     @staticmethod
-    def _compact_paipan(
-        paipan_payload: Optional[Mapping[str, Any]], limit: int = 150,
+    def _full_paipan_payload(
+        paipan_payload: Optional[Mapping[str, Any]],
     ) -> Dict[str, Any]:
         """盘面 payload 全量透传（历史版本曾按字段截断控制 prompt 体积）。
 
@@ -3786,7 +3794,74 @@ class AIAdvisor:
             return {}
         return {key: value for key, value in paipan_payload.items()}
 
-    def _entry_read_single_method(
+    @staticmethod
+    def _build_kline_context(
+        df: Any, candle_limit: int = 24,
+    ) -> Optional[Dict[str, Any]]:
+        """把 K 线 DataFrame 压缩为 AI-1 断卦可用的行情上下文。
+
+        只保留最近 candle_limit 根 OHLCV 与常用技术指标，控制 prompt 体积：
+        AI-1 以盘面断卦为主，kline 仅作行情走势背景参考（不改变古法判定）。
+        返回 None 表示数据不足（调用方应省略 kline 字段，不阻断 AI 请求）。
+        """
+        if df is None or getattr(df, "empty", True):
+            return None
+        try:
+            close = df["close"].astype(float)
+            high = df["high"].astype(float)
+            low = df["low"].astype(float)
+            vol = df["volume"].astype(float)
+            if len(close) < 2:
+                return None
+            last_close = float(close.iloc[-1])
+            if last_close <= 0:
+                return None
+            # 最近 N 根 K 线：[[timestamp, open, high, low, close, volume], ...]
+            tail = df.tail(candle_limit)
+            candles: List[List[Any]] = []
+            for idx in range(len(tail)):
+                row = tail.iloc[idx]
+                ts = row.get("timestamp") if "timestamp" in tail.columns else tail.index[idx]
+                candles.append([
+                    int(ts) if isinstance(ts, (int, float)) else str(ts),
+                    round(float(row["open"]), 8),
+                    round(float(row["high"]), 8),
+                    round(float(row["low"]), 8),
+                    round(float(row["close"]), 8),
+                    round(float(row["volume"]), 4),
+                ])
+            # RSI(14)
+            delta = close.diff()
+            gain = delta.clip(lower=0.0).ewm(alpha=1 / 14, adjust=False).mean()
+            loss = (-delta.clip(upper=0.0)).ewm(alpha=1 / 14, adjust=False).mean()
+            rsi14 = float(100.0 - 100.0 / (1.0 + gain.iloc[-1] / max(loss.iloc[-1], 1e-12)))
+            # ATR(14) 相对当前价的百分比
+            prev_close = close.shift(1)
+            tr = pd.concat(
+                [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+                axis=1,
+            ).max(axis=1)
+            atr14 = float(tr.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1])
+            # 量比（最新 vs 前 20 根均值）
+            avg_vol = float(vol.iloc[-21:-1].mean()) if len(vol) > 21 else float(vol.mean())
+            vol_ratio = float(vol.iloc[-1] / avg_vol) if avg_vol > 0 else None
+            window = min(len(close), candle_limit + 1)
+            change_window_pct = float(close.iloc[-1] / close.iloc[-window] - 1)
+            return {
+                "timeframe": "1h",
+                "candles": candles,
+                "last_price": last_close,
+                "high_window": float(high.tail(window).max()),
+                "low_window": float(low.tail(window).min()),
+                "change_window_pct": round(change_window_pct, 6),
+                "rsi14": round(rsi14, 2),
+                "atr14_pct": round(atr14 / last_close, 6),
+                "volume_ratio": round(vol_ratio, 3) if vol_ratio is not None else None,
+            }
+        except Exception:  # noqa: BLE001 构造失败不阻断 AI 请求
+            return None
+
+    def _divine_single_method(
         self,
         name: str,
         symbol: str,
@@ -3795,11 +3870,13 @@ class AIAdvisor:
         position_quote: float,
         now_iso: str,
         paipan_payload: Optional[Mapping[str, Any]],
+        kline_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """AI-1 拆分模式：单项古法解读请求（喂该古法完整盘面，输出 bias/confidence/reading）。
+        """AI-1 断卦·单项：喂该古法完整盘面 + K 线行情，输出 bias/confidence/reading。
 
         全量盘面（不截断）：奇门九宫、六壬四课三传等核心断卦依据必须完整
         可见，否则 AI 只能空泛套话（历史 400 字符截断曾丢失这些关键字段）。
+        kline 仅作行情背景参考，断卦依据以盘面要素为准（古法不变）。
         """
         method_paipan = None
         if isinstance(paipan_payload, dict):
@@ -3814,10 +3891,14 @@ class AIAdvisor:
             "paipan": method_paipan or {},
             "note": f"只解读「{name}」这一项古法，不要解读其他古法，不要给出交易动作。",
         }
+        if kline_context:
+            request["kline"] = kline_context
         system = (
             f"你是中国古法「{name}」断卦师。只负责解读「{name}」这一项，不要解读其他古法，"
             "不要给出交易动作。你的解读必须具体引用盘面中的实际断卦要素"
             "（如具体宫位、神煞、卦象、爻辞、四课三传、用神落宫等），严禁空泛套话。"
+            "输入附带 kline 行情上下文（最近 24 根 1h K 线与技术指标），仅作行情背景参考，"
+            "断卦依据以盘面要素为准。"
             "输出必须是一个 JSON object，字段只能且必须包含 "
             "bias（bullish/bearish/neutral）、confidence（0 到 1 的 JSON number）、"
             "reading（中文断卦解读，须引用盘面具体要素断卦，150 字以内）。不得输出其他字段。"
@@ -3833,7 +3914,7 @@ class AIAdvisor:
             "reading": parsed.reading,
         }
 
-    def _entry_readings_split(
+    def _divine_all_methods(
         self,
         symbol: str,
         current_price: float,
@@ -3841,19 +3922,24 @@ class AIAdvisor:
         position_quote: float,
         now_iso: str,
         paipan_payload: Optional[Mapping[str, Any]],
+        kline_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """AI-1 拆分模式：十项各发一次小请求获取 readings，单项失败用中性兜底。"""
+        """AI-1 断卦·十项：十项各发一次小请求获取 readings，单项失败用中性兜底。
+
+        供 AI-2（decide_entry）与 AI-3（decide_exit）共用，输出结构不变
+        （{方法名: {bias, confidence, reading}}），保证大屏/状态存储不受影响。
+        """
         readings: Dict[str, Any] = {}
         for name in STRATEGY_NAMES:
             try:
-                readings[name] = self._entry_read_single_method(
+                readings[name] = self._divine_single_method(
                     name, symbol, current_price, account_equity, position_quote,
-                    now_iso, paipan_payload,
+                    now_iso, paipan_payload, kline_context,
                 )
             except AIRelayError:
-                raise  # 中转站整体故障：上抛，由 decide_entry 统一回退
+                raise  # 中转站整体故障：上抛，由 decide_entry/decide_exit 统一回退
             except Exception as exc:  # noqa: BLE001 单项失败不影响其余九项
-                self.log.warning("AI-1 拆分解读「%s」失败，该项中性兜底: %s", name, exc)
+                self.log.warning("AI-1 断卦「%s」失败，该项中性兜底: %s", name, exc)
                 readings[name] = {
                     "bias": "neutral", "confidence": 0.0,
                     "reading": f"（AI 单项解读失败，规则兜底）{ANCIENT_METHOD_DESCRIPTIONS[name]}",
@@ -3868,9 +3954,11 @@ class AIAdvisor:
         account_equity: float,
         position_quote: float,
         now_iso: str,
+        kline_context: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[List[TriggerCondition], str, str, str, Optional[Dict[str, Any]]]:
-        """AI-1 入场决策（信号触发模式）：按古法判断交不交易，并给出触发条件。
+        """AI-2 入场决策（信号触发模式）：确认是否买入、买入多少仓位并给出触发条件。
 
+        流程：AI-1 十项断卦（_divine_all_methods，带 K 线行情）→ AI-2 综合确认。
         返回 (conditions, summary, decision_mode, target_level, readings)。
         decision_mode: "enter"=建议入场 | "wait"=继续等待 | "no_trade"=古法不宜交易
                        | "error"=AI 调用/响应失败（调用方应退避重试）。
@@ -3882,24 +3970,25 @@ class AIAdvisor:
         # 熔断器打开：暂停 AI 请求，直接快速失败（调用方会写冷却，不会反复重试）。
         if self._circuit_open_until and time.monotonic() < self._circuit_open_until:
             return [], "AI 熔断中（上游不稳），保守等待", "error", "HALF", None
-        # 拆分模式（split_readings）：十项 readings 各发一次小请求（只带单项盘面），
-        # 综合决策请求只带精简盘面 + 拆分得到的 readings，避免单次大 prompt 把
+        # AI-1 断卦层：十项 readings 各发一次小请求（只带单项盘面 + K 线），
+        # AI-2 综合请求带精简盘面 + 拆分得到的 readings，避免单次大 prompt 把
         # reasoning 模型的输出预算耗尽在思考上导致空正文/JSON 截断。
         split_readings: Optional[Dict[str, Any]] = None
         if self.config.split_readings:
             try:
-                split_readings = self._entry_readings_split(
+                split_readings = self._divine_all_methods(
                     symbol, current_price, account_equity, position_quote,
-                    now_iso, paipan_payload,
+                    now_iso, paipan_payload, kline_context,
                 )
             except AIRelayError as exc:
-                self.log.error("AI-1 拆分读取十项解读失败（中转站错误）%s: %s", symbol, exc)
+                self.log.error("AI-1 断卦十项失败（中转站错误）%s: %s", symbol, exc)
                 self._note_ai_failure()
-                return [], "AI-1 决策失败，保守等待", "error", "HALF", None
+                return [], "AI-1 断卦失败，保守等待", "error", "HALF", None
         system = (
             "你是中国古法十项综合断卦师（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。"
             "现在使用信号触发模式：系统不再定时重算，而是由你设定『触发条件』，条件命中才交易。"
-            "你必须基于完整盘面与当前行情，判断是否交易，并把入场时机翻译成明确、可执行的触发条件。"
+            "你必须基于 AI-1 提供的十项完整解读、完整盘面、K 线行情与当前价格水平，"
+            "确认是否买入、买入多少仓位，并把入场时机翻译成明确、可执行的触发条件。"
             "输出必须是单个 JSON object，不得输出 Markdown/代码块/解释。字段只能包含："
             "decision（string，精确等于 enter / wait / no_trade 之一）、"
             "summary（string，中文一句话总结断卦结论）、"
@@ -3930,9 +4019,11 @@ class AIAdvisor:
             "account_equity": account_equity,
             "current_position_quote": position_quote,
             "now_iso": now_iso,
-            "paipan": self._compact_paipan(paipan_payload),
+            "paipan": self._full_paipan_payload(paipan_payload),
             "note": "古法判断交易时机并给出可执行触发条件；decision=no_trade 时 conditions 必须为空数组。",
         }
+        if kline_context:
+            request["kline"] = kline_context
         if split_readings is not None:
             # 综合决策带完整 readings（输入侧无预算压力，AI-2 独立判断需要完整上下文）。
             request["readings"] = {
@@ -3944,26 +4035,26 @@ class AIAdvisor:
                 for name, rd in split_readings.items()
             }
         try:
-            # 综合决策请求：单独给更宽输出预算（reasoning 含思考+正文）。
+            # AI-2 综合决策请求：单独给更宽输出预算（reasoning 含思考+正文）。
             content = self._completion_content([
                 {"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
             ], max_tokens_override=6000)
         except Exception as exc:  # noqa: BLE001 触发决策失败不阻断监听循环
-            self.log.error("AI-1 入场决策失败 %s: %s", symbol, exc)
+            self.log.error("AI-2 入场决策失败 %s: %s", symbol, exc)
             self._note_ai_failure()
-            return [], "AI-1 决策失败，保守等待", "error", "HALF", None
+            return [], "AI-2 决策失败，保守等待", "error", "HALF", None
         try:
-            parsed = require_json_object(json.loads(content), "AI-1 entry response")
+            parsed = require_json_object(json.loads(content), "AI-2 entry response")
             reject_unknown(
                 parsed,
                 {"decision", "summary", "conditions", "target_level", "first_trigger_at", "readings"},
-                "AI-1 entry response",
+                "AI-2 entry response",
             )
         except (ConfigError, json.JSONDecodeError) as exc:
-            self.log.warning("AI-1 响应结构无效 %s: %s", symbol, exc)
+            self.log.warning("AI-2 响应结构无效 %s: %s", symbol, exc)
             self._note_ai_failure()
-            return [], "AI-1 响应无效，保守等待", "error", "HALF", None
+            return [], "AI-2 响应无效，保守等待", "error", "HALF", None
         self._note_ai_success()
         decision = str(parsed.get("decision", "wait")).strip().lower()
         if decision not in {"enter", "wait", "no_trade"}:
@@ -4004,7 +4095,7 @@ class AIAdvisor:
                     except Exception:  # noqa: BLE001 单项损坏忽略
                         continue
         self.log.warning(
-            "AI-1 入场决策 %s | decision=%s target=%s conditions=%d first_at=%s readings=%d | %s",
+            "AI-2 入场决策 %s | decision=%s target=%s conditions=%d first_at=%s readings=%d | %s",
             symbol, decision, target_level, len(conditions), first_at[:19] or "-",
             len(readings or {}), summary,
         )
@@ -4096,31 +4187,34 @@ class AIAdvisor:
         account_equity: float,
         position_quote: float,
         now_iso: str,
+        kline_context: Optional[Mapping[str, Any]] = None,
     ) -> Tuple[List[TriggerCondition], str, str, Optional[Dict[str, Any]]]:
-        """AI-2 出场决策（信号触发模式）：按古法判断卖出条件，输出出场触发条件。
+        """AI-3 出场决策（信号触发模式）：按古法判断卖出条件，输出出场触发条件。
 
+        流程：AI-1 十项断卦（_divine_all_methods，带 K 线行情）→ AI-3 综合出场。
         返回 (exit_conditions, summary, status, readings)。
         status: "ok"=正常 | "error"=调用/响应失败。
         readings: 十项古法读数字典，AI 未提供时为 None。
         """
         if not self.config.enabled:
             return [], "AI 已关闭，不设出场条件", "ok", None
-        # 拆分模式：十项 readings 各发一次小请求（复用通用单项解读），
-        # 综合出场决策请求只带精简盘面 + readings，避免大 prompt 空正文/截断。
+        # AI-1 断卦层：十项 readings 各发一次小请求（复用 _divine_all_methods），
+        # AI-3 综合出场请求带精简盘面 + readings，避免大 prompt 空正文/截断。
         split_readings: Optional[Dict[str, Any]] = None
         if self.config.split_readings:
             try:
-                split_readings = self._entry_readings_split(
+                split_readings = self._divine_all_methods(
                     symbol, current_price, account_equity, position_quote,
-                    now_iso, paipan_payload,
+                    now_iso, paipan_payload, kline_context,
                 )
             except AIRelayError as exc:
-                self.log.error("AI-2 拆分读取十项解读失败（中转站错误）%s: %s", symbol, exc)
-                return [], "AI-2 决策失败，沿用现有出场条件", "error", None
+                self.log.error("AI-1 断卦十项失败（中转站错误）%s: %s", symbol, exc)
+                return [], "AI-3 决策失败，沿用现有出场条件", "error", None
         system = (
             "你是中国古法十项综合断卦师（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。"
             "系统使用信号触发模式。现在你负责『出场决策』：为已持仓标的设定卖出触发条件。"
-            "必须基于完整盘面、当前价格与持仓成本（买入价基准）判断，并给出明确可执行的触发条件。"
+            "必须基于 AI-1 提供的十项完整解读、完整盘面、K 线行情与持仓成本（买入价基准）判断，"
+            "并给出明确可执行的触发条件。"
             "输出必须是单个 JSON object，不得输出 Markdown/代码块/解释。字段只能包含："
             "summary（string，中文一句话总结断卦结论）、"
             "conditions（array，1 到 5 个出场触发条件，每个是 object："
@@ -4147,9 +4241,11 @@ class AIAdvisor:
             "account_equity": account_equity,
             "position_quote": position_quote,
             "now_iso": now_iso,
-            "paipan": self._compact_paipan(paipan_payload),
+            "paipan": self._full_paipan_payload(paipan_payload),
             "note": "以买入价为基准设定卖出触发条件（止盈/止损/时间兜底）。",
         }
+        if kline_context:
+            request["kline"] = kline_context
         if split_readings is not None:
             # 出场决策带完整 readings（与入场一致，输入侧无预算压力）。
             request["readings"] = {
@@ -4161,20 +4257,20 @@ class AIAdvisor:
                 for name, rd in split_readings.items()
             }
         try:
-            # 综合决策请求：单独给更宽输出预算（reasoning 含思考+正文）。
+            # AI-3 综合决策请求：单独给更宽输出预算（reasoning 含思考+正文）。
             content = self._completion_content([
                 {"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
             ], max_tokens_override=6000)
         except Exception as exc:  # noqa: BLE001
-            self.log.error("AI-2 出场决策失败 %s: %s", symbol, exc)
-            return [], "AI-2 决策失败，沿用现有出场条件", "error", None
+            self.log.error("AI-3 出场决策失败 %s: %s", symbol, exc)
+            return [], "AI-3 决策失败，沿用现有出场条件", "error", None
         try:
-            parsed = require_json_object(json.loads(content), "AI-2 exit response")
-            reject_unknown(parsed, {"summary", "conditions", "readings"}, "AI-2 exit response")
+            parsed = require_json_object(json.loads(content), "AI-3 exit response")
+            reject_unknown(parsed, {"summary", "conditions", "readings"}, "AI-3 exit response")
         except (ConfigError, json.JSONDecodeError) as exc:
-            self.log.warning("AI-2 响应结构无效 %s: %s", symbol, exc)
-            return [], "AI-2 响应无效，沿用现有出场条件", "error", None
+            self.log.warning("AI-3 响应结构无效 %s: %s", symbol, exc)
+            return [], "AI-3 响应无效，沿用现有出场条件", "error", None
         conditions: List[TriggerCondition] = []
         raw_conds = parsed.get("conditions")
         if isinstance(raw_conds, list):
@@ -4205,7 +4301,7 @@ class AIAdvisor:
                     except Exception:  # noqa: BLE001
                         continue
         self.log.warning(
-            "AI-2 出场决策 %s | ref=%.4f conditions=%d readings=%d | %s",
+            "AI-3 出场决策 %s | ref=%.4f conditions=%d readings=%d | %s",
             symbol, ref_price, len(conditions), len(readings or {}), summary,
         )
         return conditions, summary, "ok", readings
@@ -4383,6 +4479,9 @@ class GuFaQuantPro:
         self.audit_path = self.state_dir / "orders.audit.jsonl"
         self.stop_event = threading.Event()
         self._indicator_cache: Dict[str, Tuple[float, float, float]] = {}
+        # K 线行情上下文缓存：{symbol: (monotonic 时间戳, context)}，5 分钟有效，
+        # 避免 tick 循环每 2 秒对 54 个币重复 fetch K 线打爆交易所限频。
+        self._kline_cache: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
         self._install_signal_handlers()
 
     def _install_signal_handlers(self) -> None:
@@ -5281,6 +5380,24 @@ class GuFaQuantPro:
         except Exception:  # noqa: BLE001 指标失败不阻断价格触发
             return None, None
 
+    def _kline_context(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """取 1h K 线摘要供 AI-1 断卦参考（AIAdvisor._build_kline_context 产物）。
+
+        缓存 5 分钟：K 线变化慢，且 AI-1 断卦仅在入场/出场评估时消费一次，
+        无需每 tick 刷新；构造失败返回 None，AI 请求自动省略 kline 字段。
+        """
+        cached = self._kline_cache.get(symbol)
+        if cached is not None and time.monotonic() - cached[0] < 300.0:
+            return cached[1]
+        ctx: Optional[Dict[str, Any]] = None
+        try:
+            df = self.gateway.fetch_ohlcv(symbol, timeframe="1h", limit=40)
+            ctx = AIAdvisor._build_kline_context(df)
+        except Exception:  # noqa: BLE001 行情上下文失败不阻断 AI 请求
+            ctx = None
+        self._kline_cache[symbol] = (time.monotonic(), ctx)
+        return ctx
+
     def _arm_entry_trigger(
         self,
         symbol: str,
@@ -5288,16 +5405,19 @@ class GuFaQuantPro:
         now_dt,
         now_iso: str,
     ) -> Optional[TriggerSet]:
-        """AI-1 入场评估 + 古法择时。返回触发条件集；暂不交易/失败返回 None 并写冷却。"""
+        """AI-2 入场评估（古法择时）：AI-1 断卦 + AI-2 确认是否买入、买入多少。
+        返回触发条件集；暂不交易/失败返回 None 并写冷却。"""
         try:
             paipan_payload = self._paipan_payload(symbol, now_dt) if self.paipan_service else None
         except Exception:  # noqa: BLE001
             paipan_payload = None
         position = self.store.state.positions.get(symbol)
         position_quote = float(position.amount * price) if position else 0.0
+        kline_context = self._kline_context(symbol)
         conditions, summary, decision, target_level, readings = self.ai.decide_entry(
             symbol, price, paipan_payload,
             self._last_equity(), position_quote, now_iso,
+            kline_context=kline_context,
         )
         # 缓存十项古法读数供大屏雷达使用（按币种存储）。
         if readings:
@@ -5605,7 +5725,8 @@ class GuFaQuantPro:
     def _arm_exit_trigger(
         self, symbol: str, current_price: float, ref_price: float
     ) -> None:
-        """AI-2 出场决策：以买入价为基准设定出场条件。失败则保留现有触发并退避。"""
+        """AI-3 出场决策：AI-1 断卦 + AI-3 以买入价为基准设定出场条件。
+        失败则保留现有触发并退避。"""
         try:
             now_dt = datetime.now(timezone.utc)
             paipan_payload = self._paipan_payload(symbol, now_dt) if self.paipan_service else None
@@ -5613,9 +5734,11 @@ class GuFaQuantPro:
             paipan_payload = None
         position = self.store.state.positions.get(symbol)
         position_quote = float(position.amount * current_price) if position else 0.0
+        kline_context = self._kline_context(symbol)
         exit_conds, summary, status, readings = self.ai.decide_exit(
             symbol, current_price, ref_price, paipan_payload,
             self._last_equity(), position_quote, iso_now(),
+            kline_context=kline_context,
         )
         # 缓存十项古法读数（按持仓币种），供大屏雷达展示。
         if readings:
