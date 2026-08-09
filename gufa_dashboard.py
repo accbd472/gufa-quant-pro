@@ -312,7 +312,7 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <!-- 十项古法雷达 -->
     <div class="card" style="grid-area:ancient">
-      <h3>ANCIENT METHODS // 十项古法信号</h3>
+      <h3>ANCIENT METHODS // 十项古法信号 <span id="radarSym" style="color:#5f7fa0;font-size:10px"></span></h3>
       <div class="chart" style="min-height:50px"><canvas id="radar"></canvas></div>
     </div>
     <!-- 决策区（Tab 切换：持仓/行情/布防） -->
@@ -416,14 +416,19 @@ function drawEq(){
   ctx.fillText(max.toFixed(1), 4, 12); ctx.fillText(min.toFixed(1), 4, H-4);
 }
 
+let radarSym = "";
 /* ---------- 雷达图 ---------- */
 function drawRadar(){
   const c = $("radar"), ctx = c.getContext("2d");
   const W = c.width = c.clientWidth, H = c.height = c.clientHeight;
   ctx.clearRect(0,0,W,H);
   const N = radarNames.length, cx = W/2, cy = H/2, R = Math.min(W,H)/2 - 26;
-  if (!N) { ctx.fillStyle="#4a6a8a"; ctx.font="12px Consolas";
-    ctx.fillText(currentMode==="signal" ? "等待 AI 古法读数…" : "NO SIGNAL", cx-54, cy); return; }
+  const hasData = radarVals.some(v=>v>0.01);
+  if (!N || (!hasData)) {
+    ctx.fillStyle="#4a6a8a"; ctx.font="12px Consolas";
+    ctx.fillText(radarSym ? ("等待 "+radarSym.replace('/USDT','')+" AI 评估…") : "等待持仓币 AI 评估…", cx-70, cy);
+    return;
+  }
   const ang = i => -Math.PI/2 + i*2*Math.PI/N;
   // 网格环
   for (let ring=1; ring<=4; ring++){
@@ -551,7 +556,7 @@ function render(d){
   if (d.equity_hist) eqHist = d.equity_hist;
   drawEq();
   // 雷达
-  if (d.radar){ radarNames = d.radar.names; radarVals = d.radar.values; drawRadar(); }
+  if (d.radar){ radarNames = d.radar.names; radarVals = d.radar.values||[]; radarSym = d.radar.symbol||""; $("radarSym") && ($("radarSym").textContent = radarSym ? "// "+radarSym.replace('/USDT','') : ""); drawRadar(); }
   // 日志
   if (d.logs){ $("log").innerHTML = d.logs; }
 }
@@ -895,17 +900,27 @@ class Snapshot:
         TEN_METHODS = ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]
         radar_names: List[str] = list(TEN_METHODS)
         radar_values: List[float] = [0.0] * 10
+        radar_symbol: str = ""
+        # 按持仓币种读取 readings（health.decisions = {sym: {readings: {...}}}）
+        pos_syms = list((state.get("positions") or {}).keys())
+        dec = health.get("decisions") or {}
         last_readings = None
-        if health.get("mode") == "signal":
-            dec = health.get("decisions") or {}
-            lr = dec.get("_last_readings") or {}
-            if isinstance(lr.get("readings"), dict) and lr["readings"]:
-                last_readings = lr["readings"]
-        else:
-            for sym, info in reversed(list(decisions.items())):
-                readings = info.get("readings") or info.get("ai", {}).get("readings")
-                if isinstance(readings, dict) and readings:
-                    last_readings = readings
+        # 优先取第一个持仓币的 readings
+        for sym in pos_syms:
+            info = dec.get(sym)
+            if isinstance(info, dict):
+                rd = info.get("readings")
+                if isinstance(rd, dict) and rd:
+                    last_readings = rd
+                    radar_symbol = sym
+                    break
+        # 持仓币无 readings 时取 decisions 里任意一个
+        if last_readings is None:
+            for sym, info in dec.items():
+                rd = (info or {}).get("readings") if isinstance(info, dict) else None
+                if isinstance(rd, dict) and rd:
+                    last_readings = rd
+                    radar_symbol = sym
                     break
         if isinstance(last_readings, dict):
             for i, name in enumerate(TEN_METHODS):
@@ -954,7 +969,7 @@ class Snapshot:
             "verdicts": verdicts,
             "positions": positions,
             "triggers": triggers,
-            "radar": {"names": radar_names, "values": radar_values},
+            "radar": {"names": radar_names, "values": radar_values, "symbol": radar_symbol},
             "equity_hist": equity_hist,
             "logs": self._read_logs_html(),
             "orders": orders,

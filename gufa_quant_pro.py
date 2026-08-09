@@ -5059,9 +5059,9 @@ class GuFaQuantPro:
             symbol, price, paipan_payload,
             self._last_equity(), position_quote, now_iso,
         )
-        # 缓存十项古法读数供大屏雷达使用（最新一次 AI-1 布防的读数）。
+        # 缓存十项古法读数供大屏雷达使用（按币种存储）。
         if readings:
-            self.store.state.last_readings = readings
+            self.store.state.last_readings[symbol] = readings
             self.store.save()
         skip = self.store.state.trigger_skip_until
         if decision == "error":
@@ -5350,7 +5350,7 @@ class GuFaQuantPro:
         )
         # 缓存十项古法读数（按持仓币种），供大屏雷达展示。
         if readings:
-            self.store.state.last_readings = readings
+            self.store.state.last_readings[symbol] = readings
             self.store.save()
         if status == "error":
             # AI-2 调用/响应失败：保留现有出场条件不覆盖，10 分钟后重试。
@@ -5418,9 +5418,7 @@ class GuFaQuantPro:
             "triggers": triggers_view,
             "fills": len(state.positions),
             "decisions": {
-                "_last_readings": {
-                    "readings": state.last_readings,
-                },
+                sym: {"readings": rd} for sym, rd in state.last_readings.items()
             } if state.last_readings else {},
             "live_updated_at": iso_now(),
         }
