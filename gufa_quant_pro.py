@@ -5435,7 +5435,15 @@ class GuFaQuantPro:
                 utc_now().date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
             )
             skip[symbol] = next_day.isoformat()
-            self.log.warning("AI-2 %s 今日不宜交易，次日 %s 再评估（%s）", symbol, next_day.date(), summary)
+            # 日志同时标注 UTC 与北京时间（UTC+8），避免凌晨时段"次日"日期歧义。
+            local_next = next_day.astimezone(timezone(timedelta(hours=8)))
+            self.log.warning(
+                "AI-2 %s 今日不宜交易，冷却至 %s（UTC）/%s（北京时间）再评估（%s）",
+                symbol,
+                next_day.strftime("%m-%d %H:%M"),
+                local_next.strftime("%m-%d %H:%M"),
+                summary,
+            )
             self.store.save()
             return None
         if decision == "wait" and not conditions:
