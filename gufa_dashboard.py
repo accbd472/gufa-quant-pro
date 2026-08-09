@@ -25,6 +25,9 @@ POLL_INTERVAL = 2.0          # SSE 推送间隔（秒）
 EQUITY_MAX_POINTS = 720      # 权益曲线最大点数（2s 采样 → 24h）
 LOG_TAIL = 120               # 日志尾部行数
 
+# AI 历史买卖动作：orders.audit.jsonl 中与交易动作相关的事件
+TRADE_EVENTS = {"trigger_entry": "买入", "trigger_exit": "卖出", "order_fill": "成交"}
+
 # 大屏统一使用本地时区（Asia/Shanghai，固定 UTC+8，无夏令时）
 LOCAL_TZ = timezone(timedelta(hours=8))
 
@@ -38,6 +41,17 @@ def _local_hhmmss(iso: str) -> str:
         return dt.astimezone(LOCAL_TZ).strftime("%H:%M:%S")
     except Exception:
         return iso[11:19] if len(iso) >= 19 else iso
+
+
+def _local_mmdd(iso: str) -> str:
+    """ISO 时间字符串 → 本地(UTC+8) MM-DD；解析失败则原样截取。"""
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(LOCAL_TZ).strftime("%m-%d")
+    except Exception:
+        return iso[5:10] if len(iso) >= 10 else iso
 
 
 def _local_iso(iso: str) -> str:
@@ -109,13 +123,13 @@ HTML = r"""<!DOCTYPE html>
 
   /* ---------- 布局：grid-template-areas，每块独占卡片 ---------- */
   main { flex: 1; display: grid;
-    grid-template-columns: 1.4fr 1fr;
-    grid-template-rows: 0.5fr 0.95fr 1.35fr 0.65fr;
+    grid-template-columns: 1.4fr 1fr 1fr;
+    grid-template-rows: 0.5fr 1fr 1.3fr 0.6fr;
     grid-template-areas:
-      "equity    telemetry"
-      "selection ancient"
-      "decision  aisteps"
-      "stream    stream";
+      "equity    telemetry telemetry"
+      "selection ancient   history"
+      "decision  aisteps   history"
+      "stream    stream    stream";
     gap: 7px; min-height: 0; }
   /* 竖屏：单列流式 */
   @media (orientation: portrait) and (max-width: 820px){
@@ -198,6 +212,23 @@ HTML = r"""<!DOCTYPE html>
   .rsym.active { color: var(--cy); background: rgba(0,240,255,.1); border-color: rgba(0,240,255,.5); text-shadow: 0 0 6px rgba(0,240,255,.4); }
   .verdict .cf { flex: 1; font-size: 10px; color: #8fb4d8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .verdict .cn { font-size: 11px; color: var(--pu); }
+  /* 持仓行可点击切盘面 */
+  .quote.posrow { cursor: pointer; transition: background .15s; }
+  .quote.posrow:hover { background: rgba(0,240,255,.12); }
+  .quote.posrow.posactive { border-left-color: var(--pu); background: rgba(168,85,247,.10); box-shadow: inset 2px 0 0 var(--pu); }
+
+  /* ---------- AI 交易历史 ---------- */
+  .trades { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 3px; min-height: 0; }
+  .trade { border: 1px solid var(--line); border-left: 2px solid var(--pu); background: rgba(0,20,40,.35);
+    border-radius: 4px; padding: 3px 6px; font-size: 10px; line-height: 1.35; flex-shrink: 0; }
+  .trade .h { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .trade .tm { color: #5f7fa0; flex-shrink: 0; }
+  .trade .sym { color: var(--cy); font-weight: 700; }
+  .trade .side { font-weight: 700; flex-shrink: 0; }
+  .trade .side.buy { color: var(--gr); }
+  .trade .side.sell { color: var(--rd); }
+  .trade .amt { color: #e8f6ff; }
+  .trade .nt { color: #7aa7cc; font-size: 9px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   /* ---------- AI 十项解读 ---------- */
   .aisteps { display: flex; flex-direction: column; gap: 3px; overflow-y: auto;
@@ -251,9 +282,10 @@ HTML = r"""<!DOCTYPE html>
     .card[style*="equity"]   { order: 2; height: min(28vh, 250px); }
     .card[style*="decision"] { order: 3; height: min(34vh, 320px); }
     .card[style*="ancient"]  { order: 4; height: min(26vh, 240px); }
-    .card[style*="selection"] { order: 5; height: min(28vh, 260px); }
-    .card[style*="aisteps"]  { order: 6; height: min(24vh, 220px); }
-    .card[style*="stream"]   { order: 7; height: min(24vh, 220px); }
+    .card[style*="history"]  { order: 5; height: min(26vh, 240px); }
+    .card[style*="selection"] { order: 6; height: min(28vh, 260px); }
+    .card[style*="aisteps"]  { order: 7; height: min(24vh, 220px); }
+    .card[style*="stream"]   { order: 8; height: min(24vh, 220px); }
     .metrics { grid-template-columns: repeat(4, 1fr); gap: 4px; }
     .m .v { font-size: 13px; }
     .m .l { font-size: 8px; margin-top: 1px; }
@@ -308,17 +340,25 @@ HTML = r"""<!DOCTYPE html>
       <h3>EQUITY // 权益曲线</h3>
       <div class="chart"><canvas id="eqChart"></canvas></div>
     </div>
-    <!-- 遥测 -->
+    <!-- 遥测（区间分析 + 日期切换） -->
     <div class="card" style="grid-area:telemetry">
-      <h3>TELEMETRY // 遥测</h3>
+      <h3>TELEMETRY // 区间分析
+        <span style="display:inline-flex;gap:4px;margin-left:4px" id="dranges">
+          <span class="rsym active" data-r="today">今日</span>
+          <span class="rsym" data-r="yday">昨日</span>
+          <span class="rsym" data-r="3d">3天</span>
+          <span class="rsym" data-r="7d">7天</span>
+        </span>
+      </h3>
       <div class="metrics">
-        <div class="m"><div class="v" id="mEquity">--</div><div class="l">权益</div></div>
-        <div class="m"><div class="v green" id="mPeak">--</div><div class="l">峰值</div></div>
-        <div class="m"><div class="v amber" id="mTrades">--</div><div class="l">成交</div></div>
-        <div class="m"><div class="v green" id="mFills">--</div><div class="l">持仓</div></div>
-        <div class="m"><div class="v" id="mCand">--</div><div class="l">候选</div></div>
-        <div class="m"><div class="v" id="mDayStart">--</div><div class="l">日初</div></div>
+        <div class="m"><div class="v" id="mEquity">--</div><div class="l">权益(实时)</div></div>
+        <div class="m"><div class="v" id="mWinStart">--</div><div class="l" id="mWinStartL">区间起始</div></div>
+        <div class="m"><div class="v" id="mWinEnd">--</div><div class="l" id="mWinEndL">区间结束</div></div>
+        <div class="m"><div class="v" id="mWinPnl">--</div><div class="l">区间盈亏</div></div>
+        <div class="m"><div class="v" id="mWinPct">--</div><div class="l">区间收益率</div></div>
+        <div class="m"><div class="v" id="mWinCmp">--</div><div class="l" id="mWinCmpL">较前1日</div></div>
       </div>
+      <div class="telmeta" id="telMeta" style="font-size:9px;color:#5f7fa0;margin-top:4px;letter-spacing:1px;flex-shrink:0"></div>
     </div>
     <!-- 选股 -->
     <div class="card" style="grid-area:selection">
@@ -327,11 +367,15 @@ HTML = r"""<!DOCTYPE html>
       <h3 style="margin-top:4px;flex-shrink:0">EXCLUDED // 剔除</h3>
       <div class="dead" id="dead" style="font-size:10px; max-height:36px; overflow-y:auto;flex-shrink:0"></div>
     </div>
-    <!-- 十项古法雷达 -->
+    <!-- 十项古法雷达（正方形，紧凑） -->
     <div class="card" style="grid-area:ancient">
-      <h3>ANCIENT METHODS // 十项古法信号 <span id="radarSym" style="color:#5f7fa0;font-size:10px"></span></h3>
-      <div class="radar-syms" id="radarSyms" style="display:flex;gap:3px;flex-wrap:wrap;flex-shrink:0;margin-bottom:4px"></div>
+      <h3>ANCIENT // 十项古法 <span id="radarSym" style="color:#5f7fa0;font-size:10px"></span></h3>
       <div class="chart" style="flex:1 1 auto;min-height:50px"><canvas id="radar"></canvas></div>
+    </div>
+    <!-- AI 历史买卖动作 -->
+    <div class="card" style="grid-area:history">
+      <h3>AI TRADES // 历史买卖动作</h3>
+      <div class="trades" id="trades"><div class="empty">加载中…</div></div>
     </div>
     <!-- 决策区（Tab 切换：持仓/行情/布防） -->
     <div class="card" style="grid-area:decision">
@@ -352,9 +396,10 @@ HTML = r"""<!DOCTYPE html>
         </div>
       </div>
     </div>
-    <!-- AI 十项解读 -->
+    <!-- AI 十项解读（币种选择器挪到这里，与雷达联动） -->
     <div class="card" style="grid-area:aisteps">
       <h3>AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
+      <div class="radar-syms" id="radarSyms" style="display:flex;gap:3px;flex-wrap:wrap;flex-shrink:0;margin-bottom:4px"></div>
       <div class="aisteps" id="aisteps"><div class="empty">—</div></div>
     </div>
     <!-- 日志 -->
@@ -363,7 +408,7 @@ HTML = r"""<!DOCTYPE html>
       <div class="logbox" id="log"></div>
     </div>
   </main>
-  <footer>GUFA QUANT PROTOCOL v2.0 // SSE+轮询双通道 // 数据源: runtime/state+health+equity</footer>
+  <footer>GUFA QUANT PROTOCOL v2.1 // SSE+轮询双通道 // 区间分析 · AI 交易历史 // 数据源: runtime/state+health+equity+orders</footer>
 </div>
 
 <script>
@@ -371,6 +416,8 @@ HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let eqHist = [], radarNames = [], radarVals = [], currentMode = "";
 let curTriggers = 0, curPositions = 0;
+let winStats = {}, curRange = "today";
+const TEN_ORDER = ["奇门","六壬","太乙","易经","风水","八字","梅花","紫微","八卦","四柱"];
 
 /* ---------- Tab 切换 ---------- */
 document.querySelectorAll(".tab").forEach(t=>{
@@ -438,6 +485,74 @@ let radarSym = "";
 let radarAll = {};       // {symbol: [10个confidence]}
 let radarReadings = {};  // {symbol: {方法名: {bias, confidence, reading}}}
 let radarSelSym = "";    // 用户手动选中的币种（空=自动取第一个）
+
+/* ---------- AI 十项解读（与雷达币种联动） ---------- */
+function renderTenReadings(sym){
+  const rd = radarReadings[sym] || {};
+  const items = TEN_ORDER.map(n=>{
+    const it = rd[n];
+    if (!it) return null;
+    const bias = it.bias || "neutral";
+    const mark = bias==="bullish" ? "▲吉" : (bias==="bearish" ? "▼凶" : "•平");
+    const cls = bias==="bullish" ? "ok" : (bias==="bearish" ? "fail" : "");
+    const cf = it.confidence!=null ? (it.confidence*100).toFixed(0)+"%" : "--";
+    return `<div class="aistep ${cls}"><span class="st">${mark}</span> <b>${n}</b> <span class="cf">${cf}</span><span class="rd">${it.reading||""}</span></div>`;
+  }).filter(Boolean);
+  if (!items.length){
+    $("aiStepSum").textContent = "// 等待 " + (sym?sym.replace('/USDT',''):"") + " 十项解读…";
+    $("aisteps").innerHTML = '<div class="empty">—</div>';
+    return;
+  }
+  $("aiStepSum").textContent = "// " + (sym?sym.replace('/USDT',''):"") + " · 十项古法合参";
+  $("aisteps").innerHTML = items.join("");
+}
+
+/* ---------- 选中币种：雷达 + 十项解读 + 高亮同步切换 ---------- */
+function selectSym(sym){
+  radarSelSym = sym; radarSym = sym;
+  radarVals = radarAll[sym] || [0,0,0,0,0,0,0,0,0,0];
+  $("radarSym").textContent = "// " + sym.replace('/USDT','');
+  document.querySelectorAll("#radarSyms .rsym").forEach(x=>x.classList.toggle("active", x.dataset.sym===sym));
+  document.querySelectorAll("#positions .posrow").forEach(x=>x.classList.toggle("posactive", x.dataset.sym===sym));
+  drawRadar();
+  renderTenReadings(sym);
+}
+
+/* ---------- 区间分析（今日/昨日/3天/7天） ---------- */
+function applyRange(){
+  const w = winStats[curRange] || {};
+  const f2 = n => (n==null || isNaN(n)) ? "--" : n.toFixed(2);
+  $("mWinStart").textContent = f2(w.start_eq);
+  $("mWinEnd").textContent = f2(w.end_eq);
+  $("mWinStartL").textContent = w.start_label || "区间起始";
+  $("mWinEndL").textContent = w.end_label || "区间结束";
+  $("mWinCmpL").textContent = w.cmp_label || "较前";
+  const pnl = w.pnl, pct = w.pnl_pct, cmp = w.cmp_pp;
+  $("mWinPnl").className = "v " + (pnl>0.0001 ? "green" : (pnl<-0.0001 ? "red" : ""));
+  $("mWinPnl").textContent = pnl==null ? "--" : ((pnl>=0?"+":"")+f2(pnl));
+  $("mWinPct").className = "v " + (pct>0.0001 ? "green" : (pct<-0.0001 ? "red" : ""));
+  $("mWinPct").textContent = pct==null ? "--" : ((pct>=0?"+":"")+pct.toFixed(2)+"%");
+  $("mWinCmp").className = "v " + (cmp>0.0001 ? "green" : (cmp<-0.0001 ? "red" : ""));
+  $("mWinCmp").textContent = cmp==null ? "--" : ((cmp>=0?"+":"")+cmp.toFixed(2)+"%");
+}
+
+/* ---------- AI 历史买卖动作 ---------- */
+function renderTrades(list){
+  const el = $("trades");
+  if (!list || !list.length){ el.innerHTML = '<div class="empty">暂无交易动作</div>'; return; }
+  el.innerHTML = list.map(t=>{
+    const isSell = t.side==="sell";
+    const act = isSell ? "▼ 卖出" : "▲ 买入";
+    const amt = t.amount ? Number(t.amount).toPrecision(4) : "--";
+    const price = t.price ? Number(t.price).toPrecision(6) : "--";
+    const val = t.value ? Number(t.value).toFixed(0)+"U" : "";
+    return `<div class="trade"><div class="h"><span class="tm">${t.date} ${t.time}</span>
+      <span class="sym">${t.sym.replace('/USDT','')}</span>
+      <span class="side ${isSell?"sell":"buy"}">${act}</span>
+      <span class="amt">${amt} @ ${price} ${val}</span></div>
+      ${t.note?`<div class="nt">${t.note}</div>`:""}</div>`;
+  }).join("");
+}
 /* ---------- 雷达图 ---------- */
 function drawRadar(){
   const c = $("radar"), ctx = c.getContext("2d");
@@ -490,12 +605,8 @@ function render(d){
   $("tagSandbox").textContent = d.sandbox ? "SANDBOX" : "PRODUCTION";
   // 遥测
   if (d.equity!=null){ $("mEquity").textContent = d.equity.toFixed(2); }
-  $("mPeak").textContent = d.peak!=null ? d.peak.toFixed(2) : "--";
-  $("mTrades").textContent = d.trades_today!=null ? d.trades_today : "--";
-  $("mFills").textContent = d.fills!=null ? d.fills
-    : (d.mode==="signal" ? d.position_count : "--");
-  $("mCand").textContent = d.candidates!=null ? d.candidates : "--";
-  $("mDayStart").textContent = d.day_start!=null ? d.day_start.toFixed(2) : "--";
+  $("telMeta").textContent = `成交 ${d.trades_today!=null?d.trades_today:"--"} · 持仓 ${d.position_count!=null?d.position_count:"--"} · 候选 ${d.candidates!=null?d.candidates:"--"} · 峰值 ${d.peak!=null?d.peak.toFixed(2):"--"} · 日初 ${d.day_start!=null?d.day_start.toFixed(2):"--"}`;
+  if (d.equity_windows){ winStats = d.equity_windows; applyRange(); }
   // 选股
   if (d.selection_date) $("selDate").textContent = "// " + d.selection_date;
   if (d.picks && d.picks.length){
@@ -528,17 +639,20 @@ function render(d){
     }).join("");
     $("liveQuotes").innerHTML = qs;
   } else { $("liveQuotes").innerHTML = '<div class="empty">等待行情…</div>'; }
-  // 持仓列表：state.positions 真实持仓 + 实时价（市值/浮动盈亏）
+  // 持仓列表：state.positions 真实持仓 + 实时价（市值/浮动盈亏），点击切换盘面
   if (d.positions && d.positions.length){
+    const cur = radarSelSym || (d.radar && d.radar.symbol) || "";
     const ps = d.positions.map(p=>{
       const pnlCls = p.pnl_pct>0.0001 ? "up" : (p.pnl_pct<-0.0001 ? "down" : "");
       const arrow = p.pnl_pct>0.0001 ? "▲" : (p.pnl_pct<-0.0001 ? "▼" : "•");
-      return `<div class="quote held"><span class="sym">${String(p.sym).replace('/USDT','')}◆</span>
+      const act = p.sym===cur ? " posactive" : "";
+      return `<div class="quote held posrow${act}" data-sym="${p.sym}"><span class="sym">${String(p.sym).replace('/USDT','')}◆</span>
         <span class="qp">${Number(p.price).toPrecision(6)}</span>
         <span class="qch ${pnlCls}">${arrow}${Math.abs(p.pnl_pct).toFixed(2)}%</span>
         <span class="qv">${Number(p.value).toFixed(0)}U</span></div>`;
     }).join("");
     $("positions").innerHTML = ps;
+    document.querySelectorAll("#positions .posrow").forEach(el=>{ el.onclick = ()=>selectSym(el.dataset.sym); });
   } else {
     $("positions").innerHTML = '<div class="empty">无持仓</div>';
   }
@@ -556,28 +670,7 @@ function render(d){
     $("verdicts").innerHTML = vs;
   } else if (d.verdicts && d.verdicts.length===0) { $("verdicts").innerHTML = '<div class="empty">无持仓/无新决策</div>'; }
   else if (d.mode==="signal") { $("verdicts").innerHTML = '<div class="empty">未布防触发条件</div>'; }
-  // AI 十项解读：显示当前选中币的十项古法解读（bias + confidence + 解读文字），
-  // 与雷达币种联动。数据来自 health.decisions[sym].readings。
-  const TEN_ORDER = ["奇门","六壬","太乙","易经","风水","八字","梅花","紫微","八卦","四柱"];
-  const renderTenReadings = (sym)=>{
-    const rd = radarReadings[sym] || {};
-    const items = TEN_ORDER.map(n=>{
-      const it = rd[n];
-      if (!it) return null;
-      const bias = it.bias || "neutral";
-      const mark = bias==="bullish" ? "▲吉" : (bias==="bearish" ? "▼凶" : "•平");
-      const cls = bias==="bullish" ? "ok" : (bias==="bearish" ? "fail" : "");
-      const cf = it.confidence!=null ? (it.confidence*100).toFixed(0)+"%" : "--";
-      return `<div class="aistep ${cls}"><span class="st">${mark}</span> <b>${n}</b> <span class="cf">${cf}</span><span class="rd">${it.reading||""}</span></div>`;
-    }).filter(Boolean);
-    if (!items.length){
-      $("aiStepSum").textContent = "// 等待 " + (sym?sym.replace('/USDT',''):"") + " 十项解读…";
-      $("aisteps").innerHTML = '<div class="empty">—</div>';
-      return;
-    }
-    $("aiStepSum").textContent = "// " + (sym?sym.replace('/USDT',''):"") + " · 十项古法合参";
-    $("aisteps").innerHTML = items.join("");
-  };
+  // AI 十项解读：显示当前选中币的十项古法解读（与雷达联动）
   if (d.radar_readings) radarReadings = d.radar_readings;
   // 若当前无雷达数据但 readings 有（例如用户选中币后 AI 已评估），优先用 readings 判定
   const activeSym = (radarSelSym && radarReadings[radarSelSym]) ? radarSelSym
@@ -593,28 +686,19 @@ function render(d){
     if (radarSelSym && radarAll[radarSelSym]) { radarSym = radarSelSym; }
     radarVals = radarAll[radarSym] || (d.radar.values||[]);
     $("radarSym") && ($("radarSym").textContent = radarSym ? "// "+radarSym.replace('/USDT','') : "");
-    // 渲染持仓币种选择器
+    // 渲染持仓币种选择器（点击切换雷达+十项解读）
     const syms = Object.keys(radarAll);
     if (syms.length){
       $("radarSyms").innerHTML = syms.map(s=>{
         const cls = s===radarSym ? "rsym active" : "rsym";
         return `<span class="${cls}" data-sym="${s}">${s.replace('/USDT','')}</span>`;
       }).join("");
-      $("radarSyms").querySelectorAll(".rsym").forEach(el=>{
-        el.onclick = ()=>{
-          radarSelSym = el.dataset.sym;
-          radarSym = radarSelSym;
-          radarVals = radarAll[radarSelSym]||[0,0,0,0,0,0,0,0,0,0];
-          $("radarSym").textContent = "// "+radarSelSym.replace('/USDT','');
-          $("radarSyms").querySelectorAll(".rsym").forEach(x=>x.classList.remove("active"));
-          el.classList.add("active");
-          drawRadar();
-          renderTenReadings(radarSelSym);
-        };
-      });
+      $("radarSyms").querySelectorAll(".rsym").forEach(el=>{ el.onclick = ()=>selectSym(el.dataset.sym); });
     } else { $("radarSyms").innerHTML = ""; }
     drawRadar();
   }
+  // AI 历史买卖动作
+  renderTrades(d.trade_history);
   // 日志
   if (d.logs){ $("log").innerHTML = d.logs; }
 }
@@ -623,6 +707,15 @@ function render(d){
 // 时钟固定 UTC+8（Asia/Shanghai），不依赖浏览器/客户端时区
 setInterval(()=>{ const t=new Date(Date.now()+8*3600*1000); const p=n=>String(n).padStart(2,"0");
   $("clock").textContent = p(t.getUTCHours())+":"+p(t.getUTCMinutes())+":"+p(t.getUTCSeconds()); }, 1000);
+
+/* ---------- 区间日期切换 ---------- */
+document.querySelectorAll("#dranges .rsym").forEach(el=>{
+  el.onclick = ()=>{
+    curRange = el.dataset.r;
+    applyRange();
+    document.querySelectorAll("#dranges .rsym").forEach(x=>x.classList.toggle("active", x===el));
+  };
+});
 
 /* ---------- 数据流（SSE + 轮询兜底） ---------- */
 fetch("/api/state").then(r=>r.json()).then(render).catch(()=>{});
@@ -667,6 +760,9 @@ class Snapshot:
         self._log_size = -1
         self._equity_cache: List[float] = []
         self._equity_size = -1
+        self._equity_pts_cache: List[tuple] = []   # [(aware datetime, equity)]
+        self._equity_pts_size = -1
+        self._equity_pts_offset = 0
 
     # ---------- 带缓存的增量读取 ----------
     def _read_equity(self) -> List[float]:
@@ -685,6 +781,154 @@ class Snapshot:
         out = out[-EQUITY_MAX_POINTS:]
         self._equity_cache = out
         self._equity_size = size
+        return out
+
+    # ---------- 权益区间统计（今日/昨日/3天/7天，北京时区） ----------
+    def _read_equity_points(self) -> List[tuple]:
+        """增量读取 equity.jsonl → [(aware datetime, equity)]，按文件追加缓存。"""
+        try:
+            size = self.equity_path.stat().st_size
+        except OSError:
+            return self._equity_pts_cache
+        if size == self._equity_pts_size and self._equity_pts_cache:
+            return self._equity_pts_cache
+        pts = self._equity_pts_cache
+        if pts and size > self._equity_pts_offset:
+            # 追加模式：只解析新增字节
+            try:
+                with self.equity_path.open("r", encoding="utf-8") as fh:
+                    fh.seek(self._equity_pts_offset)
+                    for line in fh:
+                        try:
+                            j = json.loads(line)
+                            dt = datetime.fromisoformat(str(j.get("ts", "")))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            eq = float(j.get("equity", 0.0))
+                            if eq > 0:
+                                pts.append((dt, eq))
+                        except Exception:
+                            continue
+                self._equity_pts_offset = size
+                self._equity_pts_size = size
+                return pts
+            except Exception:
+                pass
+        # 全量重读（首次 / 文件轮转截断）
+        pts = []
+        try:
+            for line in self.equity_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    j = json.loads(line)
+                    dt = datetime.fromisoformat(str(j.get("ts", "")))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    eq = float(j.get("equity", 0.0))
+                    if eq > 0:
+                        pts.append((dt, eq))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        self._equity_pts_cache = pts
+        self._equity_pts_offset = size
+        self._equity_pts_size = size
+        return pts
+
+    @staticmethod
+    def _window_stat(pts: List[tuple], start: datetime, end: datetime) -> Optional[Dict[str, float]]:
+        """区间 [start, end) 权益统计：起始/结束权益、盈亏、收益率。"""
+        in_win = [(t, e) for (t, e) in pts if start <= t < end]
+        before = [(t, e) for (t, e) in pts if t < start]
+        if in_win:
+            start_eq = in_win[0][1]
+            end_eq = in_win[-1][1]
+        elif before:
+            start_eq = end_eq = before[-1][1]
+        else:
+            return None
+        pnl = end_eq - start_eq
+        pnl_pct = (pnl / start_eq * 100.0) if start_eq else 0.0
+        return {"start_eq": start_eq, "end_eq": end_eq, "pnl": pnl, "pnl_pct": pnl_pct}
+
+    def _equity_windows(self) -> Dict[str, Dict[str, Any]]:
+        """按北京时区计算 今日/昨日/3天/7天 权益区间表现 + 较前期对比（百分点）。"""
+        pts = self._read_equity_points()
+        now = datetime.now(LOCAL_TZ)
+        today0 = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        d = timedelta(days=1)
+        specs = [
+            ("today", today0, now, "今日", "今日初", "当前", "较前1日"),
+            ("yday",  today0 - d, today0, "昨日", "昨日起", "昨日末", "较前1日"),
+            ("3d",    today0 - 3 * d, now, "3天", "3日前", "当前", "较前3天"),
+            ("7d",    today0 - 7 * d, now, "7天", "7日前", "当前", "较前7天"),
+        ]
+        prev_specs = {
+            "today": (today0 - d, today0),
+            "yday":  (today0 - 2 * d, today0 - d),
+            "3d":    (today0 - 6 * d, today0 - 3 * d),
+            "7d":    (today0 - 14 * d, today0 - 7 * d),
+        }
+        out: Dict[str, Dict[str, Any]] = {}
+        for key, start, end, label, sl, el, cl in specs:
+            st = self._window_stat(pts, start, end)
+            prev = self._window_stat(pts, *prev_specs[key])
+            item: Dict[str, Any] = {
+                "label": label, "start_label": sl, "end_label": el, "cmp_label": cl,
+                "start_eq": None, "end_eq": None, "pnl": None, "pnl_pct": None, "cmp_pp": None,
+            }
+            if st:
+                item.update(st)
+                if prev:
+                    item["cmp_pp"] = st["pnl_pct"] - prev["pnl_pct"]
+            out[key] = item
+        return out
+
+    def _trade_history(self, limit: int = 40) -> List[Dict[str, Any]]:
+        """AI 历史买卖动作：trigger_entry(买入) / trigger_exit(卖出) / order_fill(成交)。"""
+        def _num(v: Any, default: float = 0.0) -> float:
+            try:
+                return float(v or default)
+            except (TypeError, ValueError):
+                return default
+        out: List[Dict[str, Any]] = []
+        for line in reversed(_tail(self.orders_path, 500)):
+            try:
+                o = json.loads(line)
+                ev = str(o.get("event", ""))
+                if ev not in TRADE_EVENTS:
+                    continue
+                plan = o.get("plan") or {}
+                sym = plan.get("symbol") or o.get("symbol") or ""
+                if not sym:
+                    continue
+                side = str(plan.get("side") or o.get("side")
+                           or ("sell" if ev == "trigger_exit" else "buy"))
+                amount = _num(plan.get("amount"))
+                price = _num(plan.get("reference_price") or o.get("reference_price") or o.get("price"))
+                value = _num(plan.get("estimated_quote"))
+                cond = o.get("condition")
+                note = str(cond.get("note", "")) if isinstance(cond, dict) else ""
+                if not note:
+                    note = str(plan.get("reason") or o.get("reason") or "")[:80]
+                if len(note) > 70:
+                    note = note[:70] + "…"
+                out.append({
+                    "ts": str(o.get("ts", "")),
+                    "time": _local_hhmmss(str(o.get("ts", ""))),
+                    "date": _local_mmdd(str(o.get("ts", ""))),
+                    "label": TRADE_EVENTS[ev],
+                    "sym": sym,
+                    "side": side,
+                    "amount": amount,
+                    "price": price,
+                    "value": value,
+                    "note": note,
+                })
+            except Exception:
+                continue
+            if len(out) >= limit:
+                break
         return out
 
     # ---------- AI 步骤解析（最近一个周期内） ----------
@@ -799,6 +1043,9 @@ class Snapshot:
                 msg = str(j.get("message", ""))
             except Exception:
                 continue
+            # 屏蔽心跳刷屏（实时日志只看关键动作）
+            if "心跳" in msg:
+                continue
             if not self._is_key_event(msg):
                 continue
             # 高频刷屏事件合并：AI 错误/空响应/决策失败只保留最新 1 条，
@@ -836,7 +1083,6 @@ class Snapshot:
             "信号触发模式启动", "AI-1 入场决策", "AI-2 出场",
             "AI 响应为空或请求失败", "AI 中转站错误", "布防", "触发条件",
             "AI-1 响应结构无效", "AI 缩量仲裁", "AI 判定放弃", "AI 缩量后仍失败",
-            "心跳",
         )):
             return True
         # 网络错误合并显示：只保留每种错误最近 1 条
@@ -1037,6 +1283,8 @@ class Snapshot:
             "radar": {"names": list(TEN_METHODS), "values": radar_values, "symbol": radar_symbol, "all": radar_all},
             "radar_readings": radar_readings,
             "equity_hist": equity_hist,
+            "equity_windows": self._equity_windows(),
+            "trade_history": self._trade_history(40),
             "logs": self._read_logs_html(),
             "orders": orders,
             "net_ok": net_ok,
