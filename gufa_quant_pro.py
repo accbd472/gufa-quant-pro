@@ -4944,6 +4944,15 @@ class GuFaQuantPro:
                 )
                 self._arm_exit_trigger(base, pos.price, pos.avg_entry or pos.price)
                 continue
+            # 已有出场条件但缺十项古法读数（如重启后 last_readings 清空）：
+            # 主动调一次 AI-2 补 readings，让大屏雷达有数据可画。
+            if base not in self.store.state.last_readings:
+                if not (
+                    self.store.state.trigger_skip_until.get(base)
+                    and now_iso < self.store.state.trigger_skip_until[base]
+                ):
+                    self.log.info("%s 持仓但缺古法读数，唤醒 AI-2 补 readings", base)
+                    self._arm_exit_trigger(base, pos.price, pos.avg_entry or pos.price)
         for symbol in list(triggers):
             ts = TriggerSet.from_dict(triggers[symbol])
             if symbol not in managed_bases:
