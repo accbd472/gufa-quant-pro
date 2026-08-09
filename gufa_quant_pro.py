@@ -3759,25 +3759,15 @@ class AIAdvisor:
     def _compact_paipan(
         paipan_payload: Optional[Mapping[str, Any]], limit: int = 150,
     ) -> Dict[str, Any]:
-        """精简盘面 payload：每个字段只保留前 limit 字符，控制 prompt 体积。
+        """盘面 payload 全量透传（历史版本曾按字段截断控制 prompt 体积）。
 
-        完整排盘 22 项（current_十项 + natal_十项）约 1.3 万字符，加上其他
-        上下文会让 reasoning 型模型（如 deepseek-v4-flash）把输出预算耗尽在
-        思考上，导致 content 为空或 JSON 被截断。拆分成小请求后，综合决策
-        请求只需带精简盘面摘要 + 十项 readings，即可大幅缩小 prompt。
+        截断曾导致奇门九宫、六壬四课三传等核心断卦依据丢失，AI 断卦失真。
+        输入侧预算充足（十项全量约 8k 字符 ≈ 3k token，远低于上下文窗口），
+        真正需要控制的是输出预算（max_tokens），与输入大小无关，故全量保留。
         """
         if not isinstance(paipan_payload, dict):
             return {}
-        compact: Dict[str, Any] = {}
-        for key, value in paipan_payload.items():
-            if not isinstance(value, (dict, list, str)):
-                continue
-            try:
-                text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
-            except Exception:  # noqa: BLE001 单字段序列化失败跳过
-                continue
-            compact[key] = text[:limit]
-        return compact
+        return {key: value for key, value in paipan_payload.items()}
 
     def _entry_read_single_method(
         self,
@@ -3789,15 +3779,14 @@ class AIAdvisor:
         now_iso: str,
         paipan_payload: Optional[Mapping[str, Any]],
     ) -> Dict[str, Any]:
-        """AI-1 拆分模式：单项古法解读请求（只带该项盘面，输出 bias/confidence/reading）。"""
+        """AI-1 拆分模式：单项古法解读请求（喂该古法完整盘面，输出 bias/confidence/reading）。
+
+        全量盘面（不截断）：奇门九宫、六壬四课三传等核心断卦依据必须完整
+        可见，否则 AI 只能空泛套话（历史 400 字符截断曾丢失这些关键字段）。
+        """
         method_paipan = None
         if isinstance(paipan_payload, dict):
             method_paipan = paipan_payload.get(f"current_{name}") or paipan_payload.get(f"natal_{name}")
-        if isinstance(method_paipan, dict):
-            try:
-                method_paipan = json.dumps(method_paipan, ensure_ascii=False)[:400]
-            except Exception:  # noqa: BLE001
-                method_paipan = None
         request = {
             "symbol": symbol,
             "current_price": current_price,
@@ -3810,9 +3799,11 @@ class AIAdvisor:
         }
         system = (
             f"你是中国古法「{name}」断卦师。只负责解读「{name}」这一项，不要解读其他古法，"
-            "不要给出交易动作。输出必须是一个 JSON object，字段只能且必须包含 "
+            "不要给出交易动作。你的解读必须具体引用盘面中的实际断卦要素"
+            "（如具体宫位、神煞、卦象、爻辞、四课三传、用神落宫等），严禁空泛套话。"
+            "输出必须是一个 JSON object，字段只能且必须包含 "
             "bias（bullish/bearish/neutral）、confidence（0 到 1 的 JSON number）、"
-            "reading（中文断卦解读，须结合盘面具体断卦，150 字以内）。不得输出其他字段。"
+            "reading（中文断卦解读，须引用盘面具体要素断卦，150 字以内）。不得输出其他字段。"
         )
         content = self._completion_content([
             {"role": "system", "content": system},
@@ -3926,12 +3917,12 @@ class AIAdvisor:
             "note": "古法判断交易时机并给出可执行触发条件；decision=no_trade 时 conditions 必须为空数组。",
         }
         if split_readings is not None:
-            # 综合决策只需 bias/confidence + 短摘要；完整 readings 留给大屏展示。
+            # 综合决策带完整 readings（输入侧无预算压力，AI-2 独立判断需要完整上下文）。
             request["readings"] = {
                 name: {
                     "bias": rd.get("bias", "neutral"),
                     "confidence": rd.get("confidence", 0.0),
-                    "reading": str(rd.get("reading", ""))[:60],
+                    "reading": str(rd.get("reading", "")),
                 }
                 for name, rd in split_readings.items()
             }
@@ -4216,7 +4207,7 @@ class AIAdvisor:
         market_context: Optional[Mapping[str, Any]] = None,
     ) -> AIDecision:
         readings_payload = {
-            name: {"bias": r.bias, "confidence": r.confidence, "reading": r.reading[:60]}
+            name: {"bias": r.bias, "confidence": r.confidence, "reading": r.reading}
             for name, r in readings.items()
         }
         request = {
@@ -4239,12 +4230,13 @@ class AIAdvisor:
             "readings": readings_payload,  # 十项已解读结果，只做综合，不再逐项重读
         }
         system = (
-            "你是中国古法十项断卦的汇总决策师。输入已包含十项古法的完整解读（bias/confidence/reading），"
-            "你不得重新解读各项，只需综合十项解读、规则目标与持仓状态，输出最终交易决策。"
-            "你是仓位决策者：rule_target_level 是规则引擎给出的默认仓位目标，"
-            "你必须以它为准：当前仓位低于规则目标且十项解读无明确看空时，默认 BUY 至规则目标；"
-            "SELL 只能在明确看空时降低风险；HOLD 只能用于持仓已接近规则目标或信号中性（分数接近 0.5）时。"
-            "空仓 + 规则目标为 HALF/FULL 时，不要输出 HOLD，除非十项解读强烈看空。"
+            "你是中国古法十项断卦的汇总决策师。输入已包含十项古法的完整解读（bias/confidence/reading）"
+            "与完整盘面背景，你不得重新解读各项，只需综合十项解读、持仓状态与市场约束，"
+            "独立输出最终交易决策。"
+            "rule_target_level 只是本地规则引擎的参考建议，不是命令：你可以基于十项解读独立判断"
+            "并偏离它，但必须在 conflicts 中说明偏离理由。"
+            "安全护栏仍然有效：没有明确看空信号时不主动 SELL 降仓；持仓已接近目标或信号中性时用 HOLD；"
+            "空仓且十项解读偏多时不输出 HOLD（除非解读强烈看空）。"
             "market 只能从 market_context.allowed_markets 中选择：允许 swap 且强烈看多时才选 swap 放大敞口"
             "（leverage 取 1..max_leverage 且不超过 max_futures_notional_pct 约束）；其余情况选 spot、leverage=1。"
             "注意：输出中不得包含 readings 字段（十项解读已由上游单独提供），"
@@ -4263,7 +4255,7 @@ class AIAdvisor:
             # 削减载荷重试一次，仍失败才上抛由 _interpret_split 规则兜底。
             self.log.warning("AI 聚合决策首次失败，削减载荷重试一次: %s", exc)
             retry_readings = {
-                name: {"bias": r.bias, "confidence": r.confidence, "reading": r.reading[:40]}
+                name: {"bias": r.bias, "confidence": r.confidence, "reading": r.reading}
                 for name, r in readings.items()
             }
             retry_request = dict(request, readings=retry_readings)
