@@ -558,7 +558,7 @@ function drawRadar(){
   const W = c.width = c.clientWidth, H = c.height = c.clientHeight;
   ctx.clearRect(0,0,W,H);
   const N = radarNames.length, cx = W/2, cy = H/2, R = Math.min(W,H)/2 - 26;
-  const hasData = radarVals.some(v=>v>0.01);
+  const hasData = radarVals.some(v=>Math.abs(v)>0.01);
   if (!N || (!hasData)) {
     ctx.fillStyle="#4a6a8a"; ctx.font="12px Consolas";
     ctx.fillText(radarSym ? ("等待 "+radarSym.replace('/USDT','')+" AI 评估…") : "等待持仓币 AI 评估…", cx-70, cy);
@@ -573,14 +573,17 @@ function drawRadar(){
   }
   // 轴线
   for (let i=0;i<N;i++){ const a=ang(i); ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+R*Math.cos(a), cy+R*Math.sin(a)); ctx.strokeStyle="rgba(0,240,255,.10)"; ctx.stroke(); }
-  // 数值面
+  // 数值面（带方向：看多=正/紫红，看空=负/青蓝，半径按绝对值）
   ctx.beginPath();
-  for (let i=0;i<=N;i++){ const a=ang(i%N); const v=Math.max(0,Math.min(1,radarVals[i%N]||0)); const r=R*v; i? ctx.lineTo(cx+r*Math.cos(a), cy+r*Math.sin(a)) : ctx.moveTo(cx+r*Math.cos(a), cy+r*Math.sin(a)); }
+  for (let i=0;i<=N;i++){ const a=ang(i%N); const v=Math.max(-1,Math.min(1,radarVals[i%N]||0)); const r=R*Math.abs(v); i? ctx.lineTo(cx+r*Math.cos(a), cy+r*Math.sin(a)) : ctx.moveTo(cx+r*Math.cos(a), cy+r*Math.sin(a)); }
   ctx.closePath();
+  const sumV = radarVals.reduce((s,v)=>s+(v||0),0);   // 十项净方向
+  const bull = sumV >= 0;
   const g = ctx.createRadialGradient(cx,cy,10,cx,cy,R);
-  g.addColorStop(0,"rgba(168,85,247,.55)"); g.addColorStop(1,"rgba(0,240,255,.15)");
+  g.addColorStop(0, bull ? "rgba(168,85,247,.55)" : "rgba(0,200,255,.55)");
+  g.addColorStop(1, bull ? "rgba(0,240,255,.15)" : "rgba(0,120,255,.15)");
   ctx.fillStyle = g; ctx.fill();
-  ctx.strokeStyle = "#a855f7"; ctx.lineWidth = 1.4; ctx.shadowColor="#a855f7"; ctx.shadowBlur=10; ctx.stroke(); ctx.shadowBlur=0;
+  ctx.strokeStyle = bull ? "#a855f7" : "#00c8ff"; ctx.lineWidth = 1.4; ctx.shadowColor = bull ? "#a855f7" : "#00c8ff"; ctx.shadowBlur=10; ctx.stroke(); ctx.shadowBlur=0;
   // 标签
   ctx.font = "10px Consolas"; ctx.fillStyle = "#9fd0ff"; ctx.textAlign = "center";
   for (let i=0;i<N;i++){ const a=ang(i); const tx=cx+(R+14)*Math.cos(a), ty=cy+(R+14)*Math.sin(a);
@@ -1215,7 +1218,11 @@ class Snapshot:
                         item = rd.get(name)
                         if isinstance(item, dict):
                             try:
-                                vals[i] = float(item.get("confidence", 0.0))
+                                c = float(item.get("confidence", 0.0))
+                                b = str(item.get("bias") or "neutral").lower()
+                                # 带方向的分值：看多=+confidence，看空=-confidence，中性=0。
+                                # 否则雷达图只画强度不画方向，看跌也会显示"饱满/正面"。
+                                vals[i] = c if b == "bullish" else (-c if b == "bearish" else 0.0)
                             except Exception:
                                 pass
                     radar_all[sym] = vals
