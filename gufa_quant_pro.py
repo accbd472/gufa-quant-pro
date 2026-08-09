@@ -2568,7 +2568,9 @@ class ExchangeGateway:
         delta_quote = desired_quote - current_quote
         current_allocation = current_quote / snapshot.equity
         min_delta = max(self.risk.min_rebalance_quote, snapshot.equity * self.risk.min_rebalance_pct)
-        if abs(delta_quote) < min_delta:
+        # 清仓出场（target<=0 且需卖出）豁免 min_delta：残留仓位再小也必须能平掉，
+        # 否则止盈/止损触发后永远卖不出（曾因 min_rebalance_pct 阈值被卡死）。
+        if abs(delta_quote) < min_delta and not (target_allocation <= 0 and delta_quote < 0):
             return None
         side = "buy" if delta_quote > 0 else "sell"
         if side == "buy":
@@ -2622,7 +2624,8 @@ class ExchangeGateway:
         delta_notional = desired_notional - current_notional
         current_allocation = current_notional / snapshot.equity
         min_delta = max(self.risk.min_rebalance_quote, snapshot.equity * self.risk.min_rebalance_pct)
-        if abs(delta_notional) < min_delta:
+        # 清仓出场（target<=0 且需卖出）豁免 min_delta，理由同 _plan_spot。
+        if abs(delta_notional) < min_delta and not (target_allocation <= 0 and delta_notional < 0):
             return None
         side = "buy" if delta_notional > 0 else "sell"
         if side == "sell":
@@ -5031,9 +5034,10 @@ class GuFaQuantPro:
         now_mono = time.monotonic()
         if now_mono - getattr(self, "_last_heartbeat_log", 0.0) >= 30.0:
             self._last_heartbeat_log = now_mono
+            pos_real = sum(1 for p in snapshot.positions.values() if p.amount > 0)
             self.log.info(
                 "心跳 | 布防=%d 持仓=%d 权益=%.0f 行情=%d",
-                len(triggers), len(snapshot.positions), snapshot.equity, len(prices),
+                len(triggers), pos_real, snapshot.equity, len(prices),
             )
 
     def _trigger_indicators(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
@@ -5339,11 +5343,23 @@ class GuFaQuantPro:
                 market=market,
             )
             if plan is None:
-                # 快照中已无该标的仓位（可能已被清/对账移除）：触发无意义，保持移除。
-                self.log.warning(
-                    "%s 出场触发但快照中无仓位，移除触发状态", symbol,
-                )
-                self.store.state.trigger_skip_until.pop(symbol, None)
+                # 区分"真无仓"与"仓位太小无法生成计划"：
+                # 真无仓 → 触发无意义，保持移除；
+                # 有仓但无法生成 → 明确日志 + 10 分钟退避，避免刷屏。
+                pos = snapshot.positions.get(position_key(market, symbol))
+                if pos is None or pos.amount <= 0:
+                    self.log.warning(
+                        "%s 出场触发但快照中无仓位，移除触发状态", symbol,
+                    )
+                    self.store.state.trigger_skip_until.pop(symbol, None)
+                else:
+                    self.log.warning(
+                        "%s 出场触发但无法生成卖出计划（amount=%.4f quote=%.2f），"
+                        "10 分钟后重试", symbol, pos.amount, pos.quote_value,
+                    )
+                    self.store.state.trigger_skip_until[symbol] = (
+                        datetime.now(timezone.utc) + timedelta(minutes=10)
+                    ).isoformat()
                 self.store.save()
                 return
             fill = self.gateway.execute(plan)
