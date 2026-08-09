@@ -5230,6 +5230,11 @@ class GuFaQuantPro:
         # 信号模式以交易所实时快照为权威源：同步 state.positions，
         # 防止状态落盘失败/进程崩溃后本地持仓记录与交易所脱节。
         self._sync_positions(snapshot)
+        # 大屏健康报告提前写：初始全量布防扫盘期间（每币 AI-2 评估 1~3 分钟，
+        # 一轮 tick 可能持续数小时），若只在轮尾写盘，health.json quotes 会
+        # 长时间冻结，导致大屏持仓盈利%用旧价计算。此处每 tick 先写一次，
+        # 尾部再写一次以反映本 tick 成交，两者幂等不冲突。
+        self._write_signal_health(snapshot, prices, changes)
         # 已持仓基准名（spot 裸名 / swap 前缀都归一到裸名，避免重复入场）。
         # dust 残留（低于 dust_quote）不算持仓。
         managed_bases = {
