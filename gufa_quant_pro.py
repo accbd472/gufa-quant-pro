@@ -4961,6 +4961,10 @@ class GuFaQuantPro:
             if price <= 0:
                 continue
             rsi, vol_ratio = self._trigger_indicators(symbol)
+            # 出场失败退避期内不重复触发（防刷屏）。
+            if (self.store.state.trigger_skip_until.get(symbol)
+                    and now_iso < self.store.state.trigger_skip_until[symbol]):
+                continue
             for cond in ts.exit:
                 if self._evaluate_condition(cond, price, rsi, vol_ratio, now_iso):
                     self._execute_trigger_exit(symbol, price, cond)
@@ -5307,16 +5311,23 @@ class GuFaQuantPro:
     def _execute_trigger_exit(
         self, symbol: str, price: float, cond: TriggerCondition
     ) -> None:
-        """出场触发命中：平仓该标的，移除触发状态，唤醒 AI-1 重新评估。"""
+        """出场触发命中：先 disarm 防重复触发，再平仓该标的。
+
+        成功 → 移除触发状态，下次 tick 由 AI-1 重新评估入场。
+        plan is None（快照已无仓位）→ 移除触发（触发已无意义）。
+        下单失败 → 恢复触发 + 退避 10 分钟，避免每个 tick 重复触发刷屏。
+        """
         self.log.warning(
             "出场触发 %s | cond=%s value=%s price=%.4f",
             symbol, cond.kind, cond.value, price,
         )
-        snapshot = self.gateway.account_snapshot(
-            {sym: p for sym, p in self.gateway.fetch_all_tickers(
-                self.config.runtime.symbols).items() if p > 0}
-        )
+        # 先 disarm：立即从触发表移除，无论后续成败本 tick 都不再触发。
+        had_trigger = self.store.state.triggers.pop(symbol, None)
         try:
+            snapshot = self.gateway.account_snapshot(
+                {sym: p for sym, p in self.gateway.fetch_all_tickers(
+                    self.config.runtime.symbols).items() if p > 0}
+            )
             market = (
                 MARKET_SWAP
                 if position_key(MARKET_SWAP, symbol) in snapshot.positions
@@ -5328,12 +5339,27 @@ class GuFaQuantPro:
                 market=market,
             )
             if plan is None:
+                # 快照中已无该标的仓位（可能已被清/对账移除）：触发无意义，保持移除。
+                self.log.warning(
+                    "%s 出场触发但快照中无仓位，移除触发状态", symbol,
+                )
+                self.store.state.trigger_skip_until.pop(symbol, None)
+                self.store.save()
                 return
             fill = self.gateway.execute(plan)
         except OrderUncertainError:
+            # 订单状态不确定（可能已成交）：保持 disarm 防止重复下单，
+            # 交由挂单对账确认；若仓位仍在，下次 AI-2 评估会重新布防。
             raise
         except Exception as exc:  # noqa: BLE001
             self.log.error("触发出场下单失败 %s: %s", symbol, exc)
+            # 恢复触发 + 退避 10 分钟，防每 2 秒重复触发刷屏。
+            if had_trigger is not None:
+                self.store.state.triggers[symbol] = had_trigger
+            self.store.state.trigger_skip_until[symbol] = (
+                datetime.now(timezone.utc) + timedelta(minutes=10)
+            ).isoformat()
+            self.store.save()
             return
         append_jsonl(self.audit_path, {
             "ts": iso_now(), "event": "trigger_exit",
@@ -5341,9 +5367,9 @@ class GuFaQuantPro:
             "plan": asdict(plan), "fill": asdict(fill),
         })
         self._notify("trigger_exit", {"symbol": symbol, "side": "sell"})
-        # 出场后清触发状态，下次 tick 由 AI-1 重新评估入场。
+        # 出场成功：触发已移除（disarm），清退避标记，落盘。
         # 注意：此时订单已成交，状态落盘失败只记警告，绝不误报"下单失败"。
-        self.store.state.triggers.pop(symbol, None)
+        self.store.state.trigger_skip_until.pop(symbol, None)
         try:
             self.store.save()
         except Exception as exc:  # noqa: BLE001
