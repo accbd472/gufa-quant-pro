@@ -107,20 +107,38 @@ HTML = r"""<!DOCTYPE html>
   .tag { font-size: 11px; padding: 3px 9px; border-radius: 20px; border: 1px solid var(--line); color: var(--am); }
   .tag.sb { color: var(--pu); border-color: rgba(168,85,247,.5); }
 
-  /* ---------- 布局 ---------- */
-  main { flex: 1; display: grid; grid-template-columns: 1.55fr 1fr; grid-template-rows: 0.9fr 1.35fr .75fr; gap: 8px; min-height: 0; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
+  /* ---------- 布局：grid-template-areas，每块独占卡片 ---------- */
+  main { flex: 1; display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    grid-template-rows: 0.65fr 0.65fr 1.3fr 0.7fr;
+    grid-template-areas:
+      "equity    telemetry"
+      "selection ancient"
+      "decision  aisteps"
+      "stream    stream";
+    gap: 7px; min-height: 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 7px 9px;
     display: flex; flex-direction: column; min-height: 0; position: relative; overflow: hidden;
     backdrop-filter: blur(6px); }
   .card::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
     background: linear-gradient(90deg, transparent, var(--cy), transparent); opacity: .6; }
-  .card h3 { font-size: 10px; letter-spacing: 2px; color: var(--pu); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+  .card h3 { font-size: 10px; letter-spacing: 2px; color: var(--pu); margin-bottom: 5px; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
   .card h3::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, var(--line), transparent); }
   .chart { flex: 1; min-height: 0; }
   canvas { width: 100%; height: 100%; display: block; }
 
+  /* ---------- Tab 栏 ---------- */
+  .tabs { display: flex; gap: 0; flex-shrink: 0; margin-bottom: 5px; border-bottom: 1px solid var(--line); }
+  .tab { padding: 3px 12px; font-size: 10px; letter-spacing: 1px; color: #5f7fa0; cursor: pointer;
+    border: 1px solid transparent; border-bottom: none; border-radius: 6px 6px 0 0; transition: all .2s; }
+  .tab:hover { color: var(--cy); }
+  .tab.active { color: var(--cy); border-color: var(--line); background: rgba(0,240,255,.06); text-shadow: 0 0 6px rgba(0,240,255,.5); }
+  .tab-panes { flex: 1; min-height: 0; overflow: hidden; }
+  .tab-pane { display: none; height: 100%; overflow-y: auto; }
+  .tab-pane.active { display: block; }
+
   /* ---------- 指标卡 ---------- */
-  .metrics { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; }
+  .metrics { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
   .m { text-align: center; padding: 3px 2px; border: 1px solid var(--line); border-radius: 6px;
     background: rgba(0, 20, 40, .4); }
   .m .v { font-size: 15px; color: var(--cy); text-shadow: 0 0 10px rgba(0,240,255,.5); letter-spacing: 1px; }
@@ -150,9 +168,9 @@ HTML = r"""<!DOCTYPE html>
   .logbox .BUY { color: var(--gr); font-weight: 700; }
   .logbox .SELL { color: var(--rd); font-weight: 700; }
 
-  /* ---------- 决策灯 ---------- */
-  .quotes { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; flex: 0 0 auto;
-    border: 1px solid rgba(0,240,255,.15); border-radius: 6px; padding: 4px 8px; margin-bottom: 5px; }
+  /* ---------- 行情/持仓/布防 ---------- */
+  .quotes { display: flex; flex-direction: column; gap: 2px; overflow-y: auto;
+    border: 1px solid rgba(0,240,255,.15); border-radius: 6px; padding: 3px 7px; }
   .quote { display: flex; align-items: center; gap: 8px; font-size: 11px; }
   .quote.held { background: rgba(0,240,255,.06); border-left: 2px solid var(--cy); padding-left: 4px; }
   .quote .sym { width: 76px; color: var(--cy); white-space: nowrap; }
@@ -161,7 +179,7 @@ HTML = r"""<!DOCTYPE html>
   .quote .qch.up { color: var(--gr); }
   .quote .qch.down { color: var(--rd); }
   .quote .qv { width: 84px; text-align: right; color: #8fb4d8; }
-  .verdicts { display: flex; flex-direction: column; gap: 5px; overflow-y: auto; flex: 0 1 auto; min-height: 0; max-height: 56px; }
+  .verdicts { display: flex; flex-direction: column; gap: 4px; overflow-y: auto; flex: 1 1 0; min-height: 0; }
   .verdict { display: flex; align-items: center; gap: 8px; font-size: 11px; }
   .verdict .sym { width: 88px; color: var(--cy); }
   .vbadge { padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; letter-spacing: 1px; }
@@ -172,10 +190,10 @@ HTML = r"""<!DOCTYPE html>
   .verdict .cn { font-size: 11px; color: var(--pu); }
 
   /* ---------- AI 十项解读步骤 ---------- */
-  .aisteps { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 5px;
-    margin-top: 5px; flex: 1 1 0; min-height: 90px; align-content: start; overflow-y: auto; }
-  .aistep { text-align: center; font-size: 10px; padding: 3px 4px; border-radius: 5px; word-break: break-word;
-    border: 1px solid var(--line); background: rgba(0,20,40,.35); color: #8fb4d8; letter-spacing: 1px; }
+  .aisteps { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 4px;
+    flex: 1 1 0; min-height: 0; align-content: start; overflow-y: auto; }
+  .aistep { text-align: center; font-size: 9px; padding: 3px 2px; border-radius: 5px; word-break: break-word;
+    border: 1px solid var(--line); background: rgba(0,20,40,.35); color: #8fb4d8; letter-spacing: .5px; }
   .aistep.ok { border-color: rgba(52,255,176,.45); color: var(--gr); box-shadow: 0 0 6px rgba(52,255,176,.15); }
   .aistep.fallback { border-color: rgba(255,209,102,.45); color: var(--am); box-shadow: 0 0 6px rgba(255,209,102,.12); }
   .aistep.fail { border-color: rgba(255,59,107,.5); color: var(--rd); box-shadow: 0 0 6px rgba(255,59,107,.15); }
@@ -214,11 +232,13 @@ HTML = r"""<!DOCTYPE html>
     }
     .card { grid-column: auto !important; grid-row: auto !important; padding: 6px 8px; border-radius: 8px; }
     .card h3 { font-size: 9px; letter-spacing: 1px; margin-bottom: 4px; gap: 6px; }
-    .c-tele { order: 1; height: min(40vh, 340px); }
-    .c-eq   { order: 2; height: min(30vh, 270px); }
-    .c-dec  { order: 3; height: min(36vh, 330px); }
-    .c-sel  { order: 4; height: min(30vh, 300px); }
-    .c-log  { order: 5; height: min(28vh, 260px); }
+    .card[style*="telemetry"] { order: 1; height: min(36vh, 320px); }
+    .card[style*="equity"]   { order: 2; height: min(28vh, 250px); }
+    .card[style*="decision"] { order: 3; height: min(34vh, 320px); }
+    .card[style*="ancient"]  { order: 4; height: min(26vh, 240px); }
+    .card[style*="selection"] { order: 5; height: min(28vh, 260px); }
+    .card[style*="aisteps"]  { order: 6; height: min(24vh, 220px); }
+    .card[style*="stream"]   { order: 7; height: min(24vh, 220px); }
     .metrics { grid-template-columns: repeat(4, 1fr); gap: 4px; }
     .m .v { font-size: 13px; }
     .m .l { font-size: 8px; margin-top: 1px; }
@@ -266,52 +286,66 @@ HTML = r"""<!DOCTYPE html>
   </header>
 
   <main>
-    <!-- 左上：权益曲线 -->
-    <div class="card c-eq" style="grid-column:1; grid-row:1">
+    <!-- 权益曲线 -->
+    <div class="card" style="grid-area:equity">
       <h3>EQUITY // 权益曲线</h3>
       <div class="chart"><canvas id="eqChart"></canvas></div>
     </div>
-    <!-- 右上：指标 -->
-    <div class="card c-tele" style="grid-column:2; grid-row:1">
+    <!-- 遥测 -->
+    <div class="card" style="grid-area:telemetry">
       <h3>TELEMETRY // 遥测</h3>
       <div class="metrics">
         <div class="m"><div class="v" id="mEquity">--</div><div class="l">权益</div></div>
         <div class="m"><div class="v green" id="mPeak">--</div><div class="l">峰值</div></div>
-        <div class="m"><div class="v amber" id="mTrades">--</div><div class="l">今日成交</div></div>
-        <div class="m"><div class="v" id="mCycle">--</div><div class="l">周期s</div></div>
+        <div class="m"><div class="v amber" id="mTrades">--</div><div class="l">成交</div></div>
         <div class="m"><div class="v green" id="mFills">--</div><div class="l">持仓</div></div>
-        <div class="m"><div class="v" id="mReview">--</div><div class="l">复查</div></div>
         <div class="m"><div class="v" id="mCand">--</div><div class="l">候选</div></div>
         <div class="m"><div class="v" id="mDayStart">--</div><div class="l">日初</div></div>
       </div>
-      <!-- 雷达图：十项古法 -->
-      <h3 style="margin-top:6px">ANCIENT METHODS // 十项古法信号</h3>
-      <div class="chart" style="flex:1 1 auto; min-height:70px"><canvas id="radar"></canvas></div>
     </div>
-    <!-- 左下：选股 -->
-    <div class="card c-sel" style="grid-column:1; grid-row:2">
-      <h3>SELECTION // 每日古法初选 <span style="color:#5f7fa0;font-size:10px" id="selDate"></span></h3>
-      <div class="picks" id="picks"><div class="empty">等待初选数据…</div></div>
-      <h3 style="margin-top:6px">EXCLUDED // 当日剔除</h3>
-      <div class="dead" id="dead" style="font-size:10px; max-height:44px; overflow-y:auto"></div>
+    <!-- 选股 -->
+    <div class="card" style="grid-area:selection">
+      <h3>SELECTION // 每日初选 <span style="color:#5f7fa0;font-size:10px" id="selDate"></span></h3>
+      <div class="picks" id="picks"><div class="empty">等待初选…</div></div>
+      <h3 style="margin-top:4px;flex-shrink:0">EXCLUDED // 剔除</h3>
+      <div class="dead" id="dead" style="font-size:10px; max-height:36px; overflow-y:auto;flex-shrink:0"></div>
     </div>
-    <!-- 右下：决策 -->
-    <div class="card c-dec" style="grid-column:2; grid-row:2">
-      <h3>LIVE QUOTES // 实时行情 <span style="color:#5f7fa0;font-size:10px" id="liveTs"></span></h3>
-      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:24px; overflow-y:auto"><div class="empty">等待行情…</div></div>
-      <h3 style="margin-top:4px">POSITIONS // 持仓 <span style="color:#5f7fa0;font-size:10px" id="posSum"></span></h3>
-      <div class="quotes" id="positions" style="font-size:11px; max-height:48px; overflow-y:auto"><div class="empty">无持仓</div></div>
-      <div class="verdicts" id="verdicts" style="flex:0 1 auto; max-height:56px"><div class="empty">等待决策…</div></div>
-      <h3 style="margin-top:4px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
-      <div class="aisteps" id="aisteps" style="flex:1 1 0; min-height:90px; overflow-y:auto"><div class="empty">—</div></div>
+    <!-- 十项古法雷达 -->
+    <div class="card" style="grid-area:ancient">
+      <h3>ANCIENT METHODS // 十项古法信号</h3>
+      <div class="chart" style="min-height:50px"><canvas id="radar"></canvas></div>
     </div>
-    <!-- 底部通栏：日志 -->
-    <div class="card c-log" style="grid-column:1 / span 2; grid-row:3">
+    <!-- 决策区（Tab 切换：持仓/行情/布防） -->
+    <div class="card" style="grid-area:decision">
+      <div class="tabs">
+        <div class="tab active" data-pane="pane-pos">POSITIONS // 持仓</div>
+        <div class="tab" data-pane="pane-quote">LIVE QUOTES // 行情</div>
+        <div class="tab" data-pane="pane-trig">TRIGGERS // 布防</div>
+      </div>
+      <div class="tab-panes">
+        <div class="tab-pane active" id="pane-pos">
+          <div class="quotes" id="positions"><div class="empty">无持仓</div></div>
+        </div>
+        <div class="tab-pane" id="pane-quote">
+          <div class="quotes" id="liveQuotes"><div class="empty">等待行情…</div></div>
+        </div>
+        <div class="tab-pane" id="pane-trig">
+          <div class="verdicts" id="verdicts"><div class="empty">等待布防…</div></div>
+        </div>
+      </div>
+    </div>
+    <!-- AI 十项解读 -->
+    <div class="card" style="grid-area:aisteps">
+      <h3>AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
+      <div class="aisteps" id="aisteps"><div class="empty">—</div></div>
+    </div>
+    <!-- 日志 -->
+    <div class="card" style="grid-area:stream">
       <h3>STREAM // 实时日志</h3>
       <div class="logbox" id="log"></div>
     </div>
   </main>
-  <footer>GUFA QUANT PROTOCOL v1.0 // 数据源: runtime/state+health+equity // SSE 实时推送</footer>
+  <footer>GUFA QUANT PROTOCOL v2.0 // SSE+轮询双通道 // 数据源: runtime/state+health+equity</footer>
 </div>
 
 <script>
@@ -319,6 +353,16 @@ HTML = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let eqHist = [], radarNames = [], radarVals = [], currentMode = "";
 let curTriggers = 0, curPositions = 0;
+
+/* ---------- Tab 切换 ---------- */
+document.querySelectorAll(".tab").forEach(t=>{
+  t.addEventListener("click",()=>{
+    document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+    document.querySelectorAll(".tab-pane").forEach(x=>x.classList.remove("active"));
+    t.classList.add("active");
+    $(t.dataset.pane).classList.add("active");
+  });
+});
 
 /* ---------- 星空粒子 ---------- */
 (function stars(){
@@ -448,7 +492,6 @@ function render(d){
   const quoteEntries = d.quotes && Object.keys(d.quotes).length
     ? Object.entries(d.quotes) : [];
   if (quoteEntries.length){
-    if (d.live_updated_at) $("liveTs").textContent = "// " + d.live_updated_at.slice(11,19) + " 实时";
     const shortName = (sym)=>{
       const m = String(sym).match(/^(?:swap:)?([^/]+)\//);
       return (m?m[1]:sym) + (String(sym).startsWith("swap:")?"◆":"");
@@ -476,10 +519,8 @@ function render(d){
         <span class="qv">${Number(p.value).toFixed(0)}U</span></div>`;
     }).join("");
     $("positions").innerHTML = ps;
-    $("posSum").textContent = "// " + d.positions.length + " 个 · " + d.positions.reduce((s,p)=>s+p.value,0).toFixed(0) + "U";
   } else {
     $("positions").innerHTML = '<div class="empty">无持仓</div>';
-    $("posSum").textContent = "";
   }
   if (d.mode==="signal" && d.triggers && d.triggers.length){
     const ts = d.triggers.map(t=>`<div class="verdict"><span class="sym">${t.sym.replace('/USDT','')}</span>
@@ -525,11 +566,16 @@ function render(d){
 setInterval(()=>{ const t=new Date(); const p=n=>String(n).padStart(2,"0");
   $("clock").textContent = p(t.getHours())+":"+p(t.getMinutes())+":"+p(t.getSeconds()); }, 1000);
 
-/* ---------- 数据流 ---------- */
+/* ---------- 数据流（SSE + 轮询兜底） ---------- */
 fetch("/api/state").then(r=>r.json()).then(render).catch(()=>{});
 const es = new EventSource("/api/stream");
 es.onmessage = e => { try { render(JSON.parse(e.data)); } catch(_){} };
-es.onerror = () => setLed("ledSys", "bad", "LOST");
+es.onerror = () => {
+  setLed("ledSys", "bad", "LOST");
+  setTimeout(()=>{ if (es.readyState === EventSource.CLOSED) location.reload(); }, 3000);
+};
+// 轮询兜底：SSE 正常时也每 5 秒拉一次，防止 SSE 静默断线
+setInterval(()=>{ fetch("/api/state").then(r=>r.json()).then(render).catch(()=>{}); }, 5000);
 </script>
 </body>
 </html>
