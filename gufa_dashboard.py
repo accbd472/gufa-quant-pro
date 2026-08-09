@@ -925,8 +925,8 @@ class Snapshot:
         """解析 AI 十项解读的每步状态。
 
         周期模式：以「最近周期完成之后」的日志为准，统计拆分解读失败；
-        信号模式：无周期概念，直接按日志尾部统计 AI-1 入场决策成败 /
-                  AI-2 出场监控 / 空响应重试，反映真实 AI 健康度。
+        信号模式：无周期概念，直接按日志尾部统计 AI-2 入场决策成败 /
+                  AI-3 出场监控 / 空响应重试，反映真实 AI 健康度。
         """
         methods = ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]
         failed: set[str] = set()
@@ -942,9 +942,9 @@ class Snapshot:
                     msg = str(j.get("message", ""))
                 except Exception:
                     continue
-                if "AI-1 入场决策失败" in msg:
+                if "AI-2 入场决策失败" in msg:
                     fail1 += 1
-                elif "AI-1 入场决策" in msg and "decision=" in msg:
+                elif "AI-2 入场决策" in msg and "decision=" in msg:
                     ok1 += 1
                 elif "AI 响应为空或请求失败" in msg or "AI 中转站错误" in msg:
                     empty += 1
@@ -958,9 +958,9 @@ class Snapshot:
             else:
                 status = "ready"
             steps = [
-                {"name": f"AI-1 古法入场 · 成功 {ok1} · 失败 {fail1}",
+                {"name": f"AI-2 古法入场 · 成功 {ok1} · 失败 {fail1}",
                  "status": "ok" if ok1 >= fail1 else "error"},
-                {"name": "AI-2 出场条件监控 · 就绪", "status": "ok"},
+                {"name": "AI-3 出场条件监控 · 就绪", "status": "ok"},
                 {"name": "AI 请求正常" if empty == 0 else f"AI 空响应/中转站错误 {empty} 次",
                  "status": "ok" if empty == 0 else "fallback"},
             ]
@@ -1040,7 +1040,7 @@ class Snapshot:
             # 高频刷屏事件合并：AI 错误/空响应/决策失败只保留最新 1 条，
             # 避免日志卡被上游 503 刷屏，挤掉成交/布防等关键事件。
             if ("AI 响应为空或请求失败" in msg or "AI 中转站错误" in msg
-                    or "AI-1 入场决策失败" in msg):
+                    or "AI-2 入场决策失败" in msg):
                 key = "AI_ERR"
                 if key in dedup_seen:
                     continue
@@ -1069,9 +1069,9 @@ class Snapshot:
             "BUY filled", "SELL filled", "买入", "卖出", "下单",
             "订单", "成交", "仓位", "止损", "止盈",
             # 信号模式关键事件
-            "信号触发模式启动", "AI-1 入场决策", "AI-2 出场",
+            "信号触发模式启动", "AI-2 入场决策", "AI-3 出场决策", "AI-2 入场决策失败", "AI-3 出场决策失败", "AI-2 响应结构无效", "AI-3 响应结构无效", "AI-3 补设", "AI-1 断卦", "今日不宜交易",
             "AI 响应为空或请求失败", "AI 中转站错误", "布防", "触发条件",
-            "AI-1 响应结构无效", "AI 缩量仲裁", "AI 判定放弃", "AI 缩量后仍失败",
+            "AI 缩量仲裁", "AI 判定放弃", "AI 缩量后仍失败",
         )):
             return True
         # 网络错误合并显示：只保留每种错误最近 1 条
