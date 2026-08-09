@@ -199,15 +199,20 @@ HTML = r"""<!DOCTYPE html>
   .verdict .cf { flex: 1; font-size: 10px; color: #8fb4d8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .verdict .cn { font-size: 11px; color: var(--pu); }
 
-  /* ---------- AI 十项解读步骤 ---------- */
-  .aisteps { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 4px;
-    flex: 1 1 0; min-height: 0; align-content: start; overflow-y: auto; }
-  .aistep { text-align: center; font-size: 9px; padding: 3px 2px; border-radius: 5px; word-break: break-word;
-    border: 1px solid var(--line); background: rgba(0,20,40,.35); color: #8fb4d8; letter-spacing: .5px; }
-  .aistep.ok { border-color: rgba(52,255,176,.45); color: var(--gr); box-shadow: 0 0 6px rgba(52,255,176,.15); }
-  .aistep.fallback { border-color: rgba(255,209,102,.45); color: var(--am); box-shadow: 0 0 6px rgba(255,209,102,.12); }
-  .aistep.fail { border-color: rgba(255,59,107,.5); color: var(--rd); box-shadow: 0 0 6px rgba(255,59,107,.15); }
-  .aistep .st { font-size: 11px; }
+  /* ---------- AI 十项解读 ---------- */
+  .aisteps { display: flex; flex-direction: column; gap: 3px; overflow-y: auto;
+    flex: 1 1 0; min-height: 0; }
+  .aistep { display: flex; align-items: center; gap: 6px; font-size: 10.5px;
+    padding: 3px 6px; border-radius: 4px; word-break: break-word; line-height: 1.35;
+    border: 1px solid var(--line); background: rgba(0,20,40,.35); color: #8fb4d8; letter-spacing: .3px; }
+  .aistep .st { flex: 0 0 26px; font-size: 10px; font-weight: 700; }
+  .aistep b { flex: 0 0 30px; color: var(--cy); }
+  .aistep .cf { flex: 0 0 38px; color: #7aa7cc; font-size: 10px; }
+  .aistep .rd { flex: 1; color: #b7d3ea; }
+  .aistep.ok { border-color: rgba(52,255,176,.4); background: rgba(0,60,40,.25); }
+  .aistep.fail { border-color: rgba(255,59,107,.4); background: rgba(80,0,30,.22); }
+  .aistep.ok .st { color: var(--gr); }
+  .aistep.fail .st { color: var(--rd); }
 
   .empty { color: #4a6a8a; font-size: 12px; text-align: center; padding: 12px 0; }
   footer { font-size: 9px; color: #3d5a78; text-align: center; letter-spacing: 2px; }
@@ -254,9 +259,11 @@ HTML = r"""<!DOCTYPE html>
     .m .l { font-size: 8px; margin-top: 1px; }
     .chart { min-height: 110px !important; }
     .quotes { max-height: 64px; }
-    .aisteps { grid-template-columns: repeat(5, 1fr); gap: 3px; }
-    .aistep { font-size: 8px; padding: 2px 0; }
-    .aistep .st { font-size: 9px; }
+    .aisteps { gap: 2px; }
+    .aistep { font-size: 9px; padding: 2px 4px; }
+    .aistep .st { flex-basis: 22px; font-size: 9px; }
+    .aistep b { flex-basis: 26px; }
+    .aistep .cf { flex-basis: 32px; font-size: 9px; }
     .quote { font-size: 10px; }
     .quote .sym { width: 64px; }
     .quote .qv { width: 72px; }
@@ -429,6 +436,7 @@ function drawEq(){
 
 let radarSym = "";
 let radarAll = {};       // {symbol: [10个confidence]}
+let radarReadings = {};  // {symbol: {方法名: {bias, confidence, reading}}}
 let radarSelSym = "";    // 用户手动选中的币种（空=自动取第一个）
 /* ---------- 雷达图 ---------- */
 function drawRadar(){
@@ -548,23 +556,33 @@ function render(d){
     $("verdicts").innerHTML = vs;
   } else if (d.verdicts && d.verdicts.length===0) { $("verdicts").innerHTML = '<div class="empty">无持仓/无新决策</div>'; }
   else if (d.mode==="signal") { $("verdicts").innerHTML = '<div class="empty">未布防触发条件</div>'; }
-  // AI 十项解读步骤
-  if (d.ai_steps && d.ai_steps.length){
-    const nOk = d.ai_steps.filter(s=>s.status==="ok").length;
-    const nFb = d.ai_steps.filter(s=>s.status==="fallback").length;
-    $("aiStepSum").textContent = d.mode==="signal"
-      ? "// 信号模式 · AI 实时决策"
-      : `// ${nOk}✓ ${nFb}⚠ 规则兜底` + (d.ai_agg_failed ? " · 聚合兜底" : "");
-    $("aisteps").innerHTML = d.ai_steps.map(s=>{
-      const mark = s.status==="ok"?"✓":(s.status==="fallback"?"⚠":"✗");
-      return `<div class="aistep ${s.status}"><span class="st">${mark}</span> ${s.name}</div>`;
-    }).join("");
-  } else if (d.mode==="signal"){
-    const n = d.triggers ? d.triggers.length : 0;
-    $("aiStepSum").textContent = "// 信号模式 · AI-1 布防";
-    $("aisteps").innerHTML = `<div class="aistep ok"><span class="st">✓</span> AI-1 布防 ${n} 标的</div>` +
-      `<div class="aistep ok"><span class="st">✓</span> 轮询 2s · 触发即执行</div>`;
-  }
+  // AI 十项解读：显示当前选中币的十项古法解读（bias + confidence + 解读文字），
+  // 与雷达币种联动。数据来自 health.decisions[sym].readings。
+  const TEN_ORDER = ["奇门","六壬","太乙","易经","风水","八字","梅花","紫微","八卦","四柱"];
+  const renderTenReadings = (sym)=>{
+    const rd = radarReadings[sym] || {};
+    const items = TEN_ORDER.map(n=>{
+      const it = rd[n];
+      if (!it) return null;
+      const bias = it.bias || "neutral";
+      const mark = bias==="bullish" ? "▲吉" : (bias==="bearish" ? "▼凶" : "•平");
+      const cls = bias==="bullish" ? "ok" : (bias==="bearish" ? "fail" : "");
+      const cf = it.confidence!=null ? (it.confidence*100).toFixed(0)+"%" : "--";
+      return `<div class="aistep ${cls}"><span class="st">${mark}</span> <b>${n}</b> <span class="cf">${cf}</span><span class="rd">${it.reading||""}</span></div>`;
+    }).filter(Boolean);
+    if (!items.length){
+      $("aiStepSum").textContent = "// 等待 " + (sym?sym.replace('/USDT',''):"") + " 十项解读…";
+      $("aisteps").innerHTML = '<div class="empty">—</div>';
+      return;
+    }
+    $("aiStepSum").textContent = "// " + (sym?sym.replace('/USDT',''):"") + " · 十项古法合参";
+    $("aisteps").innerHTML = items.join("");
+  };
+  if (d.radar_readings) radarReadings = d.radar_readings;
+  // 若当前无雷达数据但 readings 有（例如用户选中币后 AI 已评估），优先用 readings 判定
+  const activeSym = (radarSelSym && radarReadings[radarSelSym]) ? radarSelSym
+    : (d.radar && d.radar.symbol) || "";
+  renderTenReadings(activeSym);
   // 权益曲线
   if (d.equity_hist) eqHist = d.equity_hist;
   drawEq();
@@ -591,6 +609,7 @@ function render(d){
           $("radarSyms").querySelectorAll(".rsym").forEach(x=>x.classList.remove("active"));
           el.classList.add("active");
           drawRadar();
+          renderTenReadings(radarSelSym);
         };
       });
     } else { $("radarSyms").innerHTML = ""; }
@@ -966,6 +985,16 @@ class Snapshot:
                 radar_values = radar_all[sym]
                 break
 
+        # 十项解读全文（供"AI 十项解读"卡片展示，与雷达币种联动）：
+        # {sym: {方法名: {bias, confidence, reading}}}，缺项留空 dict。
+        radar_readings: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for sym in pos_syms:
+            info = dec.get(sym)
+            if isinstance(info, dict):
+                rd = info.get("readings")
+                if isinstance(rd, dict):
+                    radar_readings[sym] = {k: v for k, v in rd.items() if isinstance(v, dict)}
+
         # 订单审计尾部（最近 3 条）
         orders = []
         for line in _tail(self.orders_path, 3):
@@ -1005,6 +1034,7 @@ class Snapshot:
             "positions": positions,
             "triggers": triggers,
             "radar": {"names": list(TEN_METHODS), "values": radar_values, "symbol": radar_symbol, "all": radar_all},
+            "radar_readings": radar_readings,
             "equity_hist": equity_hist,
             "logs": self._read_logs_html(),
             "orders": orders,
