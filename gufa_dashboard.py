@@ -186,6 +186,11 @@ HTML = r"""<!DOCTYPE html>
   .vbadge.BUY { background: rgba(52,255,176,.12); color: var(--gr); border: 1px solid rgba(52,255,176,.5); }
   .vbadge.SELL { background: rgba(255,59,107,.12); color: var(--rd); border: 1px solid rgba(255,59,107,.5); }
   .vbadge.HOLD { background: rgba(255,209,102,.10); color: var(--am); border: 1px solid rgba(255,209,102,.4); }
+  /* 雷达币种选择器 */
+  .rsym { padding: 2px 8px; font-size: 10px; color: #5f7fa0; cursor: pointer; border-radius: 10px;
+    border: 1px solid rgba(0,240,255,.15); transition: all .15s; letter-spacing: .5px; }
+  .rsym:hover { color: var(--cy); border-color: rgba(0,240,255,.4); }
+  .rsym.active { color: var(--cy); background: rgba(0,240,255,.1); border-color: rgba(0,240,255,.5); text-shadow: 0 0 6px rgba(0,240,255,.4); }
   .verdict .cf { flex: 1; font-size: 10px; color: #8fb4d8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .verdict .cn { font-size: 11px; color: var(--pu); }
 
@@ -313,7 +318,8 @@ HTML = r"""<!DOCTYPE html>
     <!-- 十项古法雷达 -->
     <div class="card" style="grid-area:ancient">
       <h3>ANCIENT METHODS // 十项古法信号 <span id="radarSym" style="color:#5f7fa0;font-size:10px"></span></h3>
-      <div class="chart" style="min-height:50px"><canvas id="radar"></canvas></div>
+      <div class="radar-syms" id="radarSyms" style="display:flex;gap:3px;flex-wrap:wrap;flex-shrink:0;margin-bottom:4px"></div>
+      <div class="chart" style="flex:1 1 auto;min-height:50px"><canvas id="radar"></canvas></div>
     </div>
     <!-- 决策区（Tab 切换：持仓/行情/布防） -->
     <div class="card" style="grid-area:decision">
@@ -417,6 +423,8 @@ function drawEq(){
 }
 
 let radarSym = "";
+let radarAll = {};       // {symbol: [10个confidence]}
+let radarSelSym = "";    // 用户手动选中的币种（空=自动取第一个）
 /* ---------- 雷达图 ---------- */
 function drawRadar(){
   const c = $("radar"), ctx = c.getContext("2d");
@@ -556,7 +564,29 @@ function render(d){
   if (d.equity_hist) eqHist = d.equity_hist;
   drawEq();
   // 雷达
-  if (d.radar){ radarNames = d.radar.names; radarVals = d.radar.values||[]; radarSym = d.radar.symbol||""; $("radarSym") && ($("radarSym").textContent = radarSym ? "// "+radarSym.replace('/USDT','') : ""); drawRadar(); }
+  if (d.radar){
+    radarNames = d.radar.names||[]; radarAll = d.radar.all||{}; radarSym = d.radar.symbol||"";
+    // 用户手动选中了某个币且该币仍有 readings → 用用户选的；否则用 API 默认的
+    if (radarSelSym && radarAll[radarSelSym]) { radarSym = radarSelSym; }
+    radarVals = radarAll[radarSym] || (d.radar.values||[]);
+    $("radarSym") && ($("radarSym").textContent = radarSym ? "// "+radarSym.replace('/USDT','') : "");
+    // 渲染持仓币种选择器
+    const syms = Object.keys(radarAll);
+    if (syms.length){
+      $("radarSyms").innerHTML = syms.map(s=>{
+        const cls = s===radarSym ? "rsym active" : "rsym";
+        return `<span class="${cls}" data-sym="${s}">${s.replace('/USDT','')}</span>`;
+      }).join("");
+      $("radarSyms").querySelectorAll(".rsym").forEach(el=>{
+        el.onclick = ()=>{ radarSelSym = el.dataset.sym;
+          radarSym = radarSelSym; radarVals = radarAll[radarSelSym]||[0]*10;
+          $("radarSym").textContent = "// "+radarSelSym.replace('/USDT','');
+          $("radarSyms").querySelectorAll(".rsym").forEach(x=>x.classList.remove("active"));
+          el.classList.add("active"); drawRadar(); };
+      });
+    } else { $("radarSyms").innerHTML = ""; }
+    drawRadar();
+  }
   // 日志
   if (d.logs){ $("log").innerHTML = d.logs; }
 }
@@ -896,40 +926,35 @@ class Snapshot:
             ai_busy = False
 
         # 雷达：始终显示十项古法（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。
-        # 有真实 readings 时画数值面，无数据时全 0（只画网格骨架）。
+        # 按持仓币种读取 readings（health.decisions = {sym: {readings: {...}}}），
+        # 把所有持仓币的 readings 都传给前端，雷达可点击切换币种查看。
         TEN_METHODS = ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]
-        radar_names: List[str] = list(TEN_METHODS)
-        radar_values: List[float] = [0.0] * 10
-        radar_symbol: str = ""
-        # 按持仓币种读取 readings（health.decisions = {sym: {readings: {...}}}）
         pos_syms = list((state.get("positions") or {}).keys())
         dec = health.get("decisions") or {}
-        last_readings = None
-        # 优先取第一个持仓币的 readings
+        # 每个持仓币的十项 confidence
+        radar_all: Dict[str, List[float]] = {}
         for sym in pos_syms:
             info = dec.get(sym)
             if isinstance(info, dict):
                 rd = info.get("readings")
                 if isinstance(rd, dict) and rd:
-                    last_readings = rd
-                    radar_symbol = sym
-                    break
-        # 持仓币无 readings 时取 decisions 里任意一个
-        if last_readings is None:
-            for sym, info in dec.items():
-                rd = (info or {}).get("readings") if isinstance(info, dict) else None
-                if isinstance(rd, dict) and rd:
-                    last_readings = rd
-                    radar_symbol = sym
-                    break
-        if isinstance(last_readings, dict):
-            for i, name in enumerate(TEN_METHODS):
-                rd = last_readings.get(name)
-                if isinstance(rd, dict):
-                    try:
-                        radar_values[i] = float(rd.get("confidence", 0.0))
-                    except Exception:
-                        radar_values[i] = 0.0
+                    vals = [0.0] * 10
+                    for i, name in enumerate(TEN_METHODS):
+                        item = rd.get(name)
+                        if isinstance(item, dict):
+                            try:
+                                vals[i] = float(item.get("confidence", 0.0))
+                            except Exception:
+                                pass
+                    radar_all[sym] = vals
+        # 默认展示第一个有 readings 的币
+        radar_symbol: str = ""
+        radar_values: List[float] = [0.0] * 10
+        for sym in pos_syms:
+            if sym in radar_all:
+                radar_symbol = sym
+                radar_values = radar_all[sym]
+                break
 
         # 订单审计尾部（最近 3 条）
         orders = []
@@ -969,7 +994,7 @@ class Snapshot:
             "verdicts": verdicts,
             "positions": positions,
             "triggers": triggers,
-            "radar": {"names": radar_names, "values": radar_values, "symbol": radar_symbol},
+            "radar": {"names": list(TEN_METHODS), "values": radar_values, "symbol": radar_symbol, "all": radar_all},
             "equity_hist": equity_hist,
             "logs": self._read_logs_html(),
             "orders": orders,
