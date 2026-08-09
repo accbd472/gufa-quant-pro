@@ -484,6 +484,7 @@ let radarSym = "";
 let radarAll = {};       // {symbol: [10个confidence]}
 let radarReadings = {};  // {symbol: {方法名: {bias, confidence, reading}}}
 let radarSelSym = "";    // 用户手动选中的币种（空=自动取第一个）
+let lastLogs = "";       // 日志卡上次内容，不变时不重写 DOM（避免打断选择/复制）
 
 /* ---------- AI 十项解读（与雷达币种联动） ---------- */
 function renderTenReadings(sym){
@@ -688,8 +689,14 @@ function render(d){
   }
   // AI 历史买卖动作
   renderTrades(d.trade_history);
-  // 日志
-  if (d.logs){ $("log").innerHTML = d.logs; }
+  // 日志（内容不变时不重写 DOM：SSE 每 2 秒推一次，重写会打断用户选择/复制）
+  if (d.logs && d.logs !== lastLogs){
+    const lb = $("log");
+    const stick = lb.scrollTop + lb.clientHeight >= lb.scrollHeight - 20; // 原贴底才跟随
+    lb.innerHTML = d.logs;
+    if (stick) lb.scrollTop = lb.scrollHeight;
+    lastLogs = d.logs;
+  }
 }
 
 /* ---------- 时钟 ---------- */
