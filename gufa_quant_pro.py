@@ -3154,20 +3154,33 @@ class AIAdvisor:
         message = f"AI 中转站错误（{status_text}）: {detail or exc}"
         return AIRelayError(message, status=status, detail=detail)
 
-    def _completion_content(self, messages: Sequence[Mapping[str, str]]) -> str:
+    def _completion_content(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        max_tokens_override: Optional[int] = None,
+    ) -> str:
         """请求 AI 并返回非空正文；空正文/网络抖动自动重试（最多 5 次）。
 
-        对 reasoning 型模型（如 deepseek-v4-flash），中转站偶发把输出预算
-        耗尽在思考上、返回空 content（finish=length）。重试时依次去掉
-        response_format / reasoning_effort 并放宽 max_tokens，最大化成功概率。
+        使用流式输出（stream=True + include_usage）：
+        - deepseek 系模型思考先行（reasoning_content 流），再出正文；
+          流式可实时观察思考消耗，避免一次性等待后才发现空正文。
+        - 思考预算护栏：reasoning 字符超 max_tokens 阈值且正文仍为空时
+          主动终止（abort），立即进入参数调整重试，不白耗时间。
+        max_tokens_override：综合决策等关键请求可单独给更宽输出预算
+        （reasoning 型模型 max_tokens 含思考+正文，3000 易被思考挤占）。
+        重试时依次去掉 response_format 并放宽 max_tokens；
+        注意保持 reasoning_effort（诊断证实去掉后思考更失控，如
+        deepseek-v4-flash 思考从 2562 飙到 4000 tokens 全吃光预算）。
         503/429/5xx 瞬时繁忙指数退避重试；4xx 配置类错误不重试直接抛。
         """
         kwargs: Dict[str, Any] = {
             "model": self.config.model,
             "messages": list(messages),
             "temperature": 0,
-            "max_tokens": self.config.max_output_tokens,
+            "max_tokens": max_tokens_override or self.config.max_output_tokens,
             "response_format": {"type": "json_object"},
+            "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if self.config.reasoning_effort:
             # 思考档位：low 可显著降低 reasoning 模型（如 deepseek-v4-flash）
@@ -3176,10 +3189,42 @@ class AIAdvisor:
         last_exc: Optional[BaseException] = None
         for attempt in range(5):
             try:
-                response = self.client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content
-                if isinstance(content, str) and content.strip():
-                    return content.strip()
+                stream = self.client.chat.completions.create(**kwargs)
+                content_parts: List[str] = []
+                reasoning_chars = 0
+                budget = int(kwargs.get("max_tokens", 3000))
+                aborted = False
+                try:
+                    for chunk in stream:
+                        if not chunk.choices:
+                            continue  # usage 块/空块
+                        delta = chunk.choices[0].delta
+                        if delta is None:
+                            continue
+                        rc = getattr(delta, "reasoning_content", None)
+                        if rc:
+                            reasoning_chars += len(rc)
+                            # 思考预算护栏：reasoning 字符已远超 max_tokens 且正文
+                            # 为空 → 模型把输出预算耗尽在思考上，继续等只会白耗，
+                            # 主动终止让重试以更宽松参数重发。
+                            if reasoning_chars > budget * 2 and not content_parts:
+                                aborted = True
+                                break
+                        c = getattr(delta, "content", None)
+                        if c:
+                            content_parts.append(c)
+                finally:
+                    try:
+                        stream.close()
+                    except Exception:  # noqa: BLE001 关闭失败不影响判定
+                        pass
+                if aborted:
+                    raise ConfigError(
+                        "AI 思考耗尽输出预算（reasoning 超限且无正文），调整参数重试"
+                    )
+                content = "".join(content_parts).strip()
+                if content:
+                    return content
                 last_exc = ConfigError("AI 响应正文必须是非空 JSON string")
             except Exception as exc:  # noqa: BLE001 - SDK/网络/中转站错误统一转成可读信息
                 last_exc = self._relay_error(exc)
@@ -3196,9 +3241,9 @@ class AIAdvisor:
                 if attempt == 0:
                     kwargs.pop("response_format", None)
                 elif attempt == 1:
-                    kwargs.pop("reasoning_effort", None)
+                    # 保持 reasoning_effort（去掉后思考更失控），仅提高输出预算兜底。
                     kwargs["max_tokens"] = min(
-                        int(kwargs.get("max_tokens", 3000)) + 1000, 4000
+                        int(kwargs.get("max_tokens", 3000)) + 3000, 9000
                     )
                 # 后续尝试保持宽松参数继续重试（503 瞬时繁忙需要更长退避）
         assert last_exc is not None
@@ -3891,10 +3936,11 @@ class AIAdvisor:
                 for name, rd in split_readings.items()
             }
         try:
+            # 综合决策请求：单独给更宽输出预算（reasoning 含思考+正文）。
             content = self._completion_content([
                 {"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
-            ])
+            ], max_tokens_override=6000)
         except Exception as exc:  # noqa: BLE001 触发决策失败不阻断监听循环
             self.log.error("AI-1 入场决策失败 %s: %s", symbol, exc)
             self._note_ai_failure()
@@ -4107,10 +4153,11 @@ class AIAdvisor:
                 for name, rd in split_readings.items()
             }
         try:
+            # 综合决策请求：单独给更宽输出预算（reasoning 含思考+正文）。
             content = self._completion_content([
                 {"role": "system", "content": system},
                 {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
-            ])
+            ], max_tokens_override=6000)
         except Exception as exc:  # noqa: BLE001
             self.log.error("AI-2 出场决策失败 %s: %s", symbol, exc)
             return [], "AI-2 决策失败，沿用现有出场条件", "error", None
