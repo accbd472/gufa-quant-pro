@@ -5023,6 +5023,14 @@ class GuFaQuantPro:
         # 触发状态写盘 + 大屏健康报告
         self.store.save()
         self._write_signal_health(snapshot, prices, changes)
+        # 心跳日志：每 30 秒输出一次 INFO，让大屏/运维知道 bot 在活着。
+        now_mono = time.monotonic()
+        if now_mono - getattr(self, "_last_heartbeat_log", 0.0) >= 30.0:
+            self._last_heartbeat_log = now_mono
+            self.log.info(
+                "心跳 | 布防=%d 持仓=%d 权益=%.0f 行情=%d",
+                len(triggers), len(snapshot.positions), snapshot.equity, len(prices),
+            )
 
     def _trigger_indicators(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         """轻量指标：RSI(14) 与成交量突增比（最新 1h 量 / 前 20 根均值）。
