@@ -546,7 +546,7 @@ function render(d){
     const ts = d.triggers.map(t=>`<div class="verdict"><span class="sym">${t.sym.replace('/USDT','')}</span>
       <span class="vbadge hold">入${t.entry_n}</span>
       <span class="cn">出${t.exit_n}</span>
-      <span class="cf">${t.target!=null?(t.target*100).toFixed(0)+"%仓":""}${t.first_at?" · "+String(t.first_at).slice(11,16):""}</span></div>`).join("");
+      <span class="cf">${t.target!=null?(t.target*100).toFixed(0)+"%仓":""}${t.first_at?" · "+String(t.first_at).slice(0,5):""}</span></div>`).join("");
     $("verdicts").innerHTML = ts;
   } else if (d.verdicts && d.verdicts.length){
     const vs = d.verdicts.map(v=>`<div class="verdict"><span class="sym">${v.sym.replace('/USDT','')}</span>
@@ -620,8 +620,9 @@ function render(d){
 }
 
 /* ---------- 时钟 ---------- */
-setInterval(()=>{ const t=new Date(); const p=n=>String(n).padStart(2,"0");
-  $("clock").textContent = p(t.getHours())+":"+p(t.getMinutes())+":"+p(t.getSeconds()); }, 1000);
+// 时钟固定 UTC+8（Asia/Shanghai），不依赖浏览器/客户端时区
+setInterval(()=>{ const t=new Date(Date.now()+8*3600*1000); const p=n=>String(n).padStart(2,"0");
+  $("clock").textContent = p(t.getUTCHours())+":"+p(t.getUTCMinutes())+":"+p(t.getUTCSeconds()); }, 1000);
 
 /* ---------- 数据流（SSE + 轮询兜底） ---------- */
 fetch("/api/state").then(r=>r.json()).then(render).catch(()=>{});
@@ -943,7 +944,7 @@ class Snapshot:
                 "entry_n": int(info.get("entry_conditions") or 0),
                 "exit_n": int(info.get("exit_conditions") or 0),
                 "target": info.get("entry_target"),
-                "first_at": info.get("first_trigger_at"),
+                "first_at": _local_hhmmss(str(info.get("first_trigger_at") or "")),
                 "ref": info.get("ref_price"),
             })
         triggers.sort(key=lambda t: t["sym"])
