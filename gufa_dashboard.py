@@ -297,7 +297,9 @@ HTML = r"""<!DOCTYPE html>
     <!-- 右下：决策 -->
     <div class="card c-dec" style="grid-column:2; grid-row:2">
       <h3>LIVE QUOTES // 实时行情 <span style="color:#5f7fa0;font-size:10px" id="liveTs"></span></h3>
-      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:40px; overflow-y:auto"><div class="empty">等待行情…</div></div>
+      <div class="quotes" id="liveQuotes" style="font-size:11px; max-height:34px; overflow-y:auto"><div class="empty">等待行情…</div></div>
+      <h3 style="margin-top:6px">POSITIONS // 持仓 <span style="color:#5f7fa0;font-size:10px" id="posSum"></span></h3>
+      <div class="quotes" id="positions" style="font-size:11px; max-height:96px; overflow-y:auto"><div class="empty">无持仓</div></div>
       <div class="verdicts" id="verdicts"><div class="empty">等待决策…</div></div>
       <h3 style="margin-top:6px">AI 十项解读 <span id="aiStepSum" style="color:#5f7fa0;font-size:10px"></span></h3>
       <div class="aisteps" id="aisteps"><div class="empty">—</div></div>
@@ -457,6 +459,22 @@ function render(d){
     }).join("");
     $("liveQuotes").innerHTML = qs;
   } else { $("liveQuotes").innerHTML = '<div class="empty">等待行情…</div>'; }
+  // 持仓列表：state.positions 真实持仓 + 实时价（市值/浮动盈亏）
+  if (d.positions && d.positions.length){
+    const ps = d.positions.map(p=>{
+      const pnlCls = p.pnl_pct>0.0001 ? "up" : (p.pnl_pct<-0.0001 ? "down" : "");
+      const arrow = p.pnl_pct>0.0001 ? "▲" : (p.pnl_pct<-0.0001 ? "▼" : "•");
+      return `<div class="quote held"><span class="sym">${String(p.sym).replace('/USDT','')}◆</span>
+        <span class="qp">${Number(p.price).toPrecision(6)}</span>
+        <span class="qch ${pnlCls}">${arrow}${Math.abs(p.pnl_pct).toFixed(2)}%</span>
+        <span class="qv">${Number(p.value).toFixed(0)}U</span></div>`;
+    }).join("");
+    $("positions").innerHTML = ps;
+    $("posSum").textContent = "// " + d.positions.length + " 个 · " + d.positions.reduce((s,p)=>s+p.value,0).toFixed(0) + "U";
+  } else {
+    $("positions").innerHTML = '<div class="empty">无持仓</div>';
+    $("posSum").textContent = "";
+  }
   if (d.mode==="signal" && d.triggers && d.triggers.length){
     const ts = d.triggers.map(t=>`<div class="verdict"><span class="sym">${t.sym.replace('/USDT','')}</span>
       <span class="vbadge hold">入${t.entry_n}</span>
@@ -770,6 +788,40 @@ class Snapshot:
             })
         verdicts.sort(key=lambda v: v["sym"])
 
+        # 持仓明细：state.json 真实持仓 + quotes 实时价 → 市值/浮动盈亏
+        positions = []
+        state_positions = state.get("positions") or {}
+        quotes_map = health.get("quotes") or {}
+        for sym, info in state_positions.items():
+            if not isinstance(info, dict):
+                continue
+            try:
+                amount = float(info.get("amount") or 0.0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            try:
+                avg = float(info.get("avg_entry") or 0.0)
+            except (TypeError, ValueError):
+                avg = 0.0
+            try:
+                price = float((quotes_map.get(sym) or {}).get("price") or 0.0)
+            except (TypeError, ValueError):
+                price = 0.0
+            value = price * amount
+            pnl = (price - avg) * amount if avg > 0 else 0.0
+            pnl_pct = (price / avg - 1) * 100 if avg > 0 else 0.0
+            positions.append({
+                "sym": sym,
+                "amount": amount,
+                "avg": avg,
+                "price": price,
+                "value": value,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "side": info.get("side", "long"),
+            })
+        positions.sort(key=lambda p: p["value"], reverse=True)
+
         # 触发布防（信号模式）：health.triggers: {sym: {entry_conditions, exit_conditions,
         # entry_target, first_trigger_at, ref_price}} → 前端直接渲染列表。
         triggers = []
@@ -845,6 +897,7 @@ class Snapshot:
             "picks": picks,
             "dead": dead,
             "verdicts": verdicts,
+            "positions": positions,
             "triggers": triggers,
             "radar": {"names": radar_names, "values": radar_values},
             "equity_hist": equity_hist,
