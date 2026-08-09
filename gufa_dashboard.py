@@ -110,13 +110,18 @@ HTML = r"""<!DOCTYPE html>
   /* ---------- 布局：grid-template-areas，每块独占卡片 ---------- */
   main { flex: 1; display: grid;
     grid-template-columns: 1.4fr 1fr;
-    grid-template-rows: 0.65fr 0.65fr 1.3fr 0.7fr;
+    grid-template-rows: 0.5fr 0.95fr 1.35fr 0.65fr;
     grid-template-areas:
       "equity    telemetry"
       "selection ancient"
       "decision  aisteps"
       "stream    stream";
     gap: 7px; min-height: 0; }
+  /* 竖屏：单列流式 */
+  @media (orientation: portrait) and (max-width: 820px){
+    main { grid-template-columns: 1fr; grid-template-rows: auto; grid-template-areas: unset; }
+    main > .card { margin-bottom: 7px; min-height: 120px; }
+  }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 7px 9px;
     display: flex; flex-direction: column; min-height: 0; position: relative; overflow: hidden;
     backdrop-filter: blur(6px); }
@@ -579,11 +584,8 @@ function render(d){
       }).join("");
       $("radarSyms").querySelectorAll(".rsym").forEach(el=>{
         el.onclick = ()=>{ radarSelSym = el.dataset.sym;
-          radarSym = radarSelSym; radarVals = radarAll[radarSelSym]||[0]*10;
+          radarSym = radarSelSym; radarVals = radarAll[radarSelSym]||[0,0,0,0,0,0,0,0,0,0];
           $("radarSym").textContent = "// "+radarSelSym.replace('/USDT','');
-          $("radarSyms").querySelectorAll(".rsym").forEach(x=>x.classList.remove("active"));
-          el.classList.add("active"); drawRadar(); };
-      });
     } else { $("radarSyms").innerHTML = ""; }
     drawRadar();
   }
