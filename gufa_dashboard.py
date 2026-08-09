@@ -423,9 +423,7 @@ function drawRadar(){
   ctx.clearRect(0,0,W,H);
   const N = radarNames.length, cx = W/2, cy = H/2, R = Math.min(W,H)/2 - 26;
   if (!N) { ctx.fillStyle="#4a6a8a"; ctx.font="12px Consolas";
-    ctx.fillText(currentMode==="signal"
-      ? "TRIGGER WATCH · "+curTriggers+" 布防 / "+curPositions+" 持仓"
-      : "NO SIGNAL", cx-74, cy); return; }
+    ctx.fillText(currentMode==="signal" ? "等待 AI 古法读数…" : "NO SIGNAL", cx-54, cy); return; }
   const ang = i => -Math.PI/2 + i*2*Math.PI/N;
   // 网格环
   for (let ring=1; ring<=4; ring++){
@@ -892,10 +890,11 @@ class Snapshot:
             ai_ok = True
             ai_busy = False
 
-        # 雷达：优先读真实十项 readings（信号模式从 last_readings，周期模式从 decisions）；
-        # 都没有时用系统状态指标占位（布防/持仓/行情/成交/屏蔽/AI）。
-        radar_names: List[str] = []
-        radar_values: List[float] = []
+        # 雷达：始终显示十项古法（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。
+        # 有真实 readings 时画数值面，无数据时全 0（只画网格骨架）。
+        TEN_METHODS = ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]
+        radar_names: List[str] = list(TEN_METHODS)
+        radar_values: List[float] = [0.0] * 10
         last_readings = None
         if health.get("mode") == "signal":
             dec = health.get("decisions") or {}
@@ -908,28 +907,14 @@ class Snapshot:
                 if isinstance(readings, dict) and readings:
                     last_readings = readings
                     break
-        if isinstance(last_readings, dict) and last_readings:
-            for name, rd in list(last_readings.items())[:10]:
-                radar_names.append(str(name))
-                try:
-                    radar_values.append(float(rd.get("confidence", 0.0)))
-                except Exception:
-                    radar_values.append(0.0)
-        else:
-            pos_count = len(state.get("positions") or {})
-            trigger_count = len(health.get("triggers") or {})
-            quote_count = len(health.get("quotes") or {})
-            trades = state.get("trades_today") or 0
-            blocked = len(state.get("depth_blocked") or {})
-            radar_names = ["布防", "持仓", "行情", "成交", "屏蔽", "AI"]
-            radar_values = [
-                min(1.0, trigger_count / 54.0),
-                min(1.0, pos_count / 10.0),
-                min(1.0, quote_count / 54.0),
-                min(1.0, trades / 10.0),
-                min(1.0, blocked / 20.0),
-                1.0 if ai_ok else 0.4,
-            ]
+        if isinstance(last_readings, dict):
+            for i, name in enumerate(TEN_METHODS):
+                rd = last_readings.get(name)
+                if isinstance(rd, dict):
+                    try:
+                        radar_values[i] = float(rd.get("confidence", 0.0))
+                    except Exception:
+                        radar_values[i] = 0.0
 
         # 订单审计尾部（最近 3 条）
         orders = []

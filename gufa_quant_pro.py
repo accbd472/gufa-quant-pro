@@ -3911,13 +3911,15 @@ class AIAdvisor:
         account_equity: float,
         position_quote: float,
         now_iso: str,
-    ) -> Tuple[List[TriggerCondition], str, str]:
+    ) -> Tuple[List[TriggerCondition], str, str, Optional[Dict[str, Any]]]:
         """AI-2 出场决策（信号触发模式）：按古法判断卖出条件，输出出场触发条件。
 
-        返回 (exit_conditions, summary, status)。status: "ok"=正常 | "error"=调用/响应失败。
+        返回 (exit_conditions, summary, status, readings)。
+        status: "ok"=正常 | "error"=调用/响应失败。
+        readings: 十项古法读数字典，AI 未提供时为 None。
         """
         if not self.config.enabled:
-            return [], "AI 已关闭，不设出场条件", "ok"
+            return [], "AI 已关闭，不设出场条件", "ok", None
         system = (
             "你是中国古法十项综合断卦师（奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱）。"
             "系统使用信号触发模式。现在你负责『出场决策』：为已持仓标的设定卖出触发条件。"
@@ -3932,6 +3934,9 @@ class AIAdvisor:
             "ref_price（number，基准价，必须使用给定持仓成本价）、"
             "note（string，中文说明卖出理由））"
             "。conditions 至少 1 条；若古法认为应继续持有，可只给 time_after 一条作为最迟复查。"
+            "readings（object，十项古法读数，key 为奇门/六壬/太乙/易经/风水/八字/梅花/紫微/八卦/四柱，"
+            "value 为 object 含 bias（bullish/bearish/neutral）、confidence（0..1）、reading（中文简述））"
+            "。readings 为可选字段，但建议每次都完整填写。"
         )
         request = {
             "symbol": symbol,
@@ -3950,13 +3955,13 @@ class AIAdvisor:
             ])
         except Exception as exc:  # noqa: BLE001
             self.log.error("AI-2 出场决策失败 %s: %s", symbol, exc)
-            return [], "AI-2 决策失败，沿用现有出场条件", "error"
+            return [], "AI-2 决策失败，沿用现有出场条件", "error", None
         try:
             parsed = require_json_object(json.loads(content), "AI-2 exit response")
-            reject_unknown(parsed, {"summary", "conditions"}, "AI-2 exit response")
+            reject_unknown(parsed, {"summary", "conditions", "readings"}, "AI-2 exit response")
         except (ConfigError, json.JSONDecodeError) as exc:
             self.log.warning("AI-2 响应结构无效 %s: %s", symbol, exc)
-            return [], "AI-2 响应无效，沿用现有出场条件", "error"
+            return [], "AI-2 响应无效，沿用现有出场条件", "error", None
         conditions: List[TriggerCondition] = []
         raw_conds = parsed.get("conditions")
         if isinstance(raw_conds, list):
@@ -3971,11 +3976,26 @@ class AIAdvisor:
                 except Exception:  # noqa: BLE001
                     continue
         summary = str(parsed.get("summary", "")).strip()[:200]
+        raw_readings = parsed.get("readings")
+        readings: Optional[Dict[str, Any]] = None
+        if isinstance(raw_readings, dict):
+            readings = {}
+            for name in ["奇门", "六壬", "太乙", "易经", "风水", "八字", "梅花", "紫微", "八卦", "四柱"]:
+                rd = raw_readings.get(name)
+                if isinstance(rd, dict):
+                    try:
+                        readings[name] = {
+                            "bias": str(rd.get("bias", "neutral")).strip().lower(),
+                            "confidence": max(0.0, min(1.0, float(rd.get("confidence", 0.0)))),
+                            "reading": str(rd.get("reading", ""))[:200],
+                        }
+                    except Exception:  # noqa: BLE001
+                        continue
         self.log.warning(
-            "AI-2 出场决策 %s | ref=%.4f conditions=%d | %s",
-            symbol, ref_price, len(conditions), summary,
+            "AI-2 出场决策 %s | ref=%.4f conditions=%d readings=%d | %s",
+            symbol, ref_price, len(conditions), len(readings or {}), summary,
         )
-        return conditions, summary, "ok"
+        return conditions, summary, "ok", readings
 
     def _aggregate_decision(
         self,
@@ -5324,10 +5344,14 @@ class GuFaQuantPro:
             paipan_payload = None
         position = self.store.state.positions.get(symbol)
         position_quote = float(position.amount * current_price) if position else 0.0
-        exit_conds, summary, status = self.ai.decide_exit(
+        exit_conds, summary, status, readings = self.ai.decide_exit(
             symbol, current_price, ref_price, paipan_payload,
             self._last_equity(), position_quote, iso_now(),
         )
+        # 缓存十项古法读数（按持仓币种），供大屏雷达展示。
+        if readings:
+            self.store.state.last_readings = readings
+            self.store.save()
         if status == "error":
             # AI-2 调用/响应失败：保留现有出场条件不覆盖，10 分钟后重试。
             self.store.state.trigger_skip_until[symbol] = (
