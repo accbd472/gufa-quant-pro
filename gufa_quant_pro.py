@@ -3063,8 +3063,8 @@ class AIAdvisor:
         self,
         config: AIConfig,
         logger: logging.Logger,
-        method_weights: Optional[Mapping[str, float]] = None,
         credentials: Optional[CredentialStore] = None,
+        method_weights: Optional[Mapping[str, float]] = None,
     ):
         self.config = config
         self.log = logger
