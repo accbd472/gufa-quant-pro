@@ -930,11 +930,18 @@ class Snapshot:
                     note = str(plan.get("reason") or o.get("reason") or "")[:80]
                 if len(note) > 70:
                     note = note[:70] + "…"
+                label = TRADE_EVENTS[ev]
+                # trigger_entry 但订单被取消/零成交 → 不算“买入”
+                if ev == "trigger_entry":
+                    fill = o.get("fill") if isinstance(o.get("fill"), dict) else None
+                    if fill and (fill.get("status") == "canceled" or float(fill.get("filled_amount", 0) or 0) <= 0):
+                        label = "✕ 未成"
+                        is_canceled = True
                 out.append({
                     "ts": str(o.get("ts", "")),
                     "time": _local_hhmmss(str(o.get("ts", ""))),
                     "date": _local_mmdd(str(o.get("ts", ""))),
-                    "label": TRADE_EVENTS[ev],
+                    "label": label,
                     "sym": sym,
                     "side": side,
                     "amount": amount,
