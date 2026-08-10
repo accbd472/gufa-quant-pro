@@ -193,6 +193,7 @@ HTML = r"""<!DOCTYPE html>
   .quote { display: flex; align-items: center; gap: 8px; font-size: 11px; }
   .quote.held { background: rgba(0,240,255,.06); border-left: 2px solid var(--cy); padding-left: 4px; }
   .quote .sym { width: 76px; color: var(--cy); white-space: nowrap; }
+  .quote .qavg { width: 66px; text-align: right; color: #5f7fa0; font-size: 10px; }
   .quote .qp { flex: 1; color: #e8f6ff; text-align: right; }
   .quote .qch { width: 62px; text-align: right; }
   .quote .qch.up { color: var(--gr); }
@@ -649,7 +650,9 @@ function render(d){
       const pnlCls = p.pnl_pct>0.0001 ? "up" : (p.pnl_pct<-0.0001 ? "down" : "");
       const arrow = p.pnl_pct>0.0001 ? "▲" : (p.pnl_pct<-0.0001 ? "▼" : "•");
       const act = p.sym===cur ? " posactive" : "";
+      const cost = p.avg ? Number(p.avg).toPrecision(7) : "--";
       return `<div class="quote held posrow${act}" data-sym="${p.sym}"><span class="sym">${String(p.sym).replace('/USDT','')}◆</span>
+        <span class="qavg">@${cost}</span>
         <span class="qp">${Number(p.price).toPrecision(6)}</span>
         <span class="qch ${pnlCls}">${arrow}${Math.abs(p.pnl_pct).toFixed(2)}%</span>
         <span class="qv">${Number(p.value).toFixed(0)}U</span></div>`;
