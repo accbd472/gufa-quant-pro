@@ -26,7 +26,8 @@ EQUITY_MAX_POINTS = 720      # 权益曲线最大点数（2s 采样 → 24h）
 LOG_TAIL = 120               # 日志尾部行数
 
 # AI 历史买卖动作：orders.audit.jsonl 中与交易动作相关的事件
-TRADE_EVENTS = {"trigger_entry": "买入", "trigger_exit": "卖出", "order_fill": "成交"}
+TRADE_EVENTS = {"trigger_entry": "买入", "trigger_exit": "卖出", "order_fill": "成交",
+                "trigger_entry_skip": "✕ 跳过", "depth_blocked": "⚠ 拦截"}
 
 # 大屏统一使用本地时区（Asia/Shanghai，固定 UTC+8，无夏令时）
 LOCAL_TZ = timezone(timedelta(hours=8))
@@ -228,6 +229,7 @@ HTML = r"""<!DOCTYPE html>
   .trade .side { font-weight: 700; flex-shrink: 0; }
   .trade .side.buy { color: var(--gr); }
   .trade .side.sell { color: var(--rd); }
+  .trade .side.skip { color: var(--am); font-size: 10px; }
   .trade .amt { color: #e8f6ff; }
   .trade .nt { color: #7aa7cc; font-size: 9px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
@@ -543,13 +545,15 @@ function renderTrades(list){
   if (!list || !list.length){ el.innerHTML = '<div class="empty">暂无交易动作</div>'; return; }
   el.innerHTML = list.map(t=>{
     const isSell = t.side==="sell";
-    const act = isSell ? "▼ 卖出" : "▲ 买入";
+    const isCancel = t.canceled;
+    const act = isCancel ? t.label : (isSell ? "▼ 卖出" : "▲ 买入");
+    const sideCls = isCancel ? "skip" : (isSell ? "sell" : "buy");
     const amt = t.amount ? Number(t.amount).toPrecision(4) : "--";
     const price = t.price ? Number(t.price).toPrecision(6) : "--";
     const val = t.value ? Number(t.value).toFixed(0)+"U" : "";
     return `<div class="trade"><div class="h"><span class="tm">${t.date} ${t.time}</span>
       <span class="sym">${t.sym.replace('/USDT','')}</span>
-      <span class="side ${isSell?"sell":"buy"}">${act}</span>
+      <span class="side ${sideCls}">${act}</span>
       <span class="amt">${amt} @ ${price} ${val}</span></div>
       ${t.note?`<div class="nt">${t.note}</div>`:""}</div>`;
   }).join("");
@@ -908,6 +912,7 @@ class Snapshot:
                 ev = str(o.get("event", ""))
                 if ev not in TRADE_EVENTS:
                     continue
+                is_canceled = ev in ("trigger_entry_skip", "depth_blocked")
                 plan = o.get("plan") or {}
                 sym = plan.get("symbol") or o.get("symbol") or ""
                 if not sym:
@@ -919,7 +924,9 @@ class Snapshot:
                 value = _num(plan.get("estimated_quote"))
                 cond = o.get("condition")
                 note = str(cond.get("note", "")) if isinstance(cond, dict) else ""
-                if not note:
+                if is_canceled:
+                    note = str(o.get("reason") or o.get("error") or note)[:80]
+                elif not note:
                     note = str(plan.get("reason") or o.get("reason") or "")[:80]
                 if len(note) > 70:
                     note = note[:70] + "…"
@@ -934,6 +941,7 @@ class Snapshot:
                     "price": price,
                     "value": value,
                     "note": note,
+                    "canceled": is_canceled,
                 })
             except Exception:
                 continue
