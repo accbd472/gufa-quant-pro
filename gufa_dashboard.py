@@ -325,9 +325,9 @@ HTML = r"""<!DOCTYPE html>
 <div class="grid"></div><div class="scan"></div><canvas id="stars"></canvas>
 <div id="app">
   <header>
-    <div class="logo">GUFA QUANT <small>PROTOCOL // 古法量化决策中枢</small></div>
-    <div class="st">SYSTEM <span class="led" id="ledSys"></span><span id="sysTxt">BOOT</span></div>
-    <div class="st">NET <span class="led" id="ledNet"></span><span id="netTxt">--</span></div>
+    <div class="logo">古法量化 <small>决策中枢</small></div>
+    <div class="st">系统 <span class="led" id="ledSys"></span><span id="sysTxt">启动</span></div>
+    <div class="st">网络 <span class="led" id="ledNet"></span><span id="netTxt">--</span></div>
     <div class="st">AI <span class="led" id="ledAI"></span><span id="aiTxt">--</span></div>
     <div class="sp"></div>
     <span class="tag" id="tagMode">--</span>
@@ -338,12 +338,12 @@ HTML = r"""<!DOCTYPE html>
   <main>
     <!-- 权益曲线 -->
     <div class="card" style="grid-area:equity">
-      <h3>EQUITY // 权益曲线</h3>
+      <h3>权益曲线</h3>
       <div class="chart"><canvas id="eqChart"></canvas></div>
     </div>
     <!-- 遥测（区间分析 + 日期切换） -->
     <div class="card" style="grid-area:telemetry">
-      <h3>TELEMETRY // 区间分析
+      <h3>区间分析
         <span style="display:inline-flex;gap:4px;margin-left:4px" id="dranges">
           <span class="rsym active" data-r="today">今日</span>
           <span class="rsym" data-r="yday">昨日</span>
@@ -363,27 +363,27 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <!-- 选股 -->
     <div class="card" style="grid-area:selection">
-      <h3>SELECTION // 每日初选 <span style="color:#5f7fa0;font-size:10px" id="selDate"></span></h3>
+      <h3>每日初选 <span style="color:#5f7fa0;font-size:10px" id="selDate"></span></h3>
       <div class="picks" id="picks"><div class="empty">等待初选…</div></div>
-      <h3 style="margin-top:4px;flex-shrink:0">EXCLUDED // 剔除</h3>
+      <h3 style="margin-top:4px;flex-shrink:0">今日剔除</h3>
       <div class="dead" id="dead" style="font-size:10px; max-height:36px; overflow-y:auto;flex-shrink:0"></div>
     </div>
     <!-- 十项古法雷达（正方形，紧凑） -->
     <div class="card" style="grid-area:ancient">
-      <h3>ANCIENT // 十项古法 <span id="radarSym" style="color:#5f7fa0;font-size:10px"></span></h3>
+      <h3>十项古法合参 <span id="radarSym" style="color:#5f7fa0;font-size:10px"></span></h3>
       <div class="chart" style="flex:1 1 auto;min-height:50px"><canvas id="radar"></canvas></div>
     </div>
     <!-- AI 历史买卖动作 -->
     <div class="card" style="grid-area:history">
-      <h3>AI TRADES // 历史买卖动作</h3>
+      <h3>AI 交易记录</h3>
       <div class="trades" id="trades"><div class="empty">加载中…</div></div>
     </div>
     <!-- 决策区（Tab 切换：持仓/行情/布防） -->
     <div class="card" style="grid-area:decision">
       <div class="tabs">
-        <div class="tab active" data-pane="pane-pos">POSITIONS // 持仓</div>
-        <div class="tab" data-pane="pane-quote">LIVE QUOTES // 行情</div>
-        <div class="tab" data-pane="pane-trig">TRIGGERS // 布防</div>
+        <div class="tab active" data-pane="pane-pos">持仓</div>
+        <div class="tab" data-pane="pane-quote">行情</div>
+        <div class="tab" data-pane="pane-trig">布防</div>
       </div>
       <div class="tab-panes">
         <div class="tab-pane active" id="pane-pos">
@@ -404,11 +404,11 @@ HTML = r"""<!DOCTYPE html>
     </div>
     <!-- 日志 -->
     <div class="card" style="grid-area:stream">
-      <h3>STREAM // 实时日志</h3>
+      <h3>实时日志</h3>
       <div class="logbox" id="log"></div>
     </div>
   </main>
-  <footer>GUFA QUANT PROTOCOL v2.1 // SSE+轮询双通道 // 区间分析 · AI 交易历史 // 数据源: runtime/state+health+equity+orders</footer>
+  <footer>古法量化协议 v2.1 // 数据: runtime/state+health+equity+orders</footer>
 </div>
 
 <script>
@@ -600,13 +600,13 @@ function render(d){
   curTriggers = (d.triggers&&d.triggers.length)||0;
   curPositions = d.position_count||0;
   // 状态灯
-  setLed("ledSys", d.status==="ok"?"ok":(d.status==="degraded"?"":"bad"), (d.status||"?").toUpperCase());
-  setLed("ledNet", d.net_ok?"ok":"bad", d.net_ok?"LINK":"DOWN");
+  setLed("ledSys", d.status==="ok"?"ok":(d.status==="degraded"?"":"bad"), {ok:"正常",halted:"暂停",degraded:"降级",error:"异常"}[d.status]||(d.status||"?"));
+  setLed("ledNet", d.net_ok?"ok":"bad", d.net_ok?"在线":"离线");
   const aiCls = d.ai_status==="ready"?"ok":(d.ai_status==="degraded"?"warn":(d.ai_busy?"busy":"bad"));
-  const aiTxt = d.ai_status==="ready"?"READY":(d.ai_status==="degraded"?"DEGRADED":(d.ai_busy?"BUSY":"DOWN"));
+  const aiTxt = d.ai_status==="ready"?"就绪":(d.ai_status==="degraded"?"降级":(d.ai_busy?"处理中":"离线"));
   setLed("ledAI", aiCls, aiTxt);
   $("tagMode").textContent = d.mode||"--";
-  $("tagSandbox").textContent = d.sandbox ? "SANDBOX" : "PRODUCTION";
+  $("tagSandbox").textContent = d.sandbox ? "模拟" : "实盘";
   // 遥测
   if (d.equity!=null){ $("mEquity").textContent = d.equity.toFixed(2); }
   $("telMeta").textContent = `成交 ${d.trades_today!=null?d.trades_today:"--"} · 持仓 ${d.position_count!=null?d.position_count:"--"} · 候选 ${d.candidates!=null?d.candidates:"--"} · 峰值 ${d.peak!=null?d.peak.toFixed(2):"--"} · 日初 ${d.day_start!=null?d.day_start.toFixed(2):"--"}`;
