@@ -18,7 +18,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 APP_NAME = "GuFaQuant-DASHBOARD"
 POLL_INTERVAL = 2.0          # SSE 推送间隔（秒）
@@ -495,7 +495,8 @@ function renderTenReadings(sym){
     const bias = it.bias || "neutral";
     const mark = bias==="bullish" ? "▲吉" : (bias==="bearish" ? "▼凶" : "•平");
     const cls = bias==="bullish" ? "ok" : (bias==="bearish" ? "fail" : "");
-    const cf = it.confidence!=null ? (it.confidence*100).toFixed(0)+"%" : "--";
+    // 置信度是 LLM 自报的伪概率，不展示；显示历史权重（strategy.weights）。
+    const cf = it.weight!=null ? ("权"+Number(it.weight).toFixed(2)) : "";
     return `<div class="aistep ${cls}"><span class="st">${mark}</span> <b>${n}</b> <span class="cf">${cf}</span><span class="rd">${it.reading||""}</span></div>`;
   }).filter(Boolean);
   if (!items.length){
@@ -748,8 +749,15 @@ def _tail(path: Path, n: int) -> List[str]:
 
 
 class Snapshot:
-    def __init__(self, state_dir: Path):
+    def __init__(self, state_dir: Path, method_weights: Optional[Mapping[str, float]] = None):
         self.state_dir = Path(state_dir)
+        # 十项古法历史权重（strategy.weights：历史地位 + 择时实战记录）。
+        self.method_weights: Dict[str, float] = dict(
+            method_weights or {
+                "奇门": 0.17, "六壬": 0.15, "易经": 0.14, "八字": 0.11, "八卦": 0.10,
+                "太乙": 0.08, "梅花": 0.08, "紫微": 0.07, "四柱": 0.06, "风水": 0.04,
+            }
+        )
         self.state_path = self.state_dir / "state.json"
         self.health_path = self.state_dir / "health.json"
         self.equity_path = self.state_dir / "equity.jsonl"
@@ -1218,11 +1226,13 @@ class Snapshot:
                         item = rd.get(name)
                         if isinstance(item, dict):
                             try:
-                                c = float(item.get("confidence", 0.0))
                                 b = str(item.get("bias") or "neutral").lower()
-                                # 带方向的分值：看多=+confidence，看空=-confidence，中性=0。
-                                # 否则雷达图只画强度不画方向，看跌也会显示"饱满/正面"。
-                                vals[i] = c if b == "bullish" else (-c if b == "bearish" else 0.0)
+                                # 历史权重 × 方向（不再用 LLM 自报 confidence）：
+                                # 权重来自 strategy.weights（历史地位/实战记录），
+                                # 奇门/六壬等主用之术轴长，风水等短轴，权重差异一目了然。
+                                w = float(self.method_weights.get(name, 0.0))
+                                s = 1.0 if b == "bullish" else (-1.0 if b == "bearish" else 0.0)
+                                vals[i] = w * s
                             except Exception:
                                 pass
                     radar_all[sym] = vals
@@ -1243,7 +1253,10 @@ class Snapshot:
             if isinstance(info, dict):
                 rd = info.get("readings")
                 if isinstance(rd, dict):
-                    radar_readings[sym] = {k: v for k, v in rd.items() if isinstance(v, dict)}
+                    radar_readings[sym] = {
+                        k: {**v, "weight": float(self.method_weights.get(k, 0.0))}
+                        for k, v in rd.items() if isinstance(v, dict)
+                    }
 
         # 订单审计尾部（最近 3 条）
         orders = []
@@ -1378,7 +1391,7 @@ def main() -> int:
         print(f"[{APP_NAME}] state_dir 不存在: {state_dir}", file=sys.stderr)
         return 1
 
-    Handler.snap = Snapshot(state_dir)
+    Handler.snap = Snapshot(state_dir, method_weights=cfg.get("strategy", {}).get("weights") or {})
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[{APP_NAME}] 科幻监控大屏已启动: http://{args.host}:{args.port}  (数据源: {state_dir})")
     try:

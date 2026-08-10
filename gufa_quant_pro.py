@@ -987,6 +987,11 @@ class AIConfig:
     timeout_seconds: int = 20
     fail_closed: bool = True
     minimum_allow_confidence: float = 0.60
+    # 十盘历史权重方向门（sentiment gate）：AI 决策不再用 LLM 自报的
+    # confidence（无统计含义），改用十项古法按历史权重（strategy.weights）
+    # 加权后的方向分：|ratio| < gate = 十盘势均力敌 → 按规则/HOLD；
+    # ratio <= -gate 且 AI 说买入 → 系统拦截降级 no_trade。
+    sentiment_gate: float = 0.15
     decision_mode: str = "bounded"
     max_output_tokens: int = 1200
     # 思考档位（reasoning 模型专用，如 deepseek-v4-flash）：low/medium/high/xhigh/max。
@@ -1007,7 +1012,7 @@ class AIConfig:
                 values[key] = require_json_bool(value, path)
             elif key in {"timeout_seconds", "max_output_tokens"}:
                 values[key] = require_json_int(value, path)
-            elif key == "minimum_allow_confidence":
+            elif key in {"minimum_allow_confidence", "sentiment_gate"}:
                 values[key] = require_json_number(value, path)
             else:
                 values[key] = require_json_string(value, path)
@@ -1016,6 +1021,8 @@ class AIConfig:
     def validate(self) -> None:
         if not 0 <= self.minimum_allow_confidence <= 1:
             raise ConfigError("ai.minimum_allow_confidence 必须在 0..1")
+        if not 0 <= self.sentiment_gate <= 0.5:
+            raise ConfigError("ai.sentiment_gate 必须在 0..0.5")
         if self.timeout_seconds < 1:
             raise ConfigError("ai.timeout_seconds 必须大于 0")
         if not 300 <= self.max_output_tokens <= 4000:
@@ -3056,12 +3063,21 @@ class AIAdvisor:
         self,
         config: AIConfig,
         logger: logging.Logger,
+        method_weights: Optional[Mapping[str, float]] = None,
         credentials: Optional[CredentialStore] = None,
     ):
         self.config = config
         self.log = logger
         self.credentials = credentials
         self.client: Any = None
+        # 十项古法历史权重（strategy.weights：历史地位 + 择时实战记录）。
+        # 用于 AI 决策的方向约束与雷达展示；缺省与 strategy 默认一致。
+        self.method_weights: Dict[str, float] = dict(
+            method_weights or {
+                "奇门": 0.17, "六壬": 0.15, "易经": 0.14, "八字": 0.11, "八卦": 0.10,
+                "太乙": 0.08, "梅花": 0.08, "紫微": 0.07, "四柱": 0.06, "风水": 0.04,
+            }
+        )
         self.last_error: str = ""  # 最近一次 AI 失败的可读原因（供日志/控制台排查）
         # AI 熔断器：连续失败达阈值后暂停 AI 请求，避免上游 503 时一波请求打爆
         # 自身限频（一次 tick 评估 54 币 × 内部 5 次重试 = 270 次请求）。
@@ -3297,6 +3313,32 @@ class AIAdvisor:
         if value <= 0.42:
             return "bearish"
         return "neutral"
+
+    def _weighted_method_ratio(self, readings: Any) -> Tuple[float, int]:
+        """十项古法历史权重加权方向分（替代 LLM 自报 confidence）。
+
+        每项古法按在中国历史上的地位与择时实战记录取权重 w_i
+        （strategy.weights），对方向加权：
+          S = Σ w_i * s_i，s_i: bullish=+1 / bearish=-1 / neutral=0
+          ratio = S / Σ w_i ∈ [-1, +1]
+        返回 (ratio, 覆盖方法数)。覆盖数 < 6 视为信息不足。
+        """
+        total_w = 0.0
+        score = 0.0
+        covered = 0
+        readings = readings or {}
+        for name, w in self.method_weights.items():
+            item = readings.get(name)
+            if not isinstance(item, dict):
+                continue
+            bias = str(item.get("bias") or "neutral").strip().lower()
+            s = 1.0 if bias == "bullish" else (-1.0 if bias == "bearish" else 0.0)
+            total_w += w
+            score += w * s
+            covered += 1
+        if total_w <= 0:
+            return 0.0, 0
+        return score / total_w, covered
 
     def rule_fallback(
         self,
@@ -4094,10 +4136,20 @@ class AIAdvisor:
                         }
                     except Exception:  # noqa: BLE001 单项损坏忽略
                         continue
+        # 系统侧方向约束：AI-2 可自由决策，但十盘历史权重加权强空时拦截买入。
+        ratio, covered = self._weighted_method_ratio(readings)
+        if covered >= 6 and ratio <= -self.config.sentiment_gate and decision == "enter":
+            self.log.warning(
+                "AI-2 入场拦截 %s | 十盘历史加权方向 %.2f <= %.2f，decision=enter 降级 no_trade",
+                symbol, ratio, -self.config.sentiment_gate,
+            )
+            decision = "no_trade"
+            conditions = []
+            summary = (f"{summary} | 十盘历史加权强空({ratio:.2f})，系统拦截买入。")[:200]
         self.log.warning(
-            "AI-2 入场决策 %s | decision=%s target=%s conditions=%d first_at=%s readings=%d | %s",
+            "AI-2 入场决策 %s | decision=%s target=%s conditions=%d first_at=%s readings=%d ratio=%+.2f | %s",
             symbol, decision, target_level, len(conditions), first_at[:19] or "-",
-            len(readings or {}), summary,
+            len(readings or {}), ratio, summary,
         )
         return conditions, summary, decision, target_level, readings
 
@@ -4474,7 +4526,7 @@ class GuFaQuantPro:
         except Exception as exc:  # noqa: BLE001 排盘降级：择时回退立即监听、AI 载荷为空
             self.log.warning("排盘服务初始化失败，古法择时/盘面载荷降级: %s", exc)
         self.risk = RiskManager(config.risk, self.store, logger)
-        self.ai = AIAdvisor(config.ai, logger, credentials)
+        self.ai = AIAdvisor(config.ai, logger, credentials, method_weights=config.strategy.weights)
         self.ai.bind_strategy_weights(config.strategy.weights)
         self.audit_path = self.state_dir / "orders.audit.jsonl"
         self.stop_event = threading.Event()
@@ -4787,7 +4839,18 @@ class GuFaQuantPro:
                 f"confidence={ai.confidence:.2f}; requested={requested:.2f}; "
                 f"rule_ref={rule_target:.2f}; current={current_fraction:.2f}"
             )
-        if ai.confidence < self.config.ai.minimum_allow_confidence:
+        # 置信度门槛：优先用十盘历史权重加权一致度（LLM 自报 confidence 无统计含义）。
+        ratio, covered = self._weighted_method_ratio(ai.readings)
+        if covered >= 6:
+            if abs(ratio) < self.config.ai.sentiment_gate:
+                requested = current_fraction
+                confidence_reason = (
+                    f"十盘历史加权一致度 |ratio|={abs(ratio):.2f} < "
+                    f"{self.config.ai.sentiment_gate:.2f}; HOLD"
+                )
+            else:
+                confidence_reason = f"十盘历史加权方向={ratio:+.2f}"
+        elif ai.confidence < self.config.ai.minimum_allow_confidence:
             requested = current_fraction
             confidence_reason = (
                 f"AI confidence {ai.confidence:.2f} < "
@@ -7014,7 +7077,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise ConfigError(
                 f"缺少 AI 凭据: {config.ai.api_key_env}。请先在交互终端运行 setup"
             )
-        advisor = AIAdvisor(config.ai, logging.getLogger(f"{APP_NAME}.ai-check"), credentials)
+        advisor = AIAdvisor(config.ai, logging.getLogger(f"{APP_NAME}.ai-check"), credentials, method_weights=config.strategy.weights)
         print(json.dumps(advisor.schema_check(), ensure_ascii=False, indent=2))
         print("AI_SCHEMA_TEST=PASS")
         return 0
