@@ -1221,6 +1221,10 @@ class Snapshot:
             if isinstance(info, dict):
                 rd = info.get("readings")
                 if isinstance(rd, dict) and rd:
+                    # 显示层归一化：轴值 = (权重 × 方向) / 最大权重。
+                    # 直接画权重会让所有轴只有半径的 ~17%（权重最大 0.17），
+                    # 雷达图缩成一团；归一化后最大权重轴满格，权重比例不变。
+                    max_w = max((float(self.method_weights.get(n, 0.0)) for n in TEN_METHODS), default=0.0) or 1.0
                     vals = [0.0] * 10
                     for i, name in enumerate(TEN_METHODS):
                         item = rd.get(name)
@@ -1232,7 +1236,7 @@ class Snapshot:
                                 # 奇门/六壬等主用之术轴长，风水等短轴，权重差异一目了然。
                                 w = float(self.method_weights.get(name, 0.0))
                                 s = 1.0 if b == "bullish" else (-1.0 if b == "bearish" else 0.0)
-                                vals[i] = w * s
+                                vals[i] = w * s / max_w
                             except Exception:
                                 pass
                     radar_all[sym] = vals
