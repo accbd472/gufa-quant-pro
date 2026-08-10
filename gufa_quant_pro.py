@@ -4372,7 +4372,7 @@ class AIAdvisor:
         market_context: Optional[Mapping[str, Any]] = None,
     ) -> AIDecision:
         readings_payload = {
-            name: {"bias": r.bias, "confidence": r.confidence, "reading": r.reading}
+            name: {"bias": r.bias, "confidence": r.confidence, "reading": r.reading[:60]}
             for name, r in readings.items()
         }
         request = {
@@ -4840,7 +4840,7 @@ class GuFaQuantPro:
                 f"rule_ref={rule_target:.2f}; current={current_fraction:.2f}"
             )
         # 置信度门槛：优先用十盘历史权重加权一致度（LLM 自报 confidence 无统计含义）。
-        ratio, covered = self._weighted_method_ratio(ai.readings)
+        ratio, covered = self.ai._weighted_method_ratio(ai.readings)
         if covered >= 6:
             if abs(ratio) < self.config.ai.sentiment_gate:
                 requested = current_fraction
@@ -5361,8 +5361,6 @@ class GuFaQuantPro:
                 continue  # 已持仓标的只管理出场
             if paused:
                 continue
-            if self._depth_blocked_today(symbol):
-                continue  # 当日深度不足缓存
             # AI-2 冷却：古法判定暂不交易/调用失败，未到时间不重复唤醒。
             if skip_until.get(symbol) and now_iso < skip_until[symbol]:
                 continue
@@ -5608,9 +5606,10 @@ class GuFaQuantPro:
             # 深度不足/滑点超限：反馈 AI 仲裁缩量买入或放弃（只缩一次，仍失败则当日屏蔽）。
             if self._retry_downsize_entry(symbol, plan, price, ts, cond, exc):
                 return
-            # 非深度/滑点类失败（交易所限额、No market data 等）：当日屏蔽避免刷屏重试。
-            self.log.error("触发入场下单失败 %s: %s", symbol, exc)
-            self._block_depth_today(symbol, str(exc))
+            # 触发失败：清掉布防，交还 AI-2 下次 tick 重新评估（不加冷却、不屏蔽当日）。
+            self.log.error("触发入场失败 %s，标记交还 AI-2 重判 | 下单失败: %s", symbol, exc)
+            self.store.state.triggers.pop(symbol, None)
+            self.store.save()
             append_jsonl(self.audit_path, {
                 "ts": iso_now(), "event": "trigger_entry_skip",
                 "symbol": symbol, "reason": "下单失败",
@@ -5652,8 +5651,9 @@ class GuFaQuantPro:
             plan.symbol, plan.side, plan.amount, plan.reference_price
         )
         if info is None:
-            self.log.warning("%s 订单簿评估失败，保守放弃（%s）", symbol, reason)
-            self._block_depth_today(symbol, message)
+            self.log.warning("触发入场失败 %s，标记交还 AI-2 重判 | 订单簿评估失败（%s）", symbol, reason)
+            self.store.state.triggers.pop(symbol, None)
+            self.store.save()
             return True
         action, amount_pct = self.ai.decide_downsize(
             symbol,
@@ -5667,8 +5667,9 @@ class GuFaQuantPro:
             iso_now(),
         )
         if action != "buy" or amount_pct <= 0:
-            self.log.warning("AI 判定放弃 %s（%s）：当日本日不再重试", symbol, reason)
-            self._block_depth_today(symbol, message)
+            self.log.warning("触发入场失败 %s，标记交还 AI-2 重判 | AI判定放弃（%s）", symbol, reason)
+            self.store.state.triggers.pop(symbol, None)
+            self.store.save()
             append_jsonl(self.audit_path, {
                 "ts": iso_now(), "event": "trigger_entry_skip",
                 "symbol": symbol, "reason": reason,
@@ -5693,8 +5694,9 @@ class GuFaQuantPro:
         try:
             fill = self.gateway.execute(new_plan)
         except Exception as exc2:  # noqa: BLE001 缩量后仍失败，当日屏蔽不再重试
-            self.log.error("AI 缩量后仍失败 %s: %s", symbol, exc2)
-            self._block_depth_today(symbol, message)
+            self.log.error("触发入场失败 %s，标记交还 AI-2 重判 | 缩量后仍失败: %s", symbol, exc2)
+            self.store.state.triggers.pop(symbol, None)
+            self.store.save()
             append_jsonl(self.audit_path, {
                 "ts": iso_now(), "event": "trigger_entry_skip",
                 "symbol": symbol, "reason": reason,
