@@ -1010,7 +1010,7 @@ def test_ai_check_cli_never_constructs_trading_controller(
     store.save()
 
     class FakeAdvisor:
-        def __init__(self, config, logger, credentials):
+        def __init__(self, config, logger, credentials, method_weights=None):
             assert config.enabled is True
             assert credentials.source("TEST_AI_KEY") == "credential-store"
 
@@ -1036,6 +1036,7 @@ def make_controller_for_bounds(mode="bounded", minimum=0.6):
     controller.config = SimpleNamespace(
         ai=SimpleNamespace(decision_mode=mode, minimum_allow_confidence=minimum)
     )
+    controller.ai = SimpleNamespace(_weighted_method_ratio=lambda readings: (0.0, 0))
     return controller
 
 
@@ -1279,7 +1280,7 @@ def test_ai_reasoning_effort_config() -> None:
 
 
 def test_ai_reasoning_effort_passed_to_api() -> None:
-    captured: Dict[str, Any] = {}
+    captured: dict = {}
 
     def fake_create(**kwargs):
         captured.update(kwargs)
@@ -1297,7 +1298,7 @@ def test_ai_reasoning_effort_passed_to_api() -> None:
             },
             ensure_ascii=False,
         )
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+        return [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content))])]
 
     # 显式 low
     cfg = g.AIConfig(enabled=True, model="deepseek-v4-flash-0731", reasoning_effort="low")
@@ -1712,6 +1713,7 @@ def test_swap_execute_sets_posside_and_margin_mode(tmp_path: Path, monkeypatch) 
     gateway.estimate_vwap = lambda symbol, side, amount, price: (price, 0.0)
 
     captured = {}
+    created_order: dict = {}
 
     def fake_set_leverage(lev, symbol, params):
         captured["leverage"] = (lev, symbol, params)
@@ -1719,16 +1721,16 @@ def test_swap_execute_sets_posside_and_margin_mode(tmp_path: Path, monkeypatch) 
 
     def fake_create_order(symbol, order_type, side, amount, price, params):
         captured["order"] = (symbol, order_type, side, amount, price, params)
-        return {"id": "swap-1", "status": "closed", "filled": amount,
-                "average": 50000.0, "fee": {"cost": 0.0}}
+        created_order.update(
+            {"id": "swap-1", "status": "closed", "filled": amount,
+             "average": 50000.0, "fee": {"cost": 0.0}}
+        )
+        return dict(created_order)
 
     gateway.client = SimpleNamespace(
         set_leverage=fake_set_leverage,
         create_order=fake_create_order,
-        fetch_order=lambda symbol, order_id: {
-            "id": order_id, "status": "closed", "filled": amount,
-            "average": 50000.0, "fee": {"cost": 0.0},
-        },
+        fetch_order=lambda symbol, order_id: dict(created_order),
     )
     monkeypatch.setattr(g.ExchangeGateway, "_network_error_types", staticmethod(lambda: (TimeoutError,)))
     gateway._wait_for_order = lambda symbol, order_id, initial: {
