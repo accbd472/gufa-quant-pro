@@ -11,7 +11,6 @@ OKX v5 实测语义（与文档相反）：
 """
 import datetime
 import json
-import os
 import time
 
 import requests
