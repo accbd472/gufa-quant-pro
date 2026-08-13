@@ -218,17 +218,47 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any], mode: int = 0o600)
         os.chmod(temp, mode)
     except OSError:
         pass
-    # Windows：目标文件可能被其他进程（如 console/dashboard）短暂以读方式
-    # 打开，os.replace 会抛 PermissionError(WinError 5)。短重试后仍失败再抛。
-    for attempt in range(4):
+    # Windows：目标文件可能被其他进程（如 console/dashboard/杀软）短暂以读方式
+    # 打开，os.replace 会抛 PermissionError(WinError 5)。递增退避重试；
+    # 仍失败则删除临时文件再抛，避免孤儿 tmp 堆积占盘。
+    last_exc: Optional[OSError] = None
+    for attempt in range(8):
         try:
             os.replace(str(temp), str(path))
             return
-        except PermissionError:
-            if attempt < 3:
-                time.sleep(0.2 * (attempt + 1))
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(min(0.15 * (attempt + 1), 1.0))
+    try:
+        os.unlink(temp)
+    except OSError:
+        pass
+    raise last_exc
+
+
+def cleanup_orphan_tmp_files(directory: Path, max_age_seconds: float = 300.0) -> int:
+    """删除目录中原子写盘遗留的临时文件（崩溃/被替换的旧实例产生）。
+
+    只清理 mtime 超过 max_age_seconds 的文件——活实例的 tmp 只存在毫秒级，
+    误删风险极低。返回删除数量。"""
+    removed = 0
+    now = time.time()
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        name = entry.name
+        if not (name.startswith(".") and name.endswith(".tmp")):
+            continue
+        try:
+            if now - entry.stat().st_mtime < max_age_seconds:
                 continue
-            raise
+            entry.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
@@ -7152,6 +7182,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     lock_path = state_dir / "gufa_quant.lock"
     with InstanceLock(lock_path):
+        # 启动时清理上一次运行（崩溃/被杀）遗留的原子写临时文件。
+        cleaned = cleanup_orphan_tmp_files(state_dir)
+        if cleaned:
+            logger.info("启动清理: 删除 %d 个遗留临时文件", cleaned)
         app = GuFaQuantPro(config, logger, credentials)
         if args.command == "validate":
             daily_selection = app._daily_selection()
