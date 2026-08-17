@@ -161,48 +161,115 @@ class LiurenPaipan(BasePaipan):
         shi_zhi: str,
         tianpan: dict[str, str],
     ):
-        """九宗门取初传（简化实现：贼克→比用→涉害→遥克→昴星/别责/八专/伏吟/返吟）。"""
-        # 伏吟 / 返吟
-        if jiang_zhi == shi_zhi:
-            return day_zhi, "伏吟", ["天地盘同位，伏吟课"]
-        if (_ke(jiang_zhi, shi_zhi) or _ke(shi_zhi, jiang_zhi)) and (
-            ZHI_ORDER.index(jiang_zhi) - ZHI_ORDER.index(shi_zhi)
-        ) % 12 == 6:
-            return day_zhi, "返吟", ["天地盘对冲，返吟课"]
+        """九宗门取初传（8.9 重写：贼克→比用→涉害→遥克→昴星/别责/八专/伏吟/返吟）。"""
+        Z = ZHI_ORDER
 
-        # 八专：日干寄宫与日支相同
-        if GAN_JI_GONG.get(day_gan) == day_zhi:
-            return day_zhi, "八专", ["日干寄宫与日支同，八专课"]
+        def upper_of(lower: str) -> str:
+            return tianpan.get(lower, lower)
 
-        # 找克：上克下（克）、下克上（贼）
-        ke_list: list[tuple] = []
+        gan_ke_gong = GAN_JI_GONG.get(day_gan, day_zhi)
+        yang_day = day_gan in YANG_GAN
+
+        # 四课各课上下神克战
+        shang_ke: list[tuple[int, str]] = []   # 上克下（取上神为用）
+        xia_zei: list[tuple[int, str]] = []    # 下贼上（取上神为用）
         for idx, (lower, upper) in enumerate(lesson_pairs, 1):
             if _ke(upper, lower):
-                ke_list.append((idx, upper, "上克下"))
+                shang_ke.append((idx, upper))
             elif _ke(lower, upper):
-                ke_list.append((idx, lower, "下贼上"))
+                xia_zei.append((idx, upper))
 
-        if len(ke_list) == 1:
-            idx, zhi, kind = ke_list[0]
-            return zhi, "贼克", [f"第{idx}课{kind}，贼克法取{JIANG_NAMES[zhi]}"]
-        if len(ke_list) > 1:
-            # 比用：取与日干阴阳相同者
-            yang_day = day_gan in YANG_GAN
-            same = [k for k in ke_list if (k[1] in YANG_ZHI) == yang_day]
-            chosen = same[0] if same else ke_list[0]
-            idx, zhi, kind = chosen
-            return zhi, "比用", [f"第{idx}课{kind}，比用法取{JIANG_NAMES[zhi]}"]
+        # ---- 伏吟（天地盘同位）----
+        if jiang_zhi == shi_zhi:
+            if xia_zei:
+                idx, chu = xia_zei[0]
+                return chu, "伏吟·重审", [f"天地盘同位伏吟；第{idx}课下贼上，取{JIANG_NAMES[chu]}"]
+            if shang_ke:
+                idx, chu = shang_ke[0]
+                return chu, "伏吟·元首", [f"天地盘同位伏吟；第{idx}课上克下，取{JIANG_NAMES[chu]}"]
+            chu = upper_of(day_zhi) if yang_day else upper_of(gan_ke_gong)
+            return chu, "伏吟", ["伏吟无克：" + ("阳日取日支上神" if yang_day else "阴日取干上神") + "为初传"]
 
-        # 无克：遥克——日干所克之课神（先上神后下支）
+        # ---- 返吟（天地盘对冲）----
+        if (Z.index(jiang_zhi) - Z.index(shi_zhi)) % 12 == 6:
+            if xia_zei:
+                idx, chu = xia_zei[0]
+                return chu, "返吟·重审", [f"天地盘对冲返吟；第{idx}课下贼上，取{JIANG_NAMES[chu]}"]
+            if shang_ke:
+                idx, chu = shang_ke[0]
+                return chu, "返吟·元首", [f"天地盘对冲返吟；第{idx}课上克下，取{JIANG_NAMES[chu]}"]
+            sanhe_ma = {"寅午戌": "申", "申子辰": "寅", "巳酉丑": "亥", "亥卯未": "巳"}
+            ma = next((m for g, m in sanhe_ma.items() if day_zhi in g), "寅")
+            return ma, "返吟", [f"返吟无克，取驿马{JIANG_NAMES[ma]}为初传"]
+
+        # ---- 八专（干支同位）----
+        if gan_ke_gong == day_zhi:
+            base = upper_of(gan_ke_gong)
+            chu = Z[(Z.index(base) + (3 if yang_day else -3)) % 12]
+            way = "阳日顺数三神" if yang_day else "阴日逆数三神"
+            return chu, "八专", [f"日干寄宫{gan_ke_gong}与日支同位，八专课；{way}取{JIANG_NAMES[chu]}"]
+
+        # ---- 贼克（古法：贼优先于克）----
+        if len(xia_zei) == 1:
+            idx, chu = xia_zei[0]
+            return chu, "重审", [f"一下贼上，重审课；取{JIANG_NAMES[chu]}为初传"]
+        if len(xia_zei) >= 2:
+            chosen, note = self._biyong_or_shehai(xia_zei, day_gan, tianpan)
+            return chosen[1], ("比用" if "比用" in note else "涉害"), [note]
+        if len(shang_ke) == 1:
+            idx, chu = shang_ke[0]
+            return chu, "元首", [f"一上克下，元首课；取{JIANG_NAMES[chu]}为初传"]
+        if len(shang_ke) >= 2:
+            chosen, note = self._biyong_or_shehai(shang_ke, day_gan, tianpan)
+            return chosen[1], ("比用" if "比用" in note else "涉害"), [note]
+
+        # ---- 遥克（先上神后下支）----
         for idx, (lower, upper) in enumerate(lesson_pairs, 1):
-            # 日干五行：天干五行
             if _ke_gan(day_gan, upper):
-                return upper, "遥克", [f"第{idx}课日干遥克上神{JIANG_NAMES[upper]}"]
+                return upper, "遥克·蒿矢", [f"四课无克；日干遥克第{idx}课上神{JIANG_NAMES[upper]}（蒿矢课）"]
+        for idx, (lower, upper) in enumerate(lesson_pairs, 1):
             if _ke_gan(day_gan, lower):
-                return lower, "遥克", [f"第{idx}课日干遥克下支{JIANG_NAMES[lower]}"]
+                return lower, "遥克·弹射", [f"四课无克；日干遥克第{idx}课下支{JIANG_NAMES[lower]}（弹射课）"]
 
-        # 昴星课：无克无遥克
-        return "酉", "昴星", ["四课无克、日干无遥克，昴星课（简化取酉）"]
+        # ---- 别责（三课备无克无遥）----
+        n_distinct = len({lp[0] for lp in lesson_pairs})
+        if n_distinct == 3:
+            if yang_day:
+                he_gan = {"甲": "己", "己": "甲", "乙": "庚", "庚": "乙", "丙": "辛",
+                          "辛": "丙", "丁": "壬", "壬": "丁", "戊": "癸", "癸": "戊"}
+                he = he_gan.get(day_gan, day_gan)
+                chu = upper_of(GAN_JI_GONG.get(he, day_zhi))
+                return chu, "别责", [f"三课备无克无遥，别责课；阳日取干合（{day_gan}合{he}）寄宫上神{JIANG_NAMES[chu]}"]
+            sanhe_qian = {"寅": "午", "午": "戌", "戌": "寅", "申": "子", "子": "辰", "辰": "申",
+                          "巳": "酉", "酉": "丑", "丑": "巳", "亥": "卯", "卯": "未", "未": "亥"}
+            chu = sanhe_qian.get(day_zhi, day_zhi)
+            return chu, "别责", [f"三课备无克无遥，别责课；阴日取日支三合前支{JIANG_NAMES[chu]}为初传"]
+
+        # ---- 昴星（无克无遥，四课全）----
+        if yang_day:
+            chu = tianpan.get("酉", "酉")
+            return chu, "昴星·虎视", [f"无克无遥，阳日昴星（虎视）：取酉宫上神{JIANG_NAMES[chu]}为初传"]
+        chu = tianpan.get("酉", "酉")
+        return chu, "昴星·冬蛇掩目", ["无克无遥，阴日昴星（冬蛇掩目）：取酉宫上神为初传（阴日取地盘酉）"]
+
+    def _biyong_or_shehai(self, ke_list, day_gan: str, tianpan: dict[str, str]):
+        """比用/涉害取用（8.9）。ke_list: [(课序, 上神)]。"""
+        yang_day = day_gan in YANG_GAN
+        same = [k for k in ke_list if (k[1] in YANG_ZHI) == yang_day]
+        if len(same) == 1:
+            idx, chu = same[0]
+            yin_yang = "阳" if yang_day else "阴"
+            return (idx, chu), f"二克比用：取与日干{yin_yang}相同之{JIANG_NAMES[chu]}为初传"
+        # 涉害：受克深者（历归本家受克计数）
+        def shou_ke_count(zhi: str) -> int:
+            n = 0
+            for di in ZHI_ORDER:
+                if _ke(tianpan.get(di, di), di):
+                    n += 1
+            return n
+        best = max(ke_list, key=lambda k: shou_ke_count(k[1]))
+        idx, chu = best
+        return (idx, chu), f"涉害法：{JIANG_NAMES[chu]}历归本家受克最深（{shou_ke_count(chu)}处），取为初传"
 
     def natal(self, ctx) -> LiurenChart:
         return self._build(ctx, "natal")

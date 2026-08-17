@@ -71,7 +71,7 @@ except ImportError as exc:  # pragma: no cover
     _PAIPAN_IMPORT_ERROR = exc
 
 APP_NAME = "GuFaQuant-Pro"
-APP_VERSION = "8.8.0"
+APP_VERSION = "8.9.0"
 CONFIG_VERSION = 3
 STATE_VERSION = 5
 CREDENTIALS_VERSION = 2
@@ -1661,6 +1661,34 @@ class MarketDataValidator:
         return df.reset_index(drop=True)
 
 
+def _audit_paipan(symbol: str, candle_time: str, result, signals: dict) -> None:
+    """排盘审计落盘（8.9）：十盘关键要素一行 JSONL，供事后核查过程真实。"""
+    try:
+        current = result.current or {}
+        natal = result.natal or {}
+        qm = current.get("奇门", {})
+        lr = current.get("六壬", {})
+        bz = current.get("八字", {})
+        entry = {
+            "ts": iso_now(),
+            "symbol": symbol,
+            "candle": candle_time,
+            "ganzhi": (current.get("奇门", {}) or {}).get("ganzhi", ""),
+            "jieqi": (current.get("奇门", {}) or {}).get("jieqi"),
+            "qimen": {"dun": qm.get("dun"), "ju": qm.get("ju"), "yuan": qm.get("yuan"),
+                       "zhifu": qm.get("zhifu"), "zhishi": qm.get("zhishi")},
+            "liuren": {"jiang": lr.get("yuejiang"), "ke": lr.get("ke_break"),
+                        "trans": lr.get("three_transmissions")},
+            "bazi": {"dm": bz.get("day_master"), "strength": bz.get("strength")},
+            "scores": {k: round(v, 4) for k, v in signals.items()},
+            "errors": {k: v for k, v in result.diagnostics.items() if k.startswith("error.")},
+            "natal_ok": sorted(natal.keys()),
+        }
+        append_jsonl(Path("runtime") / "paipan_audit.jsonl", entry)
+    except Exception:  # noqa: BLE001 - 审计失败不影响交易主流程
+        pass
+
+
 def build_paipan_service(paipan_config: Any) -> PaipanService:
     """组装十项排盘器并返回 PaipanService（report/backtest/策略共用）。"""
     if not PAIPAN_AVAILABLE:
@@ -1718,6 +1746,7 @@ class StrategyEngine:
             "paipan": result.to_dict(),
             "paipan_score": {name: signals[name] for name in STRATEGY_NAMES},
         }
+        _audit_paipan(symbol, candle_time, result, signals)
         return SignalResult(clamp(score), signals, diagnostics, candle_time)
 
     def _calculate_technical(self, raw: pd.DataFrame) -> SignalResult:

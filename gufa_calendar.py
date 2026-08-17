@@ -50,6 +50,11 @@ class PaipanTime:
     jieqi: str | None = None      # 当前所在节气（可能为空）
     next_jieqi: str | None = None  # 下一个节气
     xun_kong: str | None = None   # 日旬空亡
+    # ---- 8.9 排盘补全：农历月日 / 闰月 / 节气月序 ----
+    lunar_month: int = 0             # 农历月（1..12；闰月取正值，另见 lunar_month_leap）
+    lunar_month_leap: bool = False   # 是否闰月
+    lunar_day: int = 0               # 农历日（1..30）
+    jieqi_month: int = 0             # 节气月序（立春=1 寅月 … 小寒=12 丑月）
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -72,6 +77,7 @@ class PaipanTime:
 
 
 SHICHEN_NAMES = ["子", "丑", "寅", "卯", "辰", "巳", "午", "未", "申", "酉", "戌", "亥"]
+ZHI_ORDER = "子丑寅卯辰巳午未申酉戌亥"
 
 
 class CalendarService:
@@ -138,11 +144,22 @@ class CalendarService:
         except Exception:  # noqa: BLE001 - 节气缺失不影响排盘主流程
             next_jieqi = None
 
+        # ---- 8.9 排盘补全：农历月日（闰月归正） / 节气月序 ----
+        lmonth_raw = lunar.getMonth()          # lunar_python：闰月返回负数
+        lunar_month = abs(lmonth_raw) if lmonth_raw else 1
+        lunar_month_leap = lmonth_raw < 0
+        lunar_day = lunar.getDay()
+        # 节气月序：以月柱地支定位（立春起寅月=1），比公历月更符合古法
+        month_zhi = month_gz[1]
+        jieqi_month = (ZHI_ORDER.index(month_zhi) - 2) % 12 + 1
+
         notes: list[str] = []
         if self.config.true_solar_time:
             notes.append(f"真太阳时修正 {correction:+.1f} 分钟（经度 {self.config.longitude}°E）")
         if note:
             notes.append(note)
+        if lunar_month_leap:
+            notes.append(f"闰{lunar_month}月（古法排盘以月将/节气分界，不受闰月影响）")
 
         return PaipanTime(
             solar_dt=true_dt,
@@ -162,6 +179,10 @@ class CalendarService:
             jieqi=jieqi,
             next_jieqi=next_jieqi,
             xun_kong=lunar.getDayXunKong(),
+            lunar_month=lunar_month,
+            lunar_month_leap=lunar_month_leap,
+            lunar_day=lunar_day,
+            jieqi_month=jieqi_month,
             notes=notes,
         )
 

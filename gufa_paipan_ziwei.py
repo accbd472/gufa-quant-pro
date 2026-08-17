@@ -98,7 +98,8 @@ class ZiweiPaipan(BasePaipan):
             ctx.solar_dt.hour, ctx.solar_dt.minute, ctx.solar_dt.second,
         )
         lunar = solar.getLunar()
-        lmonth = lunar.getMonth()          # 农历月（含闰月标记）
+        lmonth_raw = lunar.getMonth()      # lunar_python：闰月返回负数
+        lmonth = abs(lmonth_raw) if lmonth_raw else 1   # 8.9：闰月归正（闰月沿用本月数）
         lday = lunar.getDay()              # 农历日
         year_gz = lunar.getYearInGanZhi()
         year_gan = year_gz[0]
@@ -188,8 +189,9 @@ class ZiweiPaipan(BasePaipan):
             palaces[name] = in_palace
 
         # 长生十二神（简：按五行局长生位起，此处仅列名录标注）
+        leap_note = "（闰月）" if lmonth_raw < 0 else ""
         notes = [
-            f"农历{lmonth}月{lday}日（{year_gz}年），{ju_name}",
+            f"农历{lmonth}月{lday}日{leap_note}（{year_gz}年），{ju_name}",
             f"命宫{ZHI_ORDER[ming]}、身宫{ZHI_ORDER[shen]}",
             "安星法采用通行三合派（维基/《紫微斗数全书》体系）",
         ]

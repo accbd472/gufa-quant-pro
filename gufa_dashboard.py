@@ -320,6 +320,20 @@ HTML = r"""<!DOCTYPE html>
     main { grid-template-rows: 1.1fr 1.2fr 1fr; }
   }
   ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-thumb { background: rgba(0,240,255,.25); border-radius: 3px; }
+
+  /* ===== 8.9 排盘标签页 ===== */
+  .ppwrap { display:flex; flex-direction:column; gap:8px; overflow-y:auto; padding:2px; }
+  .pphead { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:baseline;
+            border-bottom:1px dashed rgba(0,240,255,.2); padding-bottom:6px; }
+  .pphead .gz { font-size:15px; color:var(--cy); letter-spacing:2px; }
+  .pphead .meta { font-size:10px; color:#5f7fa0; }
+  .pprow { display:flex; flex-wrap:wrap; gap:8px; }
+  .ppcard { flex:1 1 240px; min-width:200px; background:rgba(0,240,255,.04);
+            border:1px solid rgba(0,240,255,.15); border-radius:6px; padding:6px 8px; }
+  .ppcard h4 { margin:0 0 4px; font-size:11px; color:var(--am); letter-spacing:2px; }
+  .ppcard .kv { font-size:11px; line-height:1.7; color:#c8dbe8; }
+  .ppcard .kv b { color:var(--gr); font-weight:600; }
+  .ppcard .err { color:var(--rd); font-size:10px; }
 </style>
 </head>
 <body>
@@ -385,6 +399,7 @@ HTML = r"""<!DOCTYPE html>
         <div class="tab active" data-pane="pane-pos">持仓</div>
         <div class="tab" data-pane="pane-quote">行情</div>
         <div class="tab" data-pane="pane-trig">布防</div>
+        <div class="tab" data-pane="pane-pp">排盘</div>
       </div>
       <div class="tab-panes">
         <div class="tab-pane active" id="pane-pos">
@@ -395,6 +410,9 @@ HTML = r"""<!DOCTYPE html>
         </div>
         <div class="tab-pane" id="pane-trig">
           <div class="verdicts" id="verdicts"><div class="empty">等待布防…</div></div>
+        </div>
+        <div class="tab-pane" id="pane-pp">
+          <div class="ppwrap" id="paipanBox"><div class="empty">等待排盘…</div></div>
         </div>
       </div>
     </div>
@@ -724,15 +742,52 @@ document.querySelectorAll("#dranges .rsym").forEach(el=>{
 });
 
 /* ---------- 数据流（SSE + 轮询兜底） ---------- */
-fetch("/api/state").then(r=>r.json()).then(render).catch(()=>{});
+fetch("/api/state").then(r=>r.json()).then(d=>{render(d); renderPaipan(d.paipan);}).catch(()=>{});
 const es = new EventSource("/api/stream");
-es.onmessage = e => { try { render(JSON.parse(e.data)); } catch(_){} };
+es.onmessage = e => { try { const d = JSON.parse(e.data); render(d); renderPaipan(d.paipan); } catch(_){} };
 es.onerror = () => {
   setLed("ledSys", "bad", "LOST");
   setTimeout(()=>{ if (es.readyState === EventSource.CLOSED) location.reload(); }, 3000);
 };
 // 轮询兜底：SSE 正常时也每 5 秒拉一次，防止 SSE 静默断线
-setInterval(()=>{ fetch("/api/state").then(r=>r.json()).then(render).catch(()=>{}); }, 5000);
+setInterval(()=>{ fetch("/api/state").then(r=>r.json()).then(d=>{render(d); renderPaipan(d.paipan);}).catch(()=>{}); }, 5000);
+
+/* ---------- 8.9 排盘标签页渲染 ---------- */
+function renderPaipan(pp){
+  const box = $("paipanBox"); if(!box || !pp) return;
+  const esc = s => String(s==null?"":s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  const qm = pp.qimen || {}, lr = pp.liuren || {}, bz = pp.bazi || {};
+  const scores = pp.scores || {};
+  let html = "";
+  html += '<div class="pphead"><span class="gz">' + esc(pp.ganzhi || "未排盘") + '</span>'
+       + '<span class="meta">' + esc(pp.jieqi || "") + ' · 更新 ' + esc(pp.updated || "-") + '</span></div>';
+  html += '<div class="pprow">';
+  html += '<div class="ppcard"><h4>奇门遁甲</h4><div class="kv">'
+       + (qm.dun ? '<b>' + esc(qm.dun) + esc(qm.ju) + '局</b>（' + esc(qm.yuan||"") + '）<br>值符 ' + esc(qm.zhifu||"-") + ' · 值使 ' + esc(qm.zhishi||"-") : "等待数据")
+       + '</div></div>';
+  html += '<div class="ppcard"><h4>大六壬</h4><div class="kv">'
+       + (lr.jiang ? '<b>' + esc(lr.jiang) + '将</b> · ' + esc(lr.ke||"") + '<br>三传 ' + ((lr.trans||[]).map(esc).join(" → ")) : "等待数据")
+       + '</div></div>';
+  html += '<div class="ppcard"><h4>四柱八字</h4><div class="kv">'
+       + (bz.dm ? '日主 <b>' + esc(bz.dm) + '</b>（' + esc(bz.strength||"-") + '）' : "等待数据")
+       + '</div></div>';
+  html += '<div class="ppcard"><h4>十盘断卦分</h4><div class="kv">';
+  const names = Object.keys(scores);
+  if (names.length) {
+    for (const n of names) {
+      const v = scores[n];
+      const col = v >= 0.55 ? "var(--gr)" : (v <= 0.45 ? "var(--rd)" : "var(--am)");
+      html += n + ' <b style="color:' + col + '">' + v.toFixed(2) + '</b>　';
+    }
+  } else html += "等待数据";
+  html += '</div></div>';
+  html += '</div>';
+  const errs = pp.errors || {};
+  if (Object.keys(errs).length) {
+    html += '<div class="ppcard"><h4>排盘异常</h4><div class="err">' + Object.entries(errs).map(([k,v])=>esc(k)+": "+esc(v)).join("<br>") + '</div></div>';
+  }
+  box.innerHTML = html;
+}
 </script>
 </body>
 </html>
@@ -1330,6 +1385,7 @@ class Snapshot:
             "ai_status": ai["status"],
             "ai_steps": ai["steps"],
             "ai_agg_failed": ai["agg_failed"],
+            "paipan": self._paipan_snapshot(),
         }
 
     @staticmethod
@@ -1339,6 +1395,45 @@ class Snapshot:
         if score >= 0.47:
             return "HALF"
         return "WATCH"
+
+    def _paipan_snapshot(self) -> dict:
+        """当前时辰十项古法排盘摘要（8.9 排盘标签页数据源）。
+
+        读 runtime/paipan_audit.jsonl 最后一行（审计日志）＋实时排盘。
+        主进程运行时 audit 每 tick 更新；离线时退化为静态展示。
+        """
+        try:
+            lines = self._tail_jsonl(Path("runtime") / "paipan_audit.jsonl", 1)
+            last = lines[-1] if lines else {}
+        except Exception:  # noqa: BLE001
+            last = {}
+        return {
+            "updated": last.get("ts", ""),
+            "symbol": last.get("symbol", ""),
+            "ganzhi": last.get("ganzhi", ""),
+            "jieqi": last.get("jieqi", ""),
+            "qimen": last.get("qimen", {}),
+            "liuren": last.get("liuren", {}),
+            "bazi": last.get("bazi", {}),
+            "scores": last.get("scores", {}),
+            "errors": last.get("errors", {}),
+        }
+
+    @staticmethod
+    def _tail_jsonl(path: Path, n: int) -> list:
+        try:
+            if not path.exists():
+                return []
+            data = path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+            out = []
+            for line in data[-n:]:
+                try:
+                    out.append(json.loads(line))
+                except Exception:  # noqa: BLE001
+                    continue
+            return out
+        except Exception:  # noqa: BLE001
+            return []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1364,6 +1459,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(self.snap.build()).encode("utf-8"), "application/json; charset=utf-8")
             elif path == "/api/stream":
                 self._stream()
+            elif path == "/api/paipan":
+                self._send(200, json.dumps(self.snap._paipan_snapshot()).encode("utf-8"), "application/json; charset=utf-8")
             elif path == "/favicon.ico":
                 self._send(204, b"", "image/x-icon")
             else:

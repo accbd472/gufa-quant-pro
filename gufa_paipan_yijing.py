@@ -90,11 +90,16 @@ LIUSHEN = ["青龙", "朱雀", "勾陈", "腾蛇", "白虎", "玄武"]  # 日干
 
 
 def _time_gua(ctx):
-    """梅花时间起卦：返回 (上卦名, 下卦名, 动爻位1..6, 本卦名, 本卦hex)。"""
+    """梅花时间起卦：返回 (上卦名, 下卦名, 动爻位1..6, 本卦名, 本卦hex)。
+
+    古法（《梅花易数》年月日时起例）：农历年支数（子=1..亥=12）+ 农历月 + 农历日
+    之和除八取余为上卦；再加时支数除八取余为下卦；总数除六取余为动爻。
+    8.9 修正：月日一律取农历（原误用公历）；闰月归正为正数月。
+    """
     year_zhi = ctx.year_gz[1]
     year_num = ZHI_ORDER.index(year_zhi) + 1
-    month = ctx.solar_dt.month
-    day = ctx.solar_dt.day
+    month = ctx.lunar_month          # 农历月（闰月归正）
+    day = ctx.lunar_day              # 农历日
     shi_num = ctx.shichen_index + 1  # 子=1...亥=12
     upper_num = (year_num + month + day) % 8 or 8
     lower_num = (year_num + month + day + shi_num) % 8 or 8
@@ -260,9 +265,8 @@ class BaguaPaipan(BasePaipan):
             gong_idx = 0
 
         shi = SHI_YAO.get(gong_idx, 6)
-        ying = (shi + 2) % 6 + 1 if shi <= 3 else (shi - 3)  # 应爻 = 世 +3 环
-        # 应爻简化：应 = 世 + 3（1..6 环）
-        ying = (shi + 2) % 6 + 1
+        # 世应（京房）：应爻 = 世爻对称位（初↔四、二↔五、三↔上）
+        ying = shi + 3 if shi <= 3 else shi - 3
 
         # 纳甲与六亲
         gong_wx = GONG_WUXING[gong]
@@ -361,8 +365,10 @@ class FengshuiPaipan(BasePaipan):
         year_star = 9 - ((year - 2000) % 9)
         year_star = year_star if year_star > 0 else 9
         year_zhi = ctx.year_gz[1]
+        # 8.9 修正：流月星逐月递减（子午卯酉年正月八白入中，顺月减一），
+        # 且月序用节气月（寅月=正月），不再用公历月。
         first_month_star = _MONTH_STAR_BY_ZHI.get(year_zhi, 8)
-        month_star = (first_month_star + ctx.solar_dt.month - 1 - 1) % 9 + 1
+        month_star = (first_month_star - (ctx.jieqi_month - 1)) % 9 or 9
 
         year_map = _feixing(year_star)
         month_map = _feixing(month_star)
@@ -378,7 +384,7 @@ class FengshuiPaipan(BasePaipan):
             ganzhi=ctx.ganzhi_full,
             jieqi=ctx.jieqi,
             xun_kong=ctx.xun_kong,
-            notes=ctx.notes + [f"{year}年{year_star}白入中，{ctx.solar_dt.month}月{month_star}星入中"],
+            notes=ctx.notes + [f"{year}年{year_star}入中，节气第{ctx.jieqi_month}月（{ctx.month_gz}月）{month_star}星入中"],
             yuan_yun=_yuan_yun(year),
             year_star=year_star,
             month_star=month_star,

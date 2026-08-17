@@ -66,15 +66,15 @@ class TaiyiPaipan(BasePaipan):
 
         # 岁计落宫（一宫起、岁行一宫、九宫周行）
         sui_gong = (jiyuan - 1) % 9 + 1
-        # 月计落宫（农历月推进）
-        lunar_month = ctx.solar_dt.month  # 简化用公历月
+        # 月计落宫（月柱地支推进，8.9：不再用公历月）
+        lunar_month = ctx.jieqi_month     # 节气月序（立春=1 寅月）
         yue_gong = (jiyuan * 12 + lunar_month - 1) % 9 + 1
         # 日计落宫（儒略日推进）
         jd = self._julian_day(ctx.solar_dt)
         ri_gong = int(jd) % 9 + 1
 
-        # 十六神（以月支定位，简式）
-        month_zhi = ZHI[(lunar_month + 1) % 12]  # 寅月=正月
+        # 十六神（以月柱地支定位，8.9：不再由公历月推算）
+        month_zhi = ctx.month_gz[1]
         sixteen: dict[str, str] = {}
         start = GOD_KEYS.index(month_zhi) if month_zhi in GOD_KEYS else 0
         for i in range(16):

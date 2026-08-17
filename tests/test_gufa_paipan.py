@@ -105,26 +105,32 @@ def test_paipan_produces_chart(svc, panzer):
 
 
 def test_qimen_yin_dun_1_ju(svc):
-    """2026-08-05 18:44 北京：大暑中元，阴遁 1 局（手工推演）。"""
+    """2026-08-05 18:44 北京：大暑下元（符头甲辰日定元），阴遁 4 局。
+
+    8.9 修正拆补法：元由符头（日所在旬旬首）日支定，非当日日支。
+    辛亥日在甲辰旬，符头甲辰日支辰 → 下元；大暑下元 = 阴遁 4 局。
+    """
     ctx = svc.context(SAMPLE_DT)
     c = QimenPaipan().current(ctx)
     assert c.dun == "阴遁"
-    assert c.ju == 1
-    assert c.zhifu == "天柱"
-    assert c.zhishi == "惊门"
-    # 地盘：阴遁1局戊起一宫逆布
-    assert c.jiu_gong["坎一宫"]["gan"] == "戊"
-    assert c.jiu_gong["离九宫"]["gan"] == "己"
+    assert c.ju == 4
+    assert c.yuan == "下元"
+    # 地盘：阴遁4局戊起四宫逆布
+    assert c.jiu_gong["巽四宫"]["gan"] == "戊"
 
 
 def test_liuren_three_transmissions(svc):
-    """2026-08-05 18:44：月将胜光加酉，贼克课，三传巳寅亥（手工推演）。"""
+    """2026-08-05 18:44：月将胜光加酉，元首课，三传巳寅亥（手工推演）。
+
+    8.9 九宗门重写：四课唯一克战为第 4 课上克下（申←巳）→ 元首课。
+    （原断言"贼克"为旧实现命名错误；古法一下贼上方为重审课。）
+    """
     ctx = svc.context(SAMPLE_DT)
     c = LiurenPaipan().current(ctx)
     assert c.yuejiang == "胜光"
     assert c.four_lessons == ["戌未", "未辰", "亥申", "申巳"]
     assert c.three_transmissions == ["巳", "寅", "亥"]
-    assert c.ke_break == "贼克"
+    assert c.ke_break == "元首"
 
 
 def test_taiyi_jiyuan_anchor():

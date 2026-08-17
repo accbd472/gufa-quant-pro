@@ -116,9 +116,12 @@ class QimenPaipan(BasePaipan):
             ju = 1
             note = f"节气 {jieqi} 不在定局表，按 {dun}1局处理"
         else:
-            yuan = YUAN_BY_ZHI.get(ctx.day_zhi, "中元")
+            # 拆补法：元由符头（日所在旬的旬首）日支定，非当日日支
+            xun_shou, _ = _xun_info(ctx.day_gz)
+            fu_tou_zhi = xun_shou[1]
+            yuan = YUAN_BY_ZHI.get(fu_tou_zhi, "中元")
             ju = ju_table[{"上元": 0, "中元": 1, "下元": 2}[yuan]]
-            note = f"{dun}{ju}局（{jieqi}{yuan}，日支{ctx.day_zhi}）"
+            note = f"{dun}{ju}局（{jieqi}{yuan}，符头{xun_shou}，日支{ctx.day_zhi}）"
 
         # 地盘三奇六仪
         dipan: dict[str, int] = {}  # 干 -> 宫
@@ -142,7 +145,10 @@ class QimenPaipan(BasePaipan):
             value_ring_idx = RING.index(value_palace)
 
         # 时干落宫（地盘时干宫 = 值符所加）
+        # 古法：时干为甲时遁于旬首六仪，取旬首遁仪落宫
         shi_gan = ctx.time_gz[0]
+        if shi_gan == "甲":
+            shi_gan = JIA_DUN[xun]
         target = dipan[shi_gan]
         target_ring_idx = RING.index(target) if target in RING else 0
 
@@ -216,7 +222,7 @@ class QimenPaipan(BasePaipan):
             jieqi=jieqi,
             xun_kong=ctx.xun_kong,
             notes=ctx.notes + [note, f"旬首{xun}（遁{JIA_DUN[xun]}），值符{zhifu_star}，值使{zhishi_door}"],
-            yuan=YUAN_BY_ZHI.get(ctx.day_zhi, "中元"),
+            yuan=yuan,
             dun=dun,
             ju=ju,
             zhifu=zhifu_star,
