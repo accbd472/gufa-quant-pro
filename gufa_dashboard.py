@@ -127,7 +127,7 @@ HTML = r"""<!DOCTYPE html>
   /* ---------- 主区 ---------- */
   main { flex: 1; display: grid; min-height: 0;
     grid-template-columns: 1.15fr 0.85fr;
-    grid-template-rows: 1.1fr 1.4fr 0.5fr;
+    grid-template-rows: 1.1fr 1.35fr 0.65fr;
     grid-template-areas:
       "equity  ancient"
       "decision ancient"
@@ -151,10 +151,15 @@ HTML = r"""<!DOCTYPE html>
     padding: 0 4px; font-size: 9px; border-radius: 7px; background: rgba(34,211,238,.15); color: var(--cy); }
   .tab-panes { flex: 1; min-height: 0; overflow: hidden; }
   .tab-pane { display: none; height: 100%; overflow-y: auto; }
-  .tab-pane.active { display: block; }
+  .tab-pane.active { display: flex; flex-direction: column; }
+  .rsym { font-size: 10px; padding: 1px 8px; border-radius: 8px; border: 1px solid var(--line);
+    color: var(--dim); cursor: pointer; font-variant-numeric: tabular-nums; }
+  .rsym:hover { color: var(--cy); }
+  .rsym.active { color: var(--cy); background: rgba(34,211,238,.1); border-color: rgba(34,211,238,.45); }
+  #eqWin { cursor: default; border-color: transparent; padding: 1px 0; }
 
   /* ---------- 行情/持仓行 ---------- */
-  .quotes { display: flex; flex-direction: column; gap: 3px; overflow-y: auto;
+  .quotes { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; flex: 1; min-height: 0;
     border: 1px solid rgba(34,211,238,.12); border-radius: 8px; padding: 4px 8px; }
   .quote { display: flex; align-items: center; gap: 8px; font-size: 11.5px; font-variant-numeric: tabular-nums; }
   .quote.held { background: rgba(34,211,238,.05); border-left: 2px solid var(--cy); padding-left: 5px; }
@@ -169,7 +174,7 @@ HTML = r"""<!DOCTYPE html>
   .quote.posrow.posactive { border-left-color: var(--pu); background: rgba(167,139,250,.1); }
 
   /* ---------- 初选条 ---------- */
-  .picks { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; }
+  .picks { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; flex: 1; min-height: 0; }
   .pick { display: flex; align-items: center; gap: 10px; font-size: 11.5px; }
   .pick .sym { width: 74px; color: var(--cy); white-space: nowrap; }
   .pick .bar { flex: 1; height: 10px; background: rgba(34,211,238,.08); border-radius: 5px; overflow: hidden; }
@@ -179,7 +184,7 @@ HTML = r"""<!DOCTYPE html>
   .dead { color: var(--rd); font-size: 10px; opacity: .8; }
 
   /* ---------- 布防 ---------- */
-  .verdicts { display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+  .verdicts { display: flex; flex-direction: column; gap: 4px; overflow-y: auto; flex: 1; min-height: 0; }
   .verdict { display: flex; align-items: center; gap: 8px; font-size: 11px; }
   .verdict .sym { width: 80px; color: var(--cy); }
   .vbadge { padding: 1px 9px; border-radius: 10px; font-size: 10px; font-weight: 600; }
@@ -192,7 +197,7 @@ HTML = r"""<!DOCTYPE html>
   /* ---------- 古法合参 ---------- */
   .ppwrap { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
   .pptabs { display: flex; gap: 2px; flex-shrink: 0; margin-bottom: 6px; }
-  .pptab { padding: 2px 10px; font-size: 10.5px; color: var(--dim); cursor: pointer;
+  .pptab { padding: 3px 11px; font-size: 11px; color: var(--dim); cursor: pointer;
     border: 1px solid var(--line); border-radius: 10px; }
   .pptab:hover { color: var(--cy); }
   .pptab.active { color: var(--cy); background: rgba(34,211,238,.1); border-color: rgba(34,211,238,.5); }
@@ -247,7 +252,7 @@ HTML = r"""<!DOCTYPE html>
   .radarbox { flex: 1; min-height: 120px; }
 
   /* ---------- AI 解读/交易 ---------- */
-  .aisteps { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; }
+  .aisteps { display: flex; flex-direction: column; gap: 3px; overflow-y: auto; flex: 1; min-height: 0; }
   .aistep { display: flex; align-items: center; gap: 6px; font-size: 10.5px; padding: 3px 7px;
     border-radius: 6px; border: 1px solid transparent; color: var(--dim); line-height: 1.4; }
   .aistep .st { flex: 0 0 24px; font-weight: 700; }
@@ -276,8 +281,8 @@ HTML = r"""<!DOCTYPE html>
   .logbox .BUY { color: var(--gr); font-weight: 700; }
   .logbox .SELL { color: var(--rd); font-weight: 700; }
 
-  .empty { color: #4a5f75; font-size: 11px; text-align: center; padding: 14px 0; }
-  footer { font-size: 9px; color: #3d5165; text-align: center; letter-spacing: 2px; flex-shrink: 0; }
+  .empty { color: #4a5f75; font-size: 11px; text-align: center; padding: 14px 0; margin: auto; }
+  footer { font-size: 9px; color: #5c7288; text-align: center; letter-spacing: 2px; flex-shrink: 0; }
 
   @media (max-width: 1300px){ .kpis { grid-template-columns: repeat(3, 1fr); } .kpi .v { font-size: 14px; } }
   @media (orientation: portrait) and (max-width: 820px){
@@ -308,7 +313,7 @@ HTML = r"""<!DOCTYPE html>
   </header>
 
   <div class="kpis">
-    <div class="kpi"><div class="l">权益 (USDT)</div><div class="v" id="mEquity">--</div><div class="s" id="kPeak"></div></div>
+    <div class="kpi"><div class="l">权益 (USDT)</div><div class="v" id="mEquity">--</div><div class="s" id="kPeak">--</div></div>
     <div class="kpi"><div class="l">今日盈亏</div><div class="v" id="kDayPnl">--</div><div class="s" id="kDayPct"></div></div>
     <div class="kpi"><div class="l">距峰值回撤</div><div class="v" id="kDrawdown">--</div><div class="s" id="kPeakV"></div></div>
     <div class="kpi"><div class="l">持仓</div><div class="v" id="kPos">--</div><div class="s" id="kPosV"></div></div>
@@ -319,13 +324,13 @@ HTML = r"""<!DOCTYPE html>
   <main>
     <div class="card" style="grid-area:equity">
       <h3>权益曲线
-        <span style="display:inline-flex;gap:4px;margin-left:4px" id="dranges">
+        <span class="rsym" id="eqWin" style="margin-left:auto"></span>
+        <span style="display:inline-flex;gap:2px" id="dranges">
           <span class="rsym active" data-r="today">今日</span>
           <span class="rsym" data-r="yday">昨日</span>
           <span class="rsym" data-r="3d">3天</span>
           <span class="rsym" data-r="7d">7天</span>
         </span>
-        <span class="rsym" style="margin-left:auto" id="eqWin"></span>
       </h3>
       <div class="chart"><canvas id="eqChart"></canvas></div>
     </div>
@@ -412,6 +417,8 @@ function drawEq(){
   let min=Infinity, max=-Infinity;
   for (const p of eqHist){ if(p<min)min=p; if(p>max)max=p; }
   if (max-min < 1e-9){ max+=1; min-=1; }
+  const span = max - min;
+  min -= span*0.12; max += span*0.12;   // 上下留白, 防止数据点贴边
   const pad = 10;
   const X = i => pad + (W-2*pad) * i / Math.max(1, eqHist.length-1);
   const Y = v => pad + (H-2*pad) * (1 - (v-min)/(max-min));
@@ -564,7 +571,10 @@ function render(d){
     const el = $("kDrawdown");
     el.textContent = dd.toFixed(2)+"%";
     el.className = "v " + (dd<-0.005?"red":(dd>-0.0001?"green":"amber"));
-    $("kPeakV").textContent = "峰值 " + (d.peak!=null?d.peak.toFixed(0):"--");
+    const abs = (d.equity!=null && d.peak!=null) ? d.equity - d.peak : null;
+    $("kPeakV").textContent = abs!=null ? (abs>=0?"+":"")+abs.toFixed(0)+"U 距峰值" : "--";
+  } else {
+    $("kPeakV").textContent = "--";
   }
   $("kPos").textContent = d.position_count!=null ? d.position_count : "--";
   let posVal = 0;
